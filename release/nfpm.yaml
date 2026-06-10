@@ -1,0 +1,42 @@
+name: zaigr
+arch: amd64
+platform: linux
+version: ${VERSION}
+version_schema: semver
+release: ${BUILD}
+section: utils
+priority: optional
+maintainer: zaigr maintainers
+description: Sandbox launcher for AI coding agents
+vendor: zaigr
+homepage: https://github.com/TheMeaningfulEngineer/zaigr
+license: MIT
+
+contents:
+  - src: ./zaigr
+    dst: /usr/bin/zaigr
+    file_info:
+      mode: 0755
+
+overrides:
+  deb:
+    depends:
+      - coreutils
+      - e2fsprogs
+      - openssh-client
+      - qemu-system-x86
+      - qemu-utils
+  rpm:
+    depends:
+      - coreutils
+      - e2fsprogs
+      - openssh-clients
+      - qemu-img
+      - qemu-system-x86-core
+  archlinux:
+    depends:
+      - coreutils
+      - e2fsprogs
+      - openssh
+      - qemu-img
+      - qemu-system-x86

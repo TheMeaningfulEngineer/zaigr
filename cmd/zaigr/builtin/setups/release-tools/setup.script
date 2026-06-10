@@ -1,0 +1,72 @@
+#!/bin/bash
+set -euo pipefail
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export DEBIAN_FRONTEND=noninteractive
+
+echo ":: Installing release packages ..."
+apt-get update -qq
+apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    file \
+    fuse-overlayfs \
+    git \
+    passt \
+    podman \
+    python3 \
+    python3-pexpect \
+    python3-pytest \
+    python3-pytest-timeout \
+    python3-pytest-xdist \
+    python3-pyzstd \
+    rpm \
+    slirp4netns \
+    uidmap
+
+sed -i '/^user:/d' /etc/subuid /etc/subgid
+echo 'user:100000:131072' >> /etc/subuid
+echo 'user:100000:131072' >> /etc/subgid
+
+mkdir -p /etc/containers/containers.conf.d /etc/containers/registries.conf.d
+cat > /etc/containers/containers.conf.d/zaigr.conf <<'EOF'
+[engine]
+cgroup_manager = "cgroupfs"
+events_logger = "file"
+EOF
+
+cat > /etc/containers/registries.conf <<'EOF'
+unqualified-search-registries = ["docker.io"]
+short-name-mode = "disabled"
+EOF
+rm -f /etc/containers/registries.conf.d/shortnames.conf
+rm -f /etc/containers/short-name-aliases.conf
+
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' EXIT
+
+install_tarball_binary() {
+    name="$1"
+    url="$2"
+    extract_dir="$tmpdir/$name"
+    mkdir -p "$extract_dir"
+    curl -4 -fsSL "$url" | tar -xz -C "$extract_dir"
+    binary="$(find "$extract_dir" -type f -name "$name" -perm -u+x | head -n 1)"
+    if [ -z "$binary" ]; then
+        echo ":: Could not find $name in release archive" >&2
+        exit 1
+    fi
+    install -m 0755 "$binary" "/usr/local/bin/$name"
+}
+
+echo ":: Installing git-cliff ..."
+git_cliff_version="${GIT_CLIFF_VERSION:-2.12.0}"
+install_tarball_binary \
+    git-cliff \
+    "https://github.com/orhun/git-cliff/releases/download/v${git_cliff_version}/git-cliff-${git_cliff_version}-x86_64-unknown-linux-gnu.tar.gz"
+
+echo ":: Installing nfpm ..."
+nfpm_version="${NFPM_VERSION:-2.46.1}"
+install_tarball_binary \
+    nfpm \
+    "https://github.com/goreleaser/nfpm/releases/download/v${nfpm_version}/nfpm_${nfpm_version}_Linux_x86_64.tar.gz"

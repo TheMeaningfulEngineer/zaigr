@@ -1,0 +1,29 @@
+_zaigr_inside()
+{
+    local cur
+    cur=${COMP_WORDS[COMP_CWORD]}
+    COMPREPLY=()
+
+    case "$COMP_CWORD" in
+        1)
+            COMPREPLY=($(compgen -W "firewall" -- "$cur"))
+            ;;
+        2)
+            if [ "${COMP_WORDS[1]}" = "firewall" ]; then
+                COMPREPLY=($(compgen -W "allow remove list domain-log" -- "$cur"))
+            fi
+            ;;
+        *)
+            if [ "${COMP_WORDS[1]}" = "firewall" ] && [ "${COMP_WORDS[2]}" = "remove" ]; then
+                local allowed_file=${ZAIGR_INSIDE_ALLOWED_FILE:-/etc/opensnitchd/lists/domains/allowed.txt}
+                if [ -f "$allowed_file" ]; then
+                    local entries
+                    entries=$(sed -e 's/[[:space:]]*$//' "$allowed_file" | sed '/^[[:space:]]*$/d; /^[[:space:]]*#/d')
+                    COMPREPLY=($(compgen -W "$entries" -- "$cur"))
+                fi
+            fi
+            ;;
+    esac
+}
+
+complete -F _zaigr_inside zaigr-inside /usr/local/sbin/zaigr-inside

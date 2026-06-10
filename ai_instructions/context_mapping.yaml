@@ -1,0 +1,54 @@
+rules:
+  - when: "*.firewall"
+    inject:
+      - firewall.md
+
+  - when: .feature.md
+    PreToolUse:
+      inject:
+        - feature-examples/features.md
+
+  - when: tests/**
+    inject:
+      - testing/principles.md
+      - testing/fixtures_transcripts.md
+
+    PostToolUse:
+      inject:
+        - judgement.md
+
+  - when: tests/cli/**
+    inject:
+      - testing/cli_tests.md
+    PostToolUse:
+      inject:
+        - judgement.md
+
+  - when: tests/release/**
+    inject:
+      - testing/release_tests.md
+    PostToolUse:
+      inject:
+        - judgement.md
+
+  - when: release/release
+    inject:
+      - release.md
+      - python.md
+    PostToolUse:
+      inject:
+        - judgement.md
+
+  - when: docs/releasing.md
+    inject:
+      - release.md
+    PostToolUse:
+      inject:
+        - judgement.md
+
+  - when: Makefile
+    inject:
+      - makefile.md
+    PostToolUse:
+      inject:
+        - judgement.md

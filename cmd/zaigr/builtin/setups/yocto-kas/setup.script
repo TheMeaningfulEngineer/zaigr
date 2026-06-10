@@ -1,0 +1,59 @@
+#!/bin/bash
+set -euo pipefail
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export DEBIAN_FRONTEND=noninteractive
+
+echo ":: Installing Yocto host packages ..."
+apt-get update -qq
+apt-get install -y --no-install-recommends \
+    bc \
+    bison \
+    build-essential \
+    chrpath \
+    cpio \
+    debianutils \
+    diffstat \
+    file \
+    flex \
+    gawk \
+    gcc \
+    git \
+    iputils-ping \
+    lz4 \
+    locales \
+    make \
+    patch \
+    perl \
+    pipx \
+    python3 \
+    python3-git \
+    python3-jinja2 \
+    python3-pexpect \
+    python3-pip \
+    python3-subunit \
+    python3-venv \
+    socat \
+    tar \
+    texinfo \
+    unzip \
+    wget \
+    xz-utils \
+    zstd
+
+if ! locale -a | grep -qi '^en_US\.utf8$'; then
+    sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+    locale-gen en_US.UTF-8
+fi
+
+cat >/etc/profile.d/zaigr-yocto-kas.sh <<'EOF'
+export LANG="${LANG:-en_US.UTF-8}"
+EOF
+
+echo ":: Installing kas ..."
+export PIPX_HOME=/opt/pipx
+export PIPX_BIN_DIR=/usr/local/bin
+export PIP_NO_CACHE_DIR=1
+pipx install "kas==${KAS_VERSION:-5.3}"
+
+kas --version

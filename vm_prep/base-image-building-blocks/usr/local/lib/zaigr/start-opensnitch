@@ -1,0 +1,13 @@
+#!/bin/bash
+set -euo pipefail
+
+opensnitchd_path="$(command -v opensnitchd || true)"
+[ -n "$opensnitchd_path" ] || {
+    echo ":: zaigr-opensnitch: FATAL - opensnitchd not found" >&2
+    exit 1
+}
+
+exec "$opensnitchd_path" -debug \
+    -log-file /var/log/opensnitchd.log \
+    -rules-path /etc/opensnitchd/rules \
+    -process-monitor-method proc

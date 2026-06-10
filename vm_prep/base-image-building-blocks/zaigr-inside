@@ -1,0 +1,248 @@
+#!/bin/bash
+set -eu
+set -f
+
+ALLOWED_FILE=${ZAIGR_INSIDE_ALLOWED_FILE:-/etc/opensnitchd/lists/domains/allowed.txt}
+LOG_FILE=${ZAIGR_INSIDE_LOG_FILE:-/var/log/opensnitchd.log}
+BLOCKED_GRACE_SECONDS=${ZAIGR_INSIDE_BLOCKED_GRACE_SECONDS:-2}
+
+usage() {
+    cat >&2 <<'EOF'
+Usage:
+  zaigr-inside firewall allow <domain> [<domain> ...]
+  zaigr-inside firewall remove <domain> [<domain> ...]
+  zaigr-inside firewall list
+  zaigr-inside firewall domain-log
+EOF
+}
+
+die() {
+    echo "$*" >&2
+    exit 1
+}
+
+require_root() {
+    if [ "$(id -u)" != "0" ]; then
+        die "zaigr-inside must be run as root"
+    fi
+}
+
+normalize_domain() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+is_valid_domain() {
+    local domain=$1
+    [ "${#domain}" -le 253 ] || return 1
+    [[ "$domain" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]
+}
+
+prepare_allowed_file() {
+    install -d -m 0755 "$(dirname "$ALLOWED_FILE")"
+    touch "$ALLOWED_FILE"
+    chmod 0644 "$ALLOWED_FILE"
+}
+
+firewall_allow() {
+    [ "$#" -gt 0 ] || die "missing domain"
+
+    local domains=()
+    local raw domain
+    for raw in "$@"; do
+        domain=$(normalize_domain "$raw")
+        if ! is_valid_domain "$domain"; then
+            die "invalid domain: $raw"
+        fi
+        domains+=("$domain")
+    done
+
+    prepare_allowed_file
+    for domain in "${domains[@]}"; do
+        if grep -qxF -- "$domain" "$ALLOWED_FILE"; then
+            echo "already allowed $domain"
+        else
+            printf '%s\n' "$domain" >> "$ALLOWED_FILE"
+            echo "allowed $domain"
+        fi
+    done
+    echo "manual VM firewall change; not part of a setup"
+}
+
+firewall_remove() {
+    [ "$#" -gt 0 ] || die "missing domain"
+
+    local domains=()
+    local raw domain
+    for raw in "$@"; do
+        domain=$(normalize_domain "$raw")
+        if ! is_valid_domain "$domain"; then
+            die "invalid domain: $raw"
+        fi
+        domains+=("$domain")
+    done
+
+    prepare_allowed_file
+    for domain in "${domains[@]}"; do
+        if ! grep -qxF -- "$domain" "$ALLOWED_FILE"; then
+            die "not allowed $domain"
+        fi
+    done
+
+    local tmp
+    tmp=$(mktemp "${ALLOWED_FILE}.XXXXXX")
+    while IFS= read -r line || [ -n "$line" ]; do
+        for domain in "${domains[@]}"; do
+            if [ "$line" = "$domain" ]; then
+                continue 2
+            fi
+        done
+        printf '%s\n' "$line" >> "$tmp"
+    done < "$ALLOWED_FILE"
+    chmod 0644 "$tmp"
+    mv "$tmp" "$ALLOWED_FILE"
+
+    for domain in "${domains[@]}"; do
+        echo "removed $domain"
+    done
+    echo "manual VM firewall change; not part of a setup"
+}
+
+firewall_list() {
+    [ -f "$ALLOWED_FILE" ] || return 0
+    sed -e 's/[[:space:]]*$//' "$ALLOWED_FILE" | sed '/^[[:space:]]*$/d; /^[[:space:]]*#/d'
+}
+
+strip_ansi() {
+    sed -E $'s|\x1B\\[[0-9;?]*[ -/]*[@-~]||g'
+}
+
+declare -A DOMAIN_PENDING=()
+declare -A DOMAIN_STATUS=()
+
+mark_connect() {
+    local domain=$1
+    if [ -z "${DOMAIN_STATUS[$domain]:-}" ] && [ -z "${DOMAIN_PENDING[$domain]:-}" ]; then
+        DOMAIN_PENDING[$domain]=$(date +%s)
+    fi
+}
+
+mark_allowed() {
+    local domain=$1
+    unset "DOMAIN_PENDING[$domain]"
+    if [ "${DOMAIN_STATUS[$domain]:-}" != "allowed" ]; then
+        DOMAIN_STATUS[$domain]=allowed
+        echo "allowed $domain"
+    fi
+}
+
+emit_due_blocked() {
+    local now=$1
+    local due=()
+    local domain first_seen
+    for domain in "${!DOMAIN_PENDING[@]}"; do
+        first_seen=${DOMAIN_PENDING[$domain]}
+        if [ $((now - first_seen)) -ge "$BLOCKED_GRACE_SECONDS" ]; then
+            due+=("$domain")
+        fi
+    done
+
+    [ "${#due[@]}" -gt 0 ] || return 0
+    while IFS= read -r domain; do
+        [ -n "$domain" ] || continue
+        unset "DOMAIN_PENDING[$domain]"
+        if [ -z "${DOMAIN_STATUS[$domain]:-}" ]; then
+            DOMAIN_STATUS[$domain]=blocked
+            echo "blocked $domain"
+        fi
+    done < <(printf '%s\n' "${due[@]}" | sort)
+}
+
+handle_log_line() {
+    local line proto domain port target
+    local connect_re='new[[:space:]]connection[[:space:]]+([^[:space:]]+)[[:space:]]+=>.*\(([^)]*)\):([0-9]+)[[:space:]]+uid:[[:space:]]*([0-9]+)'
+    line=$(printf '%s\n' "$1" | strip_ansi)
+
+    if [[ "$line" =~ $connect_re ]]; then
+        proto=${BASH_REMATCH[1]}
+        domain=$(normalize_domain "${BASH_REMATCH[2]}")
+        port=${BASH_REMATCH[3]}
+        if [ "$port" != "53" ] && is_valid_domain "$domain"; then
+            mark_connect "$domain"
+        fi
+        return 0
+    fi
+
+    case "$line" in
+        *"new connection"*) return 0 ;;
+        *" => "*", mark:"*)
+            target=${line#*=> }
+            target=${target%%, mark:*}
+            port=${target##*:}
+            case "$port" in
+                ''|*[!0-9]*) return 0 ;;
+            esac
+            [ "$port" != "53" ] || return 0
+            domain=${target%% *}
+            domain=${domain#[}
+            domain=${domain%]}
+            domain=$(normalize_domain "$domain")
+            if is_valid_domain "$domain"; then
+                mark_allowed "$domain"
+            fi
+            ;;
+    esac
+}
+
+firewall_domain_log() {
+    [ -f "$LOG_FILE" ] || die "OpenSnitch log not found: $LOG_FILE"
+
+    exec 3< <(tail -n 0 -F "$LOG_FILE")
+    while true; do
+        if IFS= read -r -t 1 line <&3; then
+            handle_log_line "$line"
+        fi
+        emit_due_blocked "$(date +%s)"
+    done
+}
+
+main() {
+    require_root
+    [ "$#" -ge 1 ] || { usage; exit 1; }
+
+    case "$1" in
+        firewall)
+            shift
+            [ "$#" -ge 1 ] || { usage; exit 1; }
+            case "$1" in
+                allow)
+                    shift
+                    firewall_allow "$@"
+                    ;;
+                remove)
+                    shift
+                    firewall_remove "$@"
+                    ;;
+                list)
+                    shift
+                    [ "$#" -eq 0 ] || die "firewall list takes no arguments"
+                    firewall_list
+                    ;;
+                domain-log)
+                    shift
+                    [ "$#" -eq 0 ] || die "firewall domain-log takes no arguments"
+                    firewall_domain_log
+                    ;;
+                *)
+                    usage
+                    exit 1
+                    ;;
+            esac
+            ;;
+        *)
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

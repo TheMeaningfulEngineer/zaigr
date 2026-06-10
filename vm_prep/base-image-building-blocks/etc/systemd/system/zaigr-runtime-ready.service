@@ -1,0 +1,10 @@
+[Unit]
+Description=zaigr guest runtime is ready for SSH
+After=zaigr-runtime-setup.service zaigr-opensnitch.service zaigr-boot-hooks.service
+Requires=zaigr-runtime-setup.service zaigr-opensnitch.service zaigr-boot-hooks.service
+Before=ssh.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true

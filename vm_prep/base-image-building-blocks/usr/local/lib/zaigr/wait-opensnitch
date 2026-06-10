@@ -1,0 +1,13 @@
+#!/bin/bash
+set -euo pipefail
+
+for _ in 1 2 3 4 5; do
+    if pgrep -x opensnitchd >/dev/null 2>&1; then
+        exit 0
+    fi
+    sleep 1
+done
+
+echo ":: zaigr-opensnitch: FATAL - opensnitchd is not running" >&2
+tail -5 /var/log/opensnitchd.log 2>/dev/null || true
+exit 1

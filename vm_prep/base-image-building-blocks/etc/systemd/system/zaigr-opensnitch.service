@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenSnitch firewall for zaigr guest
+After=zaigr-runtime-setup.service
+Requires=zaigr-runtime-setup.service
+Before=zaigr-boot-hooks.service ssh.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/zaigr/start-opensnitch
+ExecStartPost=/usr/local/lib/zaigr/wait-opensnitch
+Restart=on-failure
+RestartSec=1s
+
+[Install]
+WantedBy=multi-user.target

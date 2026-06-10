@@ -1,0 +1,16 @@
+#!/bin/bash
+set -eu
+
+# usrmerge: mmdebstrap minbase doesn't set up /lib/x86_64-linux-gnu but
+# the libc linker script references it. Fix before installing build tools.
+if [ ! -e /lib/x86_64-linux-gnu ]; then
+    ln -sfn /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu
+fi
+
+echo ":: Installing dev packages ..."
+apt-get update -qq
+apt-get install -y --no-install-recommends \
+    curl git \
+    fakeroot \
+    build-essential flex bison bc libelf-dev libssl-dev zstd \
+    qemu-system-x86 qemu-utils mmdebstrap uidmap rsync cpio
