@@ -1,0 +1,51 @@
+#!/bin/bash
+set -euo pipefail
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export DEBIAN_FRONTEND=noninteractive
+
+echo ":: Installing Podman ..."
+apt-get update -qq
+apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    fuse-overlayfs \
+    passt \
+    podman \
+    slirp4netns \
+    uidmap
+
+sed -i '/^user:/d' /etc/subuid /etc/subgid
+echo 'user:100000:131072' >> /etc/subuid
+echo 'user:100000:131072' >> /etc/subgid
+
+mkdir -p /etc/opensnitchd/rules
+cat > /etc/opensnitchd/rules/090-zaigr-podman.json <<'EOF'
+{
+  "name": "090-zaigr-podman",
+  "enabled": true,
+  "precedence": true,
+  "action": "allow",
+  "duration": "always",
+  "operator": {
+    "type": "simple",
+    "sensitive": false,
+    "operand": "process.path",
+    "data": "/usr/bin/podman"
+  }
+}
+EOF
+
+mkdir -p /etc/containers/containers.conf.d /etc/containers/registries.conf.d
+cat > /etc/containers/containers.conf.d/zaigr.conf <<'EOF'
+[engine]
+cgroup_manager = "cgroupfs"
+events_logger = "file"
+EOF
+
+cat > /etc/containers/registries.conf <<'EOF'
+unqualified-search-registries = ["docker.io"]
+short-name-mode = "disabled"
+EOF
+rm -f /etc/containers/registries.conf.d/shortnames.conf
+rm -f /etc/containers/short-name-aliases.conf

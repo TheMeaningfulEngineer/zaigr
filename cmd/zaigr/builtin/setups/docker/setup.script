@@ -1,0 +1,146 @@
+#!/bin/bash
+set -euo pipefail
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export DEBIAN_FRONTEND=noninteractive
+
+apt_get() {
+    apt-get \
+        -o Acquire::Retries=2 \
+        -o Acquire::http::Timeout=20 \
+        -o Acquire::https::Timeout=20 \
+        "$@"
+}
+
+echo ":: Installing Docker ..."
+apt_get update -qq
+apt_get install -y --no-install-recommends \
+    ca-certificates \
+    curl
+
+conflicting_packages=$(
+    dpkg --get-selections docker.io docker-compose docker-doc podman-docker containerd runc 2>/dev/null |
+        awk '$2 == "install" { print $1 }'
+)
+if [ -n "$conflicting_packages" ]; then
+    apt_get remove -y $conflicting_packages
+fi
+
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL --connect-timeout 5 --max-time 30 https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+chmod a+r /etc/apt/keyrings/docker.asc
+
+. /etc/os-release
+docker_codename="${VERSION_CODENAME:-}"
+if [ -z "$docker_codename" ]; then
+    echo ":: Could not determine Debian codename from /etc/os-release" >&2
+    exit 1
+fi
+
+cat > /etc/apt/sources.list.d/docker.sources <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/debian
+Suites: $docker_codename
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+
+apt_get update -qq
+apt_get install -y --no-install-recommends \
+    containerd.io \
+    docker-buildx-plugin \
+    docker-ce \
+    docker-ce-cli \
+    docker-compose-plugin \
+    fuse-overlayfs \
+    iptables \
+    uidmap
+
+sed -i '/^user:/d' /etc/subuid /etc/subgid
+echo 'user:100000:131072' >> /etc/subuid
+echo 'user:100000:131072' >> /etc/subgid
+usermod -aG docker user
+
+mkdir -p /etc/opensnitchd/rules
+cat > /etc/opensnitchd/rules/090-zaigr-dockerd.json <<'EOF'
+{
+  "name": "090-zaigr-dockerd",
+  "enabled": true,
+  "precedence": true,
+  "action": "allow",
+  "duration": "always",
+  "operator": {
+    "type": "simple",
+    "sensitive": false,
+    "operand": "process.path",
+    "data": "/usr/bin/dockerd"
+  }
+}
+EOF
+cat > /etc/opensnitchd/rules/090-zaigr-containerd.json <<'EOF'
+{
+  "name": "090-zaigr-containerd",
+  "enabled": true,
+  "precedence": true,
+  "action": "allow",
+  "duration": "always",
+  "operator": {
+    "type": "simple",
+    "sensitive": false,
+    "operand": "process.path",
+    "data": "/usr/bin/containerd"
+  }
+}
+EOF
+
+mkdir -p /etc/zaigr/boot.d
+cat > /etc/zaigr/boot.d/10-docker <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+mkdir -p /run/docker /var/run /var/lib/docker /var/lib/containerd
+log=/var/log/zaigr-dockerd.log
+
+echo 1 > /proc/sys/net/ipv4/ip_forward
+
+if ! pgrep -x containerd >/dev/null 2>&1; then
+    containerd >/var/log/zaigr-containerd.log 2>&1 &
+fi
+
+for _ in $(seq 1 30); do
+    [ -S /run/containerd/containerd.sock ] && break
+    sleep 1
+done
+
+if ! pgrep -x dockerd >/dev/null 2>&1; then
+    dockerd \
+        --host=unix:///var/run/docker.sock \
+        --containerd=/run/containerd/containerd.sock \
+        --storage-driver=fuse-overlayfs \
+        --bridge=docker0 \
+        --ip-forward=true \
+        --iptables=true \
+        --ip-masq=true \
+        --ip6tables=false \
+        --max-concurrent-downloads=1 \
+        --max-download-attempts=10 \
+        >"$log" 2>&1 &
+fi
+
+for _ in $(seq 1 60); do
+    if docker info >/dev/null 2>&1; then
+        chgrp user /var/run/docker.sock 2>/dev/null || true
+        chmod 660 /var/run/docker.sock 2>/dev/null || true
+        exit 0
+    fi
+    sleep 1
+done
+
+echo ":: Docker daemon did not become ready; see $log"
+exit 1
+EOF
+chmod 0755 /etc/zaigr/boot.d/10-docker
+/etc/zaigr/boot.d/10-docker

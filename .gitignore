@@ -1,0 +1,58 @@
+# Local tool and agent state
+.cache/
+.claude-config/
+.codex/
+.config
+.tmp/
+.tmp-go/
+.venv/
+.ruff_cache/
+
+# Python test/runtime caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Go build/test artifacts
+.go-cache/
+bin/
+*.test
+coverage.out
+*.coverprofile
+
+# zaigr build outputs
+/zaigr
+/cmd/zaigr/zaigr
+/release/dist/
+/release/state/
+/release/RELEASE_NOTES.md
+
+# Release/package artifacts that may be created outside release/dist/
+/*.deb
+/*.rpm
+/*.pkg.tar.zst
+/*.tar.gz
+/*.sha256
+
+# VM and rootfs build artifacts
+/zaigr-external-sources/
+/rootfs.img
+/rootfs-dev.img
+/rootfs.tar
+*.qcow2
+*.qcow2.wip
+*.img
+/cmd/zaigr/vm_data/bzImage
+/cmd/zaigr/vm_data/base-rootfs.img.zst
+/cmd/zaigr/vm_data/base-rootfs.version
+
+# Local workspaces and editor noise
+/test-workspace
+/tests/build/
+*.log
+*.swp
+*.swo
+.DS_Store

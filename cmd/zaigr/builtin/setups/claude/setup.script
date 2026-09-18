@@ -1,0 +1,12 @@
+#!/bin/bash
+set -euo pipefail
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export DEBIAN_FRONTEND=noninteractive
+
+echo ":: Installing Claude Code ..."
+apt-get update -qq
+apt-get install -y --no-install-recommends nodejs npm python3-yaml
+
+claude_version="${CLAUDE_CODE_VERSION:-2.1.140}"
+npm install -g "@anthropic-ai/claude-code@${claude_version}"

@@ -1,0 +1,21 @@
+#!/bin/bash
+set -euo pipefail
+
+log() {
+    echo ":: zaigr-boot-hooks: $*"
+}
+
+if [ ! -d /etc/zaigr/boot.d ]; then
+    log "no boot hooks directory"
+    exit 0
+fi
+
+for hook in /etc/zaigr/boot.d/*; do
+    [ -e "$hook" ] || continue
+    [ -x "$hook" ] || continue
+
+    log "running $hook"
+    "$hook"
+done
+
+log "boot hooks complete"

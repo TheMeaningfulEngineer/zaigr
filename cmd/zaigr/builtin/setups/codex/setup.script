@@ -1,0 +1,7 @@
+#!/bin/bash
+set -eu
+
+# Keep codex standalone until setups gain dependency support.
+apt-get update -qq
+apt-get install -y --no-install-recommends nodejs npm ripgrep python3-yaml
+npm install -g @openai/codex

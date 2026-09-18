@@ -1,0 +1,13 @@
+#!/bin/bash
+set -eu
+
+AGENT_STATE="/home/user/.zaigr-agent-state"
+if ! mountpoint -q "$AGENT_STATE"; then
+	echo "agent state mount not available: $AGENT_STATE" >&2
+	exit 1
+fi
+
+export CODEX_HOME="$AGENT_STATE/codex"
+mkdir -p "$CODEX_HOME"
+
+exec codex --dangerously-bypass-approvals-and-sandbox

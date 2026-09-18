@@ -1,0 +1,16 @@
+#!/bin/bash
+set -euo pipefail
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export DEBIAN_FRONTEND=noninteractive
+
+echo ":: Installing Mistral Vibe ..."
+apt-get update -qq
+apt-get install -y --no-install-recommends python3 python3-venv ripgrep ca-certificates
+
+mistral_vibe_version="${MISTRAL_VIBE_VERSION:-2.24.1}"
+python3 -m venv /opt/mistral-vibe
+/opt/mistral-vibe/bin/pip install --disable-pip-version-check \
+	"mistral-vibe==${mistral_vibe_version}"
+ln -sfn /opt/mistral-vibe/bin/vibe /usr/local/bin/vibe
+ln -sfn /opt/mistral-vibe/bin/vibe-acp /usr/local/bin/vibe-acp

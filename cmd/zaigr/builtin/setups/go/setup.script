@@ -1,0 +1,41 @@
+#!/bin/bash
+set -euo pipefail
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export DEBIAN_FRONTEND=noninteractive
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' EXIT
+
+install_tarball_binary() {
+    name="$1"
+    url="$2"
+    extract_dir="$tmpdir/$name"
+    mkdir -p "$extract_dir"
+    curl -4 -fsSL "$url" | tar -xz -C "$extract_dir"
+    binary="$(find "$extract_dir" -type f -name "$name" -perm -u+x | head -n 1)"
+    if [ -z "$binary" ]; then
+        echo ":: Could not find $name in release archive" >&2
+        exit 1
+    fi
+    install -m 0755 "$binary" "/usr/local/bin/$name"
+}
+
+# Install Go
+echo ":: Installing Go ..."
+go_version="${GO_VERSION:-1.24.4}"
+curl -4 -fsSL "https://go.dev/dl/go${go_version}.linux-amd64.tar.gz" | tar -C /usr/local -xz
+# Make Go available in all shell types (interactive, login, and non-interactive SSH)
+ln -sf /usr/local/go/bin/go /usr/local/bin/go
+ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+
+echo ":: Installing golangci-lint ..."
+golangci_lint_version="${GOLANGCI_LINT_VERSION:-2.12.2}"
+install_tarball_binary \
+    golangci-lint \
+    "https://github.com/golangci/golangci-lint/releases/download/v${golangci_lint_version}/golangci-lint-${golangci_lint_version}-linux-amd64.tar.gz"
+
+echo ":: Installing goreleaser ..."
+goreleaser_version="${GORELEASER_VERSION:-2.15.4}"
+install_tarball_binary \
+    goreleaser \
+    "https://github.com/goreleaser/goreleaser/releases/download/v${goreleaser_version}/goreleaser_Linux_x86_64.tar.gz"

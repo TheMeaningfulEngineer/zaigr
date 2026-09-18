@@ -1,0 +1,13 @@
+[Unit]
+Description=Run zaigr guest boot hooks
+After=opensnitch.service
+Requires=opensnitch.service
+Before=zaigr-runtime-ready.service ssh.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/zaigr/run-boot-hooks
+
+[Install]
+WantedBy=multi-user.target

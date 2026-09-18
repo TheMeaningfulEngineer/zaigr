@@ -1,0 +1,137 @@
+#!/bin/bash
+set -euo pipefail
+
+log() {
+    echo ":: zaigr-runtime-setup: $*"
+}
+
+fatal() {
+    echo ":: zaigr-runtime-setup: FATAL - $*" >&2
+    exit 1
+}
+
+cmdline_value() {
+    local key="$1"
+    sed -n "s/.*${key}=\\([^ ]*\\).*/\\1/p" /proc/cmdline
+}
+
+ensure_node() {
+    local path="$1"
+    local major="$2"
+    local minor="$3"
+
+    if [ ! -e "$path" ]; then
+        mknod -m 0666 "$path" c "$major" "$minor"
+    else
+        chmod 0666 "$path"
+    fi
+}
+
+ensure_mount() {
+    local target="$1"
+    shift
+
+    if ! mountpoint -q "$target"; then
+        mount "$@" "$target"
+    fi
+}
+
+write_proc() {
+    local path="$1"
+    local value="$2"
+
+    [ -e "$path" ] || fatal "missing $path"
+    printf '%s\n' "$value" > "$path"
+}
+
+log "preparing devices and runtime directories"
+mkdir -p /dev/shm
+ensure_mount /dev/shm -t tmpfs -o mode=1777,nosuid,nodev shm
+chmod 1777 /dev/shm
+
+# Host-owned project IP policy is reconciled after SSH becomes ready. Remove
+# image-carried copies before OpenSnitch starts so stale or captured rules can
+# never become active during boot. Capture tokens are likewise session-only.
+rm -f /etc/opensnitchd/rules/050-zaigr-project-ip-*.json
+rm -f /etc/opensnitchd/rules/000-zaigr-capture-allow-all-*.json
+
+mkdir -p /dev/mqueue
+ensure_mount /dev/mqueue -t mqueue mqueue
+
+mkdir -p /dev/pts
+ensure_mount /dev/pts -t devpts devpts
+
+ensure_node /dev/fuse 10 229
+mkdir -p /dev/net
+ensure_node /dev/net/tun 10 200
+ln -sfn /proc/self/fd /dev/fd
+
+mkdir -p /run/user/1000
+chown user:user /run/user/1000
+chmod 700 /run/user/1000
+
+[ -e /dev/mem ] && chmod 600 /dev/mem
+[ -e /dev/kmem ] && chmod 600 /dev/kmem
+if [ -e /dev/kvm ]; then
+    chgrp kvm /dev/kvm
+    chmod 0660 /dev/kvm
+fi
+
+vm_hostname="$(cmdline_value 'zaigr\.hostname')"
+vm_hostname="${vm_hostname:-zaigr}"
+hostname "$vm_hostname" || fatal "failed to set hostname from zaigr.hostname"
+
+host_epoch="$(cmdline_value 'zaigr\.host-epoch')"
+case "$host_epoch" in
+    ''|*[!0-9]*)
+        fatal "missing or invalid zaigr.host-epoch"
+        ;;
+esac
+date -s "@$host_epoch" >/dev/null || fatal "failed to set clock from zaigr.host-epoch"
+log "clock set from host epoch"
+
+log "mounting workspace and agent state"
+mkdir -p /home/user/workspace
+ensure_mount /home/user/workspace -t 9p -o trans=virtio,version=9p2000.L,cache=mmap workspace
+
+mkdir -p /home/user/.zaigr-agent-state
+ensure_mount /home/user/.zaigr-agent-state -t 9p -o trans=virtio,version=9p2000.L,cache=mmap zaigr_agent_state
+chmod 700 /home/user/.zaigr-agent-state || true
+
+log "configuring QEMU user networking"
+ip link set lo up
+[ -e /sys/class/net/eth0 ] || fatal "no eth0 found"
+ip link set eth0 mtu 1400 up
+if ! ip -4 addr show dev eth0 | grep -q '10\.0\.2\.15/24'; then
+    ip addr add 10.0.2.15/24 dev eth0
+fi
+ip route replace default via 10.0.2.2 dev eth0
+printf 'nameserver 10.0.2.3\n' > /etc/resolv.conf
+
+log "installing SSH public keys"
+root_pubkey="$(cmdline_value 'zaigr\.root-pubkey')"
+[ -n "$root_pubkey" ] || fatal "missing zaigr.root-pubkey"
+user_pubkey="$(cmdline_value 'zaigr\.user-pubkey')"
+[ -n "$user_pubkey" ] || fatal "missing zaigr.user-pubkey"
+mkdir -p /run/zaigr-ssh
+printf '%s' "$root_pubkey" | base64 -d > /run/zaigr-ssh/root-authorized-keys || fatal "invalid zaigr.root-pubkey"
+printf '%s' "$user_pubkey" | base64 -d > /run/zaigr-ssh/user-authorized-keys || fatal "invalid zaigr.user-pubkey"
+chown root:root /run/zaigr-ssh /run/zaigr-ssh/root-authorized-keys /run/zaigr-ssh/user-authorized-keys
+chmod 755 /run/zaigr-ssh
+chmod 644 /run/zaigr-ssh/root-authorized-keys /run/zaigr-ssh/user-authorized-keys
+
+log "preparing SSH host state"
+mkdir -p /run/sshd
+ssh-keygen -A >/dev/null
+
+log "applying hardening sysctls"
+write_proc /proc/sys/kernel/dmesg_restrict 1
+write_proc /proc/sys/kernel/kptr_restrict 2
+write_proc /proc/sys/kernel/perf_event_paranoid 3
+
+if [ -d /sys/kernel/tracing ]; then
+    log "mounting tracefs"
+    ensure_mount /sys/kernel/tracing -t tracefs tracefs
+fi
+
+log "runtime setup complete"

@@ -1,0 +1,223 @@
+#!/bin/bash
+set -euo pipefail
+
+readonly agent_state_parent=/home/user/.zaigr-agent-state
+readonly private_runtime=/run/zaigr-preset-isolation
+
+fatal() {
+	printf 'zaigr preset isolation: %s\n' "$*" >&2
+	exit 1
+}
+
+decode_argument() {
+	local encoded="$1"
+	local decoded
+
+	decoded="$(printf '%s' "$encoded" | base64 -d && printf .)" || fatal "invalid encoded argument"
+	printf '%s' "${decoded%.}"
+}
+
+decode_optional_argument() {
+	local encoded="$1"
+
+	if [[ "$encoded" == "-" ]]; then
+		return
+	fi
+	decode_argument "$encoded"
+}
+
+validate_preset_name() {
+	local name="$1"
+
+	case "$name" in
+	"" | "." | ".." | *..* | */* | *\\*)
+		fatal "invalid preset name"
+		;;
+	esac
+}
+
+require_preset_state() {
+	local state_dir="$1"
+
+	mountpoint -q "$agent_state_parent" || fatal "agent-state parent is not mounted"
+	if [[ -e "$state_dir" || -L "$state_dir" ]]; then
+		[[ -d "$state_dir" && ! -L "$state_dir" ]] || fatal "preset state is not a directory"
+	else
+		mkdir -- "$state_dir" || fatal "cannot create preset state"
+	fi
+	setpriv --reuid=user --regid=user --init-groups -- \
+		test -r "$state_dir" -a -w "$state_dir" -a -x "$state_dir" || \
+		fatal "preset state is not accessible to user"
+}
+
+forward_signal() {
+	local signal="$1"
+
+	if [[ -n "${preset_pid:-}" ]]; then
+		kill -"$signal" "$preset_pid" 2>/dev/null || true
+	fi
+}
+
+mask_host_credential() {
+	local path="$1"
+
+	[[ -n "$path" ]] || return 0
+	case "$path" in
+	/home/user/workspace/* | /workspace/*) ;;
+	*) fatal "invalid workspace credential path" ;;
+	esac
+	[[ -f "$path" && ! -L "$path" ]] || fatal "host credential is not a regular workspace file"
+	mount --bind "$private_runtime/hidden-credential" "$path" || \
+		fatal "cannot hide host credential from preset"
+}
+
+mask_workspace_agent_state() {
+	local path="$1"
+
+	[[ -n "$path" ]] || return 0
+	case "$path" in
+	/home/user/workspace/* | /workspace/*) ;;
+	*) fatal "invalid workspace agent-state path" ;;
+	esac
+	[[ -d "$path" && ! -L "$path" ]] || fatal "host agent state is not a regular workspace directory"
+	mount -t tmpfs -o mode=000,nosuid,nodev tmpfs "$path" || \
+		fatal "cannot hide host agent state from preset"
+}
+
+mask_workspace_control_state() {
+	local path="$1"
+
+	[[ -n "$path" ]] || return 0
+	case "$path" in
+	/home/user/workspace/* | /workspace/*) ;;
+	*) fatal "invalid workspace control-state path" ;;
+	esac
+	[[ -d "$path" && ! -L "$path" ]] || fatal "host control state is not a regular workspace directory"
+	mount -t tmpfs -o mode=000,nosuid,nodev tmpfs "$path" || \
+		fatal "cannot hide host control state from preset"
+}
+
+run_inside_isolation() {
+	local encoded_name="$1"
+	local encoded_script="$2"
+	local root_key_path="$3"
+	local user_key_path="$4"
+	local workspace_agent_state_path="$5"
+	local workspace_control_state_path="$6"
+	local preset_name state_dir selected_state run_script workspace status terminal
+
+	preset_name="$(decode_argument "$encoded_name")"
+	validate_preset_name "$preset_name"
+	state_dir="$agent_state_parent/$preset_name"
+	require_preset_state "$state_dir"
+
+	mkdir -p "$private_runtime" || fatal "cannot prepare private runtime mountpoint"
+	mount -t tmpfs -o mode=0700,nosuid,nodev tmpfs "$private_runtime" || \
+		fatal "cannot create private runtime"
+	: > "$private_runtime/hidden-credential" || fatal "cannot prepare credential mask"
+	chmod 000 "$private_runtime/hidden-credential" || fatal "cannot protect credential mask"
+
+	selected_state="$private_runtime/state"
+	mkdir "$selected_state" || fatal "cannot prepare selected state mountpoint"
+	mount --bind "$state_dir" "$selected_state" || fatal "cannot preserve selected preset state"
+
+	mount -t tmpfs -o mode=0711,nosuid,nodev tmpfs "$agent_state_parent" || \
+		fatal "cannot hide agent-state parent"
+	mkdir -- "$agent_state_parent/$preset_name" || fatal "cannot prepare isolated preset state path"
+	mount --bind "$selected_state" "$agent_state_parent/$preset_name" || \
+		fatal "cannot expose selected preset state"
+	umount "$selected_state" || fatal "cannot detach selected state staging mount"
+	rmdir "$selected_state" || fatal "cannot remove selected state staging path"
+
+	mount -o remount,hidepid=2,nosuid,nodev,noexec /proc || \
+		fatal "cannot protect preset process view"
+	mask_host_credential "$root_key_path"
+	mask_host_credential "$user_key_path"
+	mask_workspace_agent_state "$workspace_agent_state_path"
+	mask_workspace_control_state "$workspace_control_state_path"
+
+	run_script="$private_runtime/run"
+	printf '%s' "$encoded_script" | base64 -d > "$run_script" || fatal "invalid encoded run script"
+	chmod 0444 "$run_script" || fatal "cannot protect isolated run script"
+	chmod 0711 "$private_runtime" || fatal "cannot expose isolated run script"
+	unset encoded_script
+
+	workspace=""
+	for candidate in /home/user/workspace /workspace; do
+		if [[ -d "$candidate" ]]; then
+			workspace="$candidate"
+			break
+		fi
+	done
+	if [[ -z "$workspace" ]]; then
+		workspace=/home/user
+	fi
+	cd "$workspace" || fatal "cannot enter preset workspace"
+
+	trap 'forward_signal HUP' HUP
+	trap 'forward_signal INT' INT
+	trap 'forward_signal QUIT' QUIT
+	trap 'forward_signal TERM' TERM
+	terminal="${TERM:-xterm-256color}"
+
+	set +e
+	setpriv --reuid=user --regid=user --init-groups -- \
+		env -i \
+		HOME=/home/user \
+		USER=user \
+		LOGNAME=user \
+		SHELL=/bin/bash \
+		XDG_RUNTIME_DIR=/run/user/1000 \
+		WORKSPACE="$workspace" \
+		PATH=/home/user/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+		TERM="$terminal" \
+		bash -c '
+			for fd_path in /proc/self/fd/*; do
+				fd="${fd_path##*/}"
+				case "$fd" in
+				0 | 1 | 2) continue ;;
+				esac
+				[[ "$fd" =~ ^[0-9]+$ ]] || continue
+				eval "exec ${fd}>&-" 2>/dev/null || true
+			done
+			exec bash "$1"
+		' zaigr-preset "$run_script" <&0 >&1 2>&2 &
+	preset_pid=$!
+	while true; do
+		wait "$preset_pid"
+		status=$?
+		if ! kill -0 "$preset_pid" 2>/dev/null; then
+			break
+		fi
+	done
+	exit "$status"
+}
+
+if [[ "${1:-}" == "--inside" ]]; then
+	[[ $# -eq 7 ]] || fatal "invalid internal invocation"
+	run_inside_isolation "$2" "$3" "$(decode_optional_argument "$4")" \
+		"$(decode_optional_argument "$5")" "$(decode_optional_argument "$6")" \
+		"$(decode_optional_argument "$7")"
+fi
+
+[[ $# -eq 6 ]] || fatal "expected encoded preset name, run script, and protected workspace paths"
+readonly encoded_name="$1"
+readonly encoded_script="$2"
+readonly encoded_root_key_path="$3"
+readonly encoded_user_key_path="$4"
+readonly encoded_workspace_agent_state_path="$5"
+readonly encoded_workspace_control_state_path="$6"
+readonly preset_name="$(decode_argument "$encoded_name")"
+validate_preset_name "$preset_name"
+require_preset_state "$agent_state_parent/$preset_name"
+
+exec unshare \
+	--mount \
+	--pid \
+	--fork \
+	--kill-child=TERM \
+	--mount-proc=/proc \
+	--propagation private \
+	-- "$0" --inside "$encoded_name" "$encoded_script" "$encoded_root_key_path" \
+	"$encoded_user_key_path" "$encoded_workspace_agent_state_path" \
+	"$encoded_workspace_control_state_path"

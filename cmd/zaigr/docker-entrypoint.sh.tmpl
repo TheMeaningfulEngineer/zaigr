@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Activate all overlaid features.
+for env_sh in /opt/zaigr/*/env.sh; do
+  [ -f "$env_sh" ] || continue
+  feature_name="$(basename "$(dirname "$env_sh")")"
+  export FEATURE_STATE_DIR="{{.ContainerWorkspace}}/.zaigr-state/${feature_name}"
+  mkdir -p "$FEATURE_STATE_DIR"
+  auth_dir="/opt/zaigr-auth/${feature_name}"
+  if [ -d "$auth_dir" ]; then
+    export FEATURE_AUTH_DIR="$auth_dir"
+  fi
+  # shellcheck disable=SC1090
+  source "$env_sh"
+done
+
+exec "$@"
