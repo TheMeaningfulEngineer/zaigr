@@ -1,0 +1,237 @@
+#!/bin/bash
+set -euo pipefail
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export DEBIAN_FRONTEND=noninteractive
+
+echo ":: Installing k3s ..."
+apt-get update -qq
+apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    iproute2 \
+    iptables \
+    nftables \
+    tar
+
+mkdir -p /etc/opensnitchd/rules
+cat > /etc/opensnitchd/rules/020-zaigr-k3s-pod-cidr.json <<'EOF'
+{
+  "name": "020-zaigr-k3s-pod-cidr",
+  "description": "Allow only k3s cluster-local pod CIDR traffic. External egress remains domain controlled.",
+  "enabled": true,
+  "precedence": true,
+  "action": "allow",
+  "duration": "always",
+  "operator": {
+    "type": "network",
+    "sensitive": false,
+    "operand": "dest.network",
+    "data": "10.42.0.0/16"
+  }
+}
+EOF
+cat > /etc/opensnitchd/rules/020-zaigr-k3s-service-cidr.json <<'EOF'
+{
+  "name": "020-zaigr-k3s-service-cidr",
+  "description": "Allow only k3s cluster-local service CIDR traffic. External egress remains domain controlled.",
+  "enabled": true,
+  "precedence": true,
+  "action": "allow",
+  "duration": "always",
+  "operator": {
+    "type": "network",
+    "sensitive": false,
+    "operand": "dest.network",
+    "data": "10.43.0.0/16"
+  }
+}
+EOF
+
+mkdir -p /etc/zaigr/internal-cidrs.d /usr/local/lib/zaigr
+cat > /etc/zaigr/internal-cidrs.d/k3s.conf <<'EOF'
+pod=10.42.0.0/16
+service=10.43.0.0/16
+EOF
+chmod 0644 /etc/zaigr/internal-cidrs.d/k3s.conf
+
+cat > /usr/local/lib/zaigr/k3s-internal-network <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+pod_cidr=10.42.0.0/16
+service_cidr=10.43.0.0/16
+pod_probe=10.42.0.1
+service_probe=10.43.0.1
+
+log() {
+    echo ":: zaigr-k3s-internal-network: $*"
+}
+
+fail() {
+    echo ":: zaigr-k3s-internal-network: FATAL - $*" >&2
+    exit 1
+}
+
+ensure_blackhole_fallback() {
+    local cidr="$1"
+    ip route replace blackhole "$cidr" metric 42700
+}
+
+route_uses_default_dev() {
+    local addr="$1"
+    local default_dev="$2"
+    ip route get "$addr" 2>/dev/null | grep -q " dev ${default_dev} "
+}
+
+require_not_gateway_routed() {
+    local addr="$1"
+    local label="$2"
+    local default_dev
+
+    default_dev=$(ip -4 route show default 0.0.0.0/0 | awk '{print $5; exit}')
+    [ -n "$default_dev" ] || fail "no IPv4 default route found"
+    if route_uses_default_dev "$addr" "$default_dev"; then
+        ip route get "$addr" >&2 || true
+        fail "$label cluster CIDR would route through default interface ${default_dev}"
+    fi
+}
+
+ensure_blackhole_fallback "$pod_cidr"
+ensure_blackhole_fallback "$service_cidr"
+require_not_gateway_routed "$pod_probe" "pod"
+require_not_gateway_routed "$service_probe" "service"
+log "cluster CIDR fallback routes installed and validated"
+EOF
+chmod 0755 /usr/local/lib/zaigr/k3s-internal-network
+
+cat > /etc/opensnitchd/rules/021-zaigr-k3s-kubelet-localhost.json <<'EOF'
+{
+  "name": "021-zaigr-k3s-kubelet-localhost",
+  "description": "Allow k3s kubelet localhost control traffic only.",
+  "enabled": true,
+  "precedence": true,
+  "action": "allow",
+  "duration": "always",
+  "operator": {
+    "type": "simple",
+    "sensitive": false,
+    "operand": "dest.ip",
+    "data": "127.0.0.1"
+  }
+}
+EOF
+
+/usr/local/lib/zaigr/k3s-internal-network
+
+helm_version="${HELM_VERSION:-v3.20.2}"
+go_version="${GO_VERSION:-1.25.11}"
+mkdir -p /mnt
+helm_tmp="$(mktemp -d /mnt/zaigr-helm.XXXXXX)"
+cleanup_helm_tmp() {
+    if mountpoint -q "$helm_tmp"; then
+        umount "$helm_tmp"
+    fi
+    rm -rf "$helm_tmp"
+}
+trap cleanup_helm_tmp EXIT
+mount -t tmpfs -o size="${HELM_BUILD_TMPFS_SIZE:-3072m}" tmpfs "$helm_tmp"
+curl -4 -fsSL "https://go.dev/dl/go${go_version}.linux-amd64.tar.gz" | tar -C "$helm_tmp" -xz
+mkdir -p "${helm_tmp}/gomod" "${helm_tmp}/gocache" "${helm_tmp}/gotmp"
+env \
+    PATH="${helm_tmp}/go/bin:${PATH}" \
+    GOBIN=/usr/local/bin \
+    GOMODCACHE="${helm_tmp}/gomod" \
+    GOCACHE="${helm_tmp}/gocache" \
+    GOTMPDIR="${helm_tmp}/gotmp" \
+    GOTOOLCHAIN=local \
+    GOPROXY=https://proxy.golang.org,direct \
+    go install "helm.sh/helm/v3/cmd/helm@${helm_version}"
+helm version --short
+cleanup_helm_tmp
+trap - EXIT
+
+export K3S_KUBECONFIG_MODE=0644
+export INSTALL_K3S_VERSION="v1.35.5+k3s1"
+export INSTALL_K3S_FORCE_RESTART=true
+curl -sfL https://get.k3s.io | sh -
+
+wait_for_k3s_ready() {
+    for _ in $(seq 1 360); do
+        if k3s kubectl wait --for=condition=Ready node --all --timeout=5s >/dev/null 2>&1 && \
+           k3s kubectl -n kube-system rollout status deployment/coredns --timeout=5s >/dev/null 2>&1 && \
+           k3s kubectl -n kube-system rollout status deployment/local-path-provisioner --timeout=5s >/dev/null 2>&1 && \
+           k3s kubectl -n kube-system rollout status deployment/metrics-server --timeout=5s >/dev/null 2>&1 && \
+           k3s kubectl -n kube-system rollout status deployment/traefik --timeout=5s >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+dump_k3s_diagnostics() {
+    echo ":: /proc/cgroups"
+    cat /proc/cgroups || true
+    echo ":: mounted cgroups"
+    findmnt -R /sys/fs/cgroup || true
+    echo ":: k3s service status"
+    systemctl status k3s --no-pager || true
+    echo ":: k3s service journal"
+    journalctl -u k3s --no-pager -n 200 || true
+    echo ":: kube-system pods"
+    k3s kubectl get pods -n kube-system -o wide || true
+    echo ":: kube-system services"
+    k3s kubectl get svc -n kube-system -o wide || true
+    echo ":: storage classes"
+    k3s kubectl get storageclass || true
+    echo ":: coredns description"
+    k3s kubectl describe pod -n kube-system -l k8s-app=kube-dns || true
+    echo ":: coredns logs"
+    k3s kubectl logs -n kube-system -l k8s-app=kube-dns --tail=100 || true
+}
+
+mkdir -p /home/user/.kube
+cp /etc/rancher/k3s/k3s.yaml /home/user/.kube/config
+chown -R user:user /home/user/.kube
+cat > /etc/profile.d/zaigr-k3s.sh <<'EOF'
+export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
+EOF
+chmod 0644 /etc/profile.d/zaigr-k3s.sh
+
+mkdir -p /etc/zaigr/boot.d
+cat > /etc/zaigr/boot.d/30-k3s-ready <<'EOF'
+#!/bin/bash
+set -eu
+/usr/local/lib/zaigr/k3s-internal-network
+for _ in $(seq 1 180); do
+    if systemctl is-active --quiet k3s && \
+       k3s kubectl wait --for=condition=Ready node --all --timeout=5s >/dev/null 2>&1 && \
+       k3s kubectl -n kube-system rollout status deployment/coredns --timeout=5s >/dev/null 2>&1 && \
+       k3s kubectl -n kube-system rollout status deployment/local-path-provisioner --timeout=5s >/dev/null 2>&1 && \
+       k3s kubectl -n kube-system rollout status deployment/metrics-server --timeout=5s >/dev/null 2>&1 && \
+       k3s kubectl -n kube-system rollout status deployment/traefik --timeout=5s >/dev/null 2>&1; then
+        exit 0
+    fi
+    sleep 1
+done
+
+echo ":: k3s did not become ready during boot"
+systemctl status k3s --no-pager || true
+journalctl -u k3s --no-pager -n 100 || true
+k3s kubectl get pods -n kube-system -o wide || true
+k3s kubectl get svc -n kube-system -o wide || true
+k3s kubectl get storageclass || true
+k3s kubectl describe pod -n kube-system -l k8s-app=kube-dns || true
+k3s kubectl logs -n kube-system -l k8s-app=kube-dns --tail=100 || true
+exit 1
+EOF
+chmod 0755 /etc/zaigr/boot.d/30-k3s-ready
+
+if wait_for_k3s_ready; then
+    exit 0
+fi
+
+echo ":: k3s did not become ready; see systemctl status k3s and journalctl -u k3s"
+dump_k3s_diagnostics
+exit 1

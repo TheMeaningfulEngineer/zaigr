@@ -1,0 +1,5 @@
+#!/bin/bash
+set -eu
+
+apt-get update -qq
+apt-get install -y --no-install-recommends nodejs npm

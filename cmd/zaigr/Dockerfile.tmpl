@@ -1,0 +1,21 @@
+FROM debian:unstable-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    curl \
+    git \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -s /bin/bash zaigr
+
+ENV HOME={{.ContainerHome}}
+WORKDIR {{.ContainerWorkspace}}
+
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+USER zaigr
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD []

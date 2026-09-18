@@ -1,0 +1,15 @@
+#!/bin/bash
+set -euo pipefail
+
+for _ in $(seq 1 30); do
+    if pgrep -x opensnitchd >/dev/null 2>&1 \
+        && grep -Fq 'Running on netfilter queue #0' /var/log/opensnitchd.log 2>/dev/null \
+        && grep -Fq '[eBPF DNS] worker initialized #0' /var/log/opensnitchd.log 2>/dev/null; then
+        exit 0
+    fi
+    sleep 1
+done
+
+echo ":: zaigr-opensnitch: FATAL - opensnitchd did not become ready" >&2
+tail -20 /var/log/opensnitchd.log 2>/dev/null || true
+exit 1

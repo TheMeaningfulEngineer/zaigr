@@ -1,0 +1,9 @@
+#!/bin/bash
+set -eu
+
+WORKSPACE="${WORKSPACE:-/home/user/workspace}"
+if [ -d "$WORKSPACE" ]; then
+    cd "$WORKSPACE"
+fi
+
+exec bash -l

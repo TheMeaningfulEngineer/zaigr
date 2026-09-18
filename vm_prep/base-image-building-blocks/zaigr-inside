@@ -1,0 +1,490 @@
+#!/bin/bash
+set -eu
+set -f
+
+ALLOWED_FILE=${ZAIGR_INSIDE_ALLOWED_FILE:-/etc/opensnitchd/lists/domains/allowed.txt}
+LOG_FILE=${ZAIGR_INSIDE_LOG_FILE:-/var/log/opensnitchd.log}
+BLOCKED_GRACE_SECONDS=${ZAIGR_INSIDE_BLOCKED_GRACE_SECONDS:-2}
+RULES_DIR=${ZAIGR_INSIDE_RULES_DIR:-/etc/opensnitchd/rules}
+
+usage() {
+    cat >&2 <<'EOF'
+Usage:
+  zaigr-inside firewall allow <domain> [<domain> ...]
+  zaigr-inside firewall remove <domain> [<domain> ...]
+  zaigr-inside firewall list
+  zaigr-inside firewall domain-log
+  zaigr-inside firewall reload-domains
+  zaigr-inside firewall sync-ips [--revoke <ipv4>] -- [<ipv4> ...]
+EOF
+}
+
+die() {
+    echo "$*" >&2
+    exit 1
+}
+
+require_root() {
+    if [ "$(id -u)" != "0" ]; then
+        die "zaigr-inside must be run as root"
+    fi
+}
+
+normalize_domain() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+is_valid_domain() {
+    local domain=$1
+    [ "${#domain}" -le 253 ] || return 1
+    [[ "$domain" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]
+}
+
+prepare_allowed_file() {
+    install -d -m 0755 "$(dirname "$ALLOWED_FILE")"
+    touch "$ALLOWED_FILE"
+    chmod 0644 "$ALLOWED_FILE"
+}
+
+firewall_allow() {
+    [ "$#" -gt 0 ] || die "missing domain"
+
+    local domains=()
+    local raw domain
+    for raw in "$@"; do
+        domain=$(normalize_domain "$raw")
+        if ! is_valid_domain "$domain"; then
+            die "invalid domain: $raw"
+        fi
+        domains+=("$domain")
+    done
+
+    prepare_allowed_file
+    for domain in "${domains[@]}"; do
+        if grep -qxF -- "$domain" "$ALLOWED_FILE"; then
+            echo "already allowed $domain"
+        else
+            printf '%s\n' "$domain" >> "$ALLOWED_FILE"
+            echo "allowed $domain"
+        fi
+    done
+    echo "manual VM firewall change; not part of a setup"
+}
+
+firewall_remove() {
+    [ "$#" -gt 0 ] || die "missing domain"
+
+    local domains=()
+    local raw domain
+    for raw in "$@"; do
+        domain=$(normalize_domain "$raw")
+        if ! is_valid_domain "$domain"; then
+            die "invalid domain: $raw"
+        fi
+        domains+=("$domain")
+    done
+
+    prepare_allowed_file
+    for domain in "${domains[@]}"; do
+        if ! grep -qxF -- "$domain" "$ALLOWED_FILE"; then
+            die "not allowed $domain"
+        fi
+    done
+
+    local tmp
+    tmp=$(mktemp "${ALLOWED_FILE}.XXXXXX")
+    while IFS= read -r line || [ -n "$line" ]; do
+        for domain in "${domains[@]}"; do
+            if [ "$line" = "$domain" ]; then
+                continue 2
+            fi
+        done
+        printf '%s\n' "$line" >> "$tmp"
+    done < "$ALLOWED_FILE"
+    chmod 0644 "$tmp"
+    mv "$tmp" "$ALLOWED_FILE"
+
+    for domain in "${domains[@]}"; do
+        echo "removed $domain"
+    done
+    echo "manual VM firewall change; not part of a setup"
+}
+
+firewall_list() {
+    [ -f "$ALLOWED_FILE" ] || return 0
+    sed -e 's/[[:space:]]*$//' "$ALLOWED_FILE" | sed '/^[[:space:]]*$/d; /^[[:space:]]*#/d'
+}
+
+is_valid_ipv4() {
+    local address=$1 octet
+    local -a octets
+    [[ "$address" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    IFS=. read -r -a octets <<< "$address"
+    [ "${#octets[@]}" -eq 4 ] || return 1
+    for octet in "${octets[@]}"; do
+        [ "$octet" = "0" ] || [[ "$octet" =~ ^[1-9][0-9]*$ ]] || return 1
+        [ "$((10#$octet))" -le 255 ] || return 1
+    done
+    [ "$address" != "0.0.0.0" ] || return 1
+    [ "$address" != "255.255.255.255" ] || return 1
+    [ "$((10#${octets[0]}))" -lt 224 ] || [ "$((10#${octets[0]}))" -gt 239 ] || return 1
+}
+
+project_ip_rule_path() {
+    printf '%s/050-zaigr-project-ip-%s.json' "$RULES_DIR" "${1//./-}"
+}
+
+wait_for_named_rule_load() {
+    local path=$1 status=$2 name=$3 offset=$4 expected_operator=${5:-} attempt needle
+    needle="Loaded rule from $path: [$status] $name:"
+    if [ -n "$expected_operator" ]; then
+        needle="$needle $expected_operator"
+    fi
+    for attempt in $(seq 1 60); do
+        if tail -c "+$offset" "$LOG_FILE" 2>/dev/null \
+            | sed -E $'s|\x1B\\[[0-9;?]*[ -/]*[@-~]||g' \
+            | grep -Fq "$needle"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    die "OpenSnitch did not acknowledge loading firewall rule $path"
+}
+
+wait_for_rule_load() {
+    local path=$1 address=$2 enabled=$3 offset=$4 operator_data=$5 status name
+    status=Enabled
+    [ "$enabled" = true ] || status=Disabled
+    name="050-zaigr-project-ip-${address//./-}"
+    wait_for_named_rule_load "$path" "$status" "$name" "$offset" \
+        "if(dest.ip matches '$operator_data'){ allow always }"
+}
+
+write_project_ip_rule() {
+    local address=$1 enabled=$2 path tmp offset publication operator_data
+    path=$(project_ip_rule_path "$address")
+    publication="$(date +%s%N)${BASHPID}${RANDOM}"
+    # The anchored zero-repeat term preserves the exact-IP match while making
+    # this publication uniquely identifiable in OpenSnitch's load log.
+    operator_data="^${address//./[.]}\$(${publication}){0}"
+    tmp=$(mktemp "$RULES_DIR/.zaigr-project-ip.XXXXXX")
+    cat > "$tmp" <<EOF
+{
+  "name": "050-zaigr-project-ip-${address//./-}",
+  "description": "Host-managed exact project IPv4 permission for $address",
+  "enabled": $enabled,
+  "precedence": true,
+  "action": "allow",
+  "duration": "always",
+  "operator": {
+    "type": "regexp",
+    "sensitive": false,
+    "operand": "dest.ip",
+    "data": "$operator_data"
+  }
+}
+EOF
+    chmod 0600 "$tmp"
+    mv "$tmp" "$path"
+    offset=$(( $(wc -c < "$LOG_FILE") + 1 ))
+    printf '\n' >> "$path"
+    wait_for_rule_load "$path" "$address" "$enabled" "$offset" "$operator_data"
+}
+
+write_domain_list_rule() {
+    local enabled=$1 path tmp offset status
+    path="$RULES_DIR/100-allow-whitelisted-domains.json"
+    tmp=$(mktemp "$RULES_DIR/.zaigr-domain-list.XXXXXX")
+    cat > "$tmp" <<EOF
+{"name":"100-allow-whitelisted-domains","enabled":$enabled,"action":"allow","duration":"always","operator":{"type":"lists","operand":"lists.domains_regexp","data":"/etc/opensnitchd/lists/domains/"}}
+EOF
+    chmod 0600 "$tmp"
+    mv "$tmp" "$path"
+    offset=$(( $(wc -c < "$LOG_FILE") + 1 ))
+    printf '\n' >> "$path"
+    status=Enabled
+    [ "$enabled" = true ] || status=Disabled
+    wait_for_named_rule_load "$path" "$status" "100-allow-whitelisted-domains" "$offset"
+}
+
+firewall_reload_domains() {
+    install -d -m 0755 "$RULES_DIR"
+    # The disabled generation drains older queued events before the enabled
+    # generation recompiles the domain list from its updated contents.
+    write_domain_list_rule false
+    write_domain_list_rule true
+}
+
+is_inbound_control_ssh_flow() {
+    local peer_address=$1 local_address=$2 peer_port=$3 matches
+    if ! matches=$(conntrack -L -f ipv4 -p tcp \
+        --orig-src "$peer_address" --orig-dst "$local_address" \
+        --sport "$peer_port" --dport 22 2>/dev/null); then
+        die "could not inspect source-port-22 conntrack flow from $peer_address"
+    fi
+    [ -n "$matches" ]
+}
+
+close_revoked_ip_sockets() {
+    local address=$1 state recvq sendq local_endpoint peer_endpoint
+    local local_address local_port peer_port remaining
+
+    ss -K -H -4 -t dst "$address" 'sport != :22' >/dev/null
+    # A host-alias grant can share the peer address used by zaigr's inbound
+    # SSH transport. Preserve only sockets whose original conntrack direction
+    # is peer-to-local port 22; an outbound process can spoof a name or port.
+    while read -r state recvq sendq local_endpoint peer_endpoint; do
+        [ -n "$local_endpoint" ] || continue
+        local_address=${local_endpoint%:*}
+        local_port=${local_endpoint##*:}
+        peer_port=${peer_endpoint##*:}
+        if is_inbound_control_ssh_flow "$address" "$local_address" "$peer_port"; then
+            continue
+        fi
+        ss -K -H -4 -t \
+            src "$local_address" sport = ":$local_port" \
+            dst "$address" dport = ":$peer_port" >/dev/null
+    done < <(ss -H -4 -t -n dst "$address" sport = :22)
+    ss -K -H -4 -u dst "$address" >/dev/null
+
+    remaining=$(ss -H -4 -t -n dst "$address" 'sport != :22')
+    [ -z "$remaining" ] || die "could not revoke every outbound TCP socket to $address"
+    remaining=$(ss -H -4 -u -n dst "$address")
+    [ -z "$remaining" ] || die "could not revoke every outbound UDP socket to $address"
+    while read -r state recvq sendq local_endpoint peer_endpoint; do
+        [ -n "$local_endpoint" ] || continue
+        local_address=${local_endpoint%:*}
+        peer_port=${peer_endpoint##*:}
+        if is_inbound_control_ssh_flow "$address" "$local_address" "$peer_port"; then
+            continue
+        fi
+        die "could not revoke an outbound source-port-22 TCP socket to $address"
+    done < <(ss -H -4 -t -n dst "$address" sport = :22)
+
+    # Socket destruction and conntrack deletion are both required: a UDP
+    # client can otherwise bind the same source port and reuse an established
+    # tuple without traversing OpenSnitch's NEW/RELATED queue.
+    conntrack -D -f ipv4 -d "$address" >/dev/null 2>&1 || true
+    if ! remaining=$(conntrack -L -f ipv4 -d "$address" 2>/dev/null); then
+        die "could not verify conntrack revocation for $address"
+    fi
+    [ -z "$remaining" ] || die "could not revoke every outbound conntrack flow to $address"
+}
+
+firewall_sync_ips() {
+    local -a revoked=() desired=()
+    local -a managed_paths=()
+    local address path name managed_list
+    while [ "$#" -gt 0 ] && [ "$1" = "--revoke" ]; do
+        [ "$#" -ge 2 ] || die "missing IPv4 address after --revoke"
+        is_valid_ipv4 "$2" || die "invalid exact IPv4 address: $2"
+        revoked+=("$2")
+        shift 2
+    done
+    [ "$#" -gt 0 ] && [ "$1" = "--" ] || die "firewall sync-ips requires -- before the desired addresses"
+    shift
+    for address in "$@"; do
+        is_valid_ipv4 "$address" || die "invalid exact IPv4 address: $address"
+        desired+=("$address")
+    done
+
+    install -d -m 0755 "$RULES_DIR"
+    declare -A desired_paths=()
+    for address in "${desired[@]}"; do
+        path=$(project_ip_rule_path "$address")
+        desired_paths[$path]=1
+        # Acknowledging a disabled generation first drains any older queued
+        # write for this path before the enabled generation is published.
+        write_project_ip_rule "$address" false
+        write_project_ip_rule "$address" true
+    done
+
+    managed_list=$(mktemp "$RULES_DIR/.zaigr-managed-paths.XXXXXX")
+    if ! find "$RULES_DIR" -maxdepth 1 -type f \
+        -name '050-zaigr-project-ip-*.json' -print0 > "$managed_list"; then
+        rm -f "$managed_list"
+        die "could not enumerate existing project IPv4 firewall rules"
+    fi
+    if ! mapfile -d '' -t managed_paths < "$managed_list"; then
+        rm -f "$managed_list"
+        die "could not read existing project IPv4 firewall rule list"
+    fi
+    rm -f "$managed_list"
+    for path in "${managed_paths[@]}"; do
+        [ -z "${desired_paths[$path]:-}" ] || continue
+        name=${path##*/050-zaigr-project-ip-}
+        name=${name%.json}
+        address=${name//-/.}
+        if is_valid_ipv4 "$address"; then
+            write_project_ip_rule "$address" false
+        fi
+        rm -f "$path"
+    done
+
+    for address in "${revoked[@]}"; do
+        close_revoked_ip_sockets "$address"
+    done
+}
+
+strip_ansi() {
+    sed -E $'s|\x1B\\[[0-9;?]*[ -/]*[@-~]||g'
+}
+
+declare -A DOMAIN_PENDING=()
+declare -A DOMAIN_STATUS=()
+
+mark_connect() {
+    local domain=$1
+    if [ -z "${DOMAIN_STATUS[$domain]:-}" ] && [ -z "${DOMAIN_PENDING[$domain]:-}" ]; then
+        DOMAIN_PENDING[$domain]=$(date +%s)
+    fi
+}
+
+mark_allowed() {
+    local domain=$1
+    unset "DOMAIN_PENDING[$domain]"
+    if [ "${DOMAIN_STATUS[$domain]:-}" != "allowed" ]; then
+        DOMAIN_STATUS[$domain]=allowed
+        echo "allowed $domain"
+    fi
+}
+
+emit_due_blocked() {
+    local now=$1
+    local due=()
+    local domain first_seen
+    for domain in "${!DOMAIN_PENDING[@]}"; do
+        first_seen=${DOMAIN_PENDING[$domain]}
+        if [ $((now - first_seen)) -ge "$BLOCKED_GRACE_SECONDS" ]; then
+            due+=("$domain")
+        fi
+    done
+
+    [ "${#due[@]}" -gt 0 ] || return 0
+    while IFS= read -r domain; do
+        [ -n "$domain" ] || continue
+        unset "DOMAIN_PENDING[$domain]"
+        if [ -z "${DOMAIN_STATUS[$domain]:-}" ]; then
+            DOMAIN_STATUS[$domain]=blocked
+            echo "blocked $domain"
+        fi
+    done < <(printf '%s\n' "${due[@]}" | sort)
+}
+
+handle_log_line() {
+    local line proto domain port target
+    local connect_re='new[[:space:]]connection[[:space:]]+([^[:space:]]+)[[:space:]]+=>.*\(([^)]*)\):([0-9]+)[[:space:]]+uid:[[:space:]]*([0-9]+)'
+    line=$(printf '%s\n' "$1" | strip_ansi)
+
+    if [[ "$line" =~ $connect_re ]]; then
+        proto=${BASH_REMATCH[1]}
+        domain=$(normalize_domain "${BASH_REMATCH[2]}")
+        port=${BASH_REMATCH[3]}
+        if [ "$port" != "53" ] && is_valid_domain "$domain"; then
+            mark_connect "$domain"
+        fi
+        return 0
+    fi
+
+    case "$line" in
+        *"new connection"*) return 0 ;;
+        *" => "*", mark:"*)
+            target=${line#*=> }
+            target=${target%%, mark:*}
+            port=${target##*:}
+            case "$port" in
+                ''|*[!0-9]*) return 0 ;;
+            esac
+            [ "$port" != "53" ] || return 0
+            domain=${target%% *}
+            domain=${domain#[}
+            domain=${domain%]}
+            domain=$(normalize_domain "$domain")
+            if is_valid_domain "$domain"; then
+                mark_allowed "$domain"
+            fi
+            ;;
+    esac
+}
+
+firewall_domain_log() {
+    [ -f "$LOG_FILE" ] || die "OpenSnitch log not found: $LOG_FILE"
+
+    local ready_marker=${ZAIGR_INSIDE_DOMAIN_LOG_READY_MARKER:-}
+    local ready_writer_pid=
+    exec 3< <(tail -n 0 -F "$LOG_FILE")
+    if [ -n "$ready_marker" ]; then
+        (
+            while true; do
+                printf '%s\n' "$ready_marker" >> "$LOG_FILE"
+                sleep 0.1
+            done
+        ) &
+        ready_writer_pid=$!
+        trap 'if [ -n "${ready_writer_pid:-}" ]; then kill "$ready_writer_pid" 2>/dev/null || true; wait "$ready_writer_pid" 2>/dev/null || true; fi' EXIT
+    fi
+    while true; do
+        if IFS= read -r -t 1 line <&3; then
+            if [ -n "$ready_marker" ] && [ "$line" = "$ready_marker" ]; then
+                kill "$ready_writer_pid" 2>/dev/null || true
+                wait "$ready_writer_pid" 2>/dev/null || true
+                ready_writer_pid=
+                printf '%s\n' "$ready_marker"
+                continue
+            fi
+            handle_log_line "$line"
+        fi
+        emit_due_blocked "$(date +%s)"
+    done
+}
+
+main() {
+    require_root
+    [ "$#" -ge 1 ] || { usage; exit 1; }
+
+    case "$1" in
+        firewall)
+            shift
+            [ "$#" -ge 1 ] || { usage; exit 1; }
+            case "$1" in
+                allow)
+                    shift
+                    firewall_allow "$@"
+                    ;;
+                remove)
+                    shift
+                    firewall_remove "$@"
+                    ;;
+                list)
+                    shift
+                    [ "$#" -eq 0 ] || die "firewall list takes no arguments"
+                    firewall_list
+                    ;;
+                domain-log)
+                    shift
+                    [ "$#" -eq 0 ] || die "firewall domain-log takes no arguments"
+                    firewall_domain_log
+                    ;;
+                reload-domains)
+                    shift
+                    [ "$#" -eq 0 ] || die "firewall reload-domains takes no arguments"
+                    firewall_reload_domains
+                    ;;
+                sync-ips)
+                    shift
+                    firewall_sync_ips "$@"
+                    ;;
+                *)
+                    usage
+                    exit 1
+                    ;;
+            esac
+            ;;
+        *)
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

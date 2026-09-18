@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "apply_patch|Edit|MultiEdit|Read|Write|Bash|unified_exec|shell|exec_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 __HOOK_SCRIPT__"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "apply_patch|Edit|MultiEdit|Read|Write|Bash|unified_exec|shell|exec_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 __HOOK_SCRIPT__"
+          }
+        ]
+      }
+    ]
+  }
+}

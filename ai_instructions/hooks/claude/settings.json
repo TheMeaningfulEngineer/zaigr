@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|MultiEdit|Read|Write|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 __HOOK_SCRIPT__"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|MultiEdit|Read|Write|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 __HOOK_SCRIPT__"
+          }
+        ]
+      }
+    ]
+  }
+}

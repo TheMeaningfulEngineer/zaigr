@@ -1,0 +1,13 @@
+#!/bin/bash
+set -eu
+
+AGENT_STATE="/home/user/.zaigr-agent-state"
+if ! mountpoint -q "$AGENT_STATE"; then
+	echo "agent state mount not available: $AGENT_STATE" >&2
+	exit 1
+fi
+
+export VIBE_HOME="$AGENT_STATE/mistral"
+mkdir -p "$VIBE_HOME"
+
+exec vibe --agent auto-approve

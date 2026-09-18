@@ -1,0 +1,1562 @@
+#!/usr/bin/env python3
+"""Simple release orchestration CLI."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+RELEASE_DIR = Path("release")
+RELEASE_NOTES = RELEASE_DIR / "RELEASE_NOTES.md"
+DIST_DIR = RELEASE_DIR / "dist"
+CLIFF_CONFIG = RELEASE_DIR / "cliff.toml"
+NFPM_CONFIG = RELEASE_DIR / "nfpm.yaml"
+RELEASE_ROOT = RELEASE_DIR / "state"
+STATE_ROOT = RELEASE_ROOT / "candidates"
+ACTIVE_FILE = RELEASE_ROOT / "active.json"
+
+SEMVER_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+CANDIDATE_RE = re.compile(r"^(?P<version>[0-9]+\.[0-9]+\.[0-9]+)-(?P<build>[1-9][0-9]*)$")
+DIRTY_COMMIT_RE = re.compile(r"^(?P<sha>[0-9a-fA-F]{7,40})-dirty$")
+JsonObject = dict[str, Any]
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] not in {"candidate", "verify", "publish"} and _looks_like_version(args[0]):
+        args = ["candidate", *args]
+
+    parser = argparse.ArgumentParser(prog="release/release")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("candidate").add_argument("version", nargs="?")
+
+    subparsers.add_parser("verify")
+
+    subparsers.add_parser("publish")
+
+    parsed = parser.parse_args(args)
+
+    repo = Path.cwd()
+    try:
+        if parsed.command == "candidate":
+            return _cmd_candidate(repo, parsed)
+        if parsed.command == "verify":
+            return _cmd_verify(repo, parsed)
+        if parsed.command == "publish":
+            return _cmd_publish(repo, parsed)
+        raise RuntimeError(f"unknown command: {parsed.command}")
+    except (ValueError, RuntimeError, OSError) as exc:
+        print(f"release: error: {exc}", file=sys.stderr)
+        return 2
+
+
+def _looks_like_version(value: str) -> bool:
+    """Check whether a value looks like a release version.
+
+    Args:
+        value: The command argument to inspect.
+
+    Returns:
+        True when the value should be treated as a candidate version.
+    """
+    if not value:
+        return False
+    try:
+        _parse_version(value)
+        return True
+    except ValueError:
+        return value[0].isdigit() or value.startswith("v")
+
+
+def _cmd_candidate(repo: Path, args: argparse.Namespace) -> int:
+    """Create a release candidate and capture its build outputs.
+
+    Args:
+        repo: Repository root.
+        args: Parsed CLI arguments for the candidate command.
+
+    Returns:
+        The command exit code.
+
+    Raises:
+        RuntimeError: If confirmation is declined or a release step fails.
+        ValueError: If the requested version is invalid.
+    """
+    version = args.version or _prompt("Release candidate version: ")
+    version = _parse_version(version)
+    commit = _git_commit(repo)
+    dirty = _git_dirty(repo)
+    build = _next_build(repo, version)
+    candidate_root = _candidate_path(repo, version, build)
+
+    failed = _latest_failed_candidate(repo, version)
+    if failed is not None:
+        _print_previous_failed_candidate(*failed)
+
+    metadata: dict[str, str | int] = {
+        "version": version,
+        "build": build,
+        "tag": f"v{version}",
+        "commit": commit,
+        "candidate_dir": str(candidate_root),
+    }
+    _print_candidate_preview(metadata)
+    if dirty:
+        _confirm_dirty_candidate(version, build, commit)
+    _confirm_action("candidate", version, build)
+
+    ref = _init_candidate(repo, version, build, commit, dirty)
+    _set_active_candidate(repo, version, build, ref)
+
+    transcript_path = ref / "transcripts" / "candidate.log"
+    command_display: str | None = "candidate"
+    logger = _transcript_logger(transcript_path)
+    try:
+        logger.info(":: Checking release tools")
+        _require_release_tools()
+
+        build_time = _release_build_time()
+        command_display = "Clean previous release outputs"
+        _run_command(
+            logger,
+            repo,
+            ["rm", "-rf", str(DIST_DIR), str(RELEASE_NOTES)],
+            plan=command_display,
+        )
+
+        command_display = "Build base kernel"
+        _run_command(logger, repo, ["vm_prep/build-kernel.sh"], plan=command_display)
+
+        command_display = "Build base rootfs"
+        _run_command(logger, repo, ["vm_prep/build-base-rootfs.sh"], plan=command_display)
+
+        command_display = "Build zaigr binary"
+        ldflags = (
+            f"-X main.version={version} "
+            f"-X main.build={build} "
+            f"-X main.commit={commit} "
+            f"-X main.buildTime={build_time}"
+        )
+        _run_command(
+            logger,
+            repo,
+            ["go", "build", "-ldflags", ldflags, "-o", "zaigr", "./cmd/zaigr"],
+            plan=command_display,
+        )
+
+        command_display = "Generate release notes"
+        _run_command(
+            logger,
+            repo,
+            [
+                "git-cliff",
+                "--config",
+                str(CLIFF_CONFIG),
+                "--tag",
+                f"v{version}",
+                "--output",
+                str(RELEASE_NOTES),
+            ],
+            plan=command_display,
+        )
+
+        command_display = "Create dist directory"
+        _run_command(logger, repo, ["mkdir", "-p", str(DIST_DIR)], plan=command_display)
+
+        command_display = "Prepare standalone binary"
+        _run_command(
+            logger,
+            repo,
+            ["install", "-m", "0755", "zaigr", str(DIST_DIR / "zaigr")],
+            plan=command_display,
+        )
+
+        command_display = "Build Debian package"
+        _run_command(
+            logger,
+            repo,
+            [
+                "nfpm",
+                "package",
+                "--config",
+                str(NFPM_CONFIG),
+                "--packager",
+                "deb",
+                "--target",
+                str(DIST_DIR / f"zaigr_{version}-{build}_amd64.deb"),
+            ],
+            env={"VERSION": version, "BUILD": str(build)},
+            plan=command_display,
+        )
+
+        command_display = "Build RPM package"
+        _run_command(
+            logger,
+            repo,
+            [
+                "nfpm",
+                "package",
+                "--config",
+                str(NFPM_CONFIG),
+                "--packager",
+                "rpm",
+                "--target",
+                str(DIST_DIR / f"zaigr-{version}-{build}.x86_64.rpm"),
+            ],
+            env={"VERSION": version, "BUILD": str(build)},
+            plan=command_display,
+        )
+
+        command_display = "Build Arch Linux package"
+        _run_command(
+            logger,
+            repo,
+            [
+                "nfpm",
+                "package",
+                "--config",
+                str(NFPM_CONFIG),
+                "--packager",
+                "archlinux",
+                "--target",
+                str(DIST_DIR / f"zaigr-{version}-{build}-x86_64.pkg.tar.zst"),
+            ],
+            env={"VERSION": version, "BUILD": str(build)},
+            plan=command_display,
+        )
+
+        logger.info(":: Writing checksums")
+        _write_checksums(repo)
+
+        logger.info(":: Capturing candidate outputs")
+        _capture_candidate_outputs(repo, ref)
+
+    except Exception as exc:
+        _mark_candidate_failed(ref, transcript_path, exc, command_display)
+        raise
+    finally:
+        _close_transcript_logger(logger)
+
+    release = _read_json(ref / "release.json")
+    release["status"] = "candidate"
+    release["artifacts"] = [
+        {"path": str(path), "sha256": _sha256(path)}
+        for path in _collect_artifacts(ref / "dist")
+    ]
+    release["binary_sha256"] = _sha256(ref / "zaigr")
+    _write_json(ref / "release.json", release)
+
+    _print_candidate_result(ref)
+    return 0
+
+
+def _cmd_verify(repo: Path, args: argparse.Namespace) -> int:
+    """Verify the active release candidate.
+
+    Args:
+        repo: Repository root.
+        args: Parsed CLI arguments for the verify command.
+
+    Returns:
+        The command exit code.
+
+    Raises:
+        RuntimeError: If the active candidate is missing, invalid, or not verifiable.
+    """
+    del args
+    version, build, root = _resolve_active_candidate(repo)
+    release = _validate_candidate(root, version, build)
+
+    if release.get("status") != "candidate":
+        raise RuntimeError(
+            f"active candidate {version}-{build} is not ready for verification "
+            f"(status: {release.get('status', 'unknown')})"
+        )
+
+    _print_active_candidate(version, build, release, root)
+    _confirm_action("verifying", version, build)
+
+    print(f"Verifying candidate: {root}", file=sys.stderr, flush=True)
+    _restore_candidate_outputs(repo, root)
+
+    transcript_path = root / "transcripts" / "verify.log"
+    logger = _transcript_logger(transcript_path)
+    evidence: JsonObject = {
+        "candidate": f"{version}-{build}",
+        "command": ["make", "test-all"],
+        "started_at": _utc_now(),
+        "status": "failed",
+    }
+    try:
+        inputs = _verification_inputs(repo, root, release)
+        env = {
+            "ZAIGR_TEST_BINARY": str((root / "zaigr").resolve()),
+            "PYTEST_XDIST_WORKERS": os.environ.get("PYTEST_XDIST_WORKERS", "8"),
+            "PYTEST_BUILTIN_WORKERS": os.environ.get("PYTEST_BUILTIN_WORKERS", "2"),
+        }
+        evidence.update({"inputs": inputs, "environment": env, "status": "running"})
+        _write_json(root / "verification.json", evidence)
+        logger.info(":: Verification inputs: %s", json.dumps(evidence, sort_keys=True))
+        _run_command(logger, repo, ["make", "test-all"], env=env)
+        if _verification_inputs(repo, root, release) != inputs:
+            raise RuntimeError("verification inputs changed while the test suite was running")
+        evidence["status"] = "passed"
+    except BaseException as exc:
+        evidence["status"] = "failed"
+        evidence["error"] = str(exc)
+        raise
+    finally:
+        _close_transcript_logger(logger)
+        evidence["finished_at"] = _utc_now()
+        _write_json(root / "verification.json", evidence)
+
+    release["status"] = "verified"
+    release["verified"] = True
+    release["verified_at"] = _utc_now()
+    _write_json(root / "release.json", release)
+    print(f"Candidate verified: {root}")
+    return 0
+
+
+def _verification_inputs(repo: Path, root: Path, release: JsonObject) -> JsonObject:
+    """Validate saved/restored artifacts and identify the tests being executed.
+
+    Args:
+        repo: Repository containing the test suite.
+        root: Saved candidate directory.
+        release: Candidate metadata with build-time checksums.
+
+    Returns:
+        Binary, artifact, and source identities for the verification record.
+
+    Raises:
+        RuntimeError: If a candidate is incomplete or its artifacts have changed.
+    """
+    binary = root / "zaigr"
+    expected = release.get("binary_sha256")
+    if not expected:
+        raise RuntimeError("candidate has no binary checksum; create a fresh candidate")
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise RuntimeError(f"candidate binary is missing or not executable: {binary}")
+    if _sha256(binary) != expected or _sha256(repo / "zaigr") != expected:
+        raise RuntimeError("candidate binary checksum mismatch")
+
+    artifacts = release.get("artifacts", [])
+    if not artifacts:
+        raise RuntimeError("candidate has no artifact checksums")
+    expected_artifacts = {Path(item["path"]).name: item["sha256"] for item in artifacts}
+    for directory in (root / "dist", repo / DIST_DIR):
+        actual = {path.name: _sha256(path) for path in _collect_artifacts(directory)}
+        if actual != expected_artifacts:
+            raise RuntimeError(f"candidate artifact checksum mismatch: {directory}")
+
+    diff = subprocess.check_output(["git", "diff", "--binary", "HEAD", "--"], cwd=repo)
+    untracked = subprocess.check_output(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=repo
+    )
+    return {
+        "binary_sha256": expected,
+        "artifacts": expected_artifacts,
+        "test_commit": _git_commit(repo),
+        "test_diff_sha256": hashlib.sha256(diff).hexdigest(),
+        "untracked_files": {
+            os.fsdecode(path): _sha256(repo / os.fsdecode(path))
+            for path in sorted(untracked.split(b"\0"))
+            if path
+        },
+    }
+
+
+def _cmd_publish(repo: Path, args: argparse.Namespace) -> int:
+    """Publish the active verified release candidate.
+
+    Args:
+        repo: Repository root.
+        args: Parsed CLI arguments for the publish command.
+
+    Returns:
+        The command exit code.
+
+    Raises:
+        RuntimeError: If the active candidate is unverified or publish state is invalid.
+    """
+    del args
+    version, build, root = _resolve_active_candidate(repo)
+    release = _validate_candidate(root, version, build)
+
+    _print_active_candidate(version, build, release, root)
+    if not release.get("verified"):
+        raise RuntimeError(
+            f"refusing to publish unverified candidate {version}-{build} "
+            f"(status: {release.get('status', 'unknown')})"
+        )
+    _confirm_action("publishing", version, build)
+
+    publish_state = _read_json(root / "publish.json")
+    artifacts = _collect_artifacts(root / "dist")
+    if not artifacts:
+        raise RuntimeError(f"publish requires artifacts in {root / 'dist'}")
+
+    changelog = root / "changelog.md"
+    if not changelog.is_file() or not changelog.read_text(encoding="utf-8").strip():
+        raise RuntimeError(f"publish requires a non-empty changelog: {changelog}")
+
+    print(f"Publishing candidate: {root}", file=sys.stderr, flush=True)
+    transcript_path = root / "transcripts" / "publish.log"
+    logger = _transcript_logger(transcript_path)
+    try:
+        tag_target = _tag_target_commit(release)
+        tag_commit = _required_commit(logger, repo, tag_target)
+        _ensure_local_tag(logger, repo, root, publish_state, release["tag"], tag_target, tag_commit)
+        _ensure_remote_tag(logger, repo, root, publish_state, release["tag"], tag_commit)
+        _ensure_github_release(logger, repo, root, publish_state, release["tag"], artifacts, changelog)
+        publish_state["asset_uploads"] = [path.name for path in artifacts]
+        publish_state["publish_complete"] = True
+        publish_state["published_at"] = _utc_now()
+        _write_json(root / "publish.json", publish_state)
+    finally:
+        _close_transcript_logger(logger)
+
+    release["status"] = "published"
+    _write_json(root / "release.json", release)
+    print(f"Published: {release['tag']}")
+    return 0
+
+
+def _prompt(prompt: str) -> str:
+    """Read one required value from stdin.
+
+    Args:
+        prompt: Text to print before reading.
+
+    Returns:
+        The stripped input value.
+
+    Raises:
+        RuntimeError: If stdin is closed before a value is provided.
+    """
+    print(prompt, end="", file=sys.stderr, flush=True)
+    value = sys.stdin.readline()
+    if not value:
+        raise RuntimeError("release candidate version is required")
+    print(file=sys.stderr, flush=True)
+    return value.strip()
+
+
+def _confirm_action(action: str, version: str, build: int) -> None:
+    """Require user confirmation before a release action.
+
+    Args:
+        action: The action being confirmed.
+        version: Candidate version.
+        build: Candidate build number.
+
+    Raises:
+        RuntimeError: If the user declines the action.
+    """
+    if action in {"verifying", "publishing"}:
+        prompt = (
+            f"Detected active candidate {version}-{build}. "
+            f"Do you want to proceed with {action} version {version}, build {build}? [y/N] "
+        )
+    else:
+        prompt = (
+            f"Do you want to proceed with releasing version {version}, build {build}? "
+            "Old builds will be wiped. [y/N] "
+        )
+    print(prompt, end="", file=sys.stderr, flush=True)
+    answer = sys.stdin.readline()
+    if not answer or answer.strip().lower() not in {"y", "yes"}:
+        print(file=sys.stderr, flush=True)
+        if action == "candidate":
+            raise RuntimeError("release candidate creation cancelled")
+        raise RuntimeError(f"{action} cancelled")
+    print(file=sys.stderr, flush=True)
+
+
+def _confirm_dirty_candidate(version: str, build: int, commit: str) -> None:
+    """Require confirmation before creating a dirty candidate.
+
+    Args:
+        version: Candidate version.
+        build: Candidate build number.
+        commit: Commit recorded for the candidate.
+
+    Raises:
+        RuntimeError: If the user declines the dirty candidate.
+    """
+    prompt = (
+        f"Worktree is dirty for candidate {version}-{build}. "
+        f"The release tag will point at {commit}, but artifacts may include uncommitted changes. "
+        "Continue with dirty worktree? [y/N] "
+    )
+    print(prompt, end="", file=sys.stderr, flush=True)
+    answer = sys.stdin.readline()
+    if not answer or answer.strip().lower() not in {"y", "yes"}:
+        print(file=sys.stderr, flush=True)
+        raise RuntimeError("dirty release candidate creation cancelled")
+    print(file=sys.stderr, flush=True)
+
+
+def _transcript_logger(path: Path) -> logging.Logger:
+    """Create a logger that writes transcript messages to stderr and file.
+
+    Args:
+        path: Transcript destination path.
+
+    Returns:
+        A logger configured with a stream and file handler.
+    """
+    logger = logging.getLogger(f"release.transcript.{id(path)}")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    formatter = logging.Formatter("%(message)s")
+
+    stream_handler = logging.StreamHandler(sys.stderr)
+    stream_handler.setFormatter(formatter)
+    file_handler = logging.FileHandler(path, mode="w", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+
+    logger.handlers.clear()
+    logger.addHandler(stream_handler)
+    logger.addHandler(file_handler)
+
+    return logger
+
+
+def _close_transcript_logger(logger: logging.Logger) -> None:
+    """Close and remove transcript logging handlers.
+
+    Args:
+        logger: Logger configured by `_transcript_logger`.
+    """
+    for handler in logger.handlers:
+        handler.close()
+    logger.handlers.clear()
+
+
+def _run_command(
+    logger: logging.Logger,
+    repo: Path,
+    argv: list[str],
+    *,
+    plan: str | None = None,
+    env: dict[str, str] | None = None,
+) -> None:
+    """Run one command and stream output into the release logs.
+
+    Args:
+        logger: Logger writing transcript and stream output.
+        repo: Repository root used as the command working directory.
+        argv: Command and arguments.
+        plan: Optional human-readable step name.
+        env: Optional environment overrides.
+
+    Raises:
+        RuntimeError: If the command exits with a non-zero status.
+    """
+    if plan is not None:
+        logger.info(f":: {plan}")
+    logger.info(f"{repo}$ {shlex.join(argv)}")
+
+    process_env = os.environ.copy()
+    if env:
+        process_env.update(env)
+
+    process = subprocess.Popen(
+        argv,
+        cwd=repo,
+        env=process_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdout is not None
+    for line in process.stdout:
+        logger.info(line.removesuffix("\n"))
+    rc = process.wait()
+    if rc != 0:
+        raise RuntimeError(f"command failed with exit code {rc}: {shlex.join(argv)}")
+
+
+def _run_command_capture(
+    logger: logging.Logger,
+    repo: Path,
+    argv: list[str],
+    *,
+    allow_failure: bool = False,
+) -> tuple[int, str]:
+    """Run one command and return its output.
+
+    Args:
+        logger: Logger writing transcript and stream output.
+        repo: Repository root used as the command working directory.
+        argv: Command and arguments.
+        allow_failure: Return non-zero status instead of raising.
+
+    Returns:
+        The command return code and stdout.
+
+    Raises:
+        RuntimeError: If the command fails and failure is not allowed.
+    """
+    logger.info(f"{repo}$ {shlex.join(argv)}")
+    result = subprocess.run(
+        argv,
+        cwd=repo,
+        env=os.environ.copy(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = result.stdout or ""
+    for line in output.splitlines():
+        logger.info(line)
+    for line in (result.stderr or "").splitlines():
+        logger.info(line)
+    if result.returncode != 0 and not allow_failure:
+        raise RuntimeError(f"command failed with exit code {result.returncode}: {shlex.join(argv)}")
+    return result.returncode, output
+
+
+def _parse_version(value: str) -> str:
+    """Validate a semver value without a v prefix.
+
+    Args:
+        value: Version string from CLI input.
+
+    Returns:
+        The validated version string.
+
+    Raises:
+        ValueError: If the version is not MAJOR.MINOR.PATCH.
+    """
+    if value.startswith("v"):
+        raise ValueError(
+            f"invalid release version: {value}\n\nExpected MAJOR.MINOR.PATCH, for example 1.0.0.\n"
+            "Do not include the v prefix."
+        )
+    if not SEMVER_RE.match(value):
+        raise ValueError(
+            f"invalid release version: {value}\n\nExpected MAJOR.MINOR.PATCH, for example 1.0.0.\n"
+            "Do not include prerelease or build metadata."
+        )
+    return value
+
+
+def _next_build(repo: Path, version: str) -> int:
+    """Calculate the next build number for a version.
+
+    Args:
+        repo: Repository root.
+        version: Release version.
+
+    Returns:
+        The next build number.
+    """
+    existing = sorted(_existing_builds(repo, version))
+    return existing[-1] + 1 if existing else 1
+
+
+def _existing_builds(repo: Path, version: str) -> list[int]:
+    """Find existing build numbers for a version.
+
+    Args:
+        repo: Repository root.
+        version: Release version.
+
+    Returns:
+        Sorted build numbers for the version.
+    """
+    root = _state_root(repo)
+    if not root.exists():
+        return []
+
+    builds: list[int] = []
+    prefix = f"{version}-"
+    for candidate in root.iterdir():
+        if not candidate.is_dir() or not candidate.name.startswith(prefix):
+            continue
+        match = CANDIDATE_RE.match(candidate.name)
+        if match and match.group("version") == version:
+            builds.append(int(match.group("build")))
+    return builds
+
+
+def _latest_failed_candidate(repo: Path, version: str) -> tuple[Path, JsonObject] | None:
+    """Find the most recent failed candidate for a version.
+
+    Args:
+        repo: Repository root.
+        version: Release version.
+
+    Returns:
+        The failed candidate path and metadata, or None.
+    """
+    for build in reversed(_existing_builds(repo, version)):
+        path = _candidate_path(repo, version, build)
+        try:
+            release = _read_json(path / "release.json")
+        except RuntimeError:
+            continue
+        if release.get("status") == "failed":
+            return path, release
+    return None
+
+
+def _init_candidate(repo: Path, version: str, build: int, commit: str, dirty: bool) -> Path:
+    """Create a candidate directory with initial state files.
+
+    Args:
+        repo: Repository root.
+        version: Release version.
+        build: Candidate build number.
+        commit: Commit hash recorded for the candidate.
+        dirty: Whether the worktree was dirty before candidate files were created.
+
+    Returns:
+        The candidate directory path.
+
+    Raises:
+        RuntimeError: If the candidate directory already exists.
+    """
+    root = _candidate_path(repo, version, build)
+    if root.exists():
+        raise RuntimeError(f"candidate already exists: {root}")
+
+    (root / "dist").mkdir(parents=True)
+    (root / "transcripts").mkdir()
+    (root / "changelog.md").write_text("", encoding="utf-8")
+
+    release = {
+        "build": build,
+        "candidate": f"{version}-{build}",
+        "commit": commit,
+        "created_at": _utc_now(),
+        "dirty": dirty,
+        "schema": 1,
+        "status": "created",
+        "tag": f"v{version}",
+        "verified": False,
+        "version": version,
+    }
+    publish = {
+        "asset_uploads": [],
+        "github_release_created": False,
+        "local_tag_created": False,
+        "publish_complete": False,
+        "remote_tag_pushed": False,
+        "schema": 1,
+    }
+    _write_json(root / "release.json", release)
+    _write_json(root / "publish.json", publish)
+    return root
+
+
+def _set_active_candidate(repo: Path, version: str, build: int, candidate_root: Path) -> None:
+    """Write the active candidate reference.
+
+    Args:
+        repo: Repository root.
+        version: Release version.
+        build: Candidate build number.
+        candidate_root: Candidate directory path.
+    """
+    _write_json(
+        _active_path(repo),
+        {
+            "build": build,
+            "candidate": candidate_root.name,
+            "schema": 1,
+            "version": version,
+        },
+    )
+
+
+def _resolve_active_candidate(repo: Path) -> tuple[str, int, Path]:
+    """Load and validate the active candidate reference.
+
+    Args:
+        repo: Repository root.
+
+    Returns:
+        The active version, build number, and candidate path.
+
+    Raises:
+        RuntimeError: If active state is missing or malformed.
+    """
+    active = _read_json(_active_path(repo))
+    if active.get("schema") != 1:
+        raise RuntimeError(f"unsupported active release schema in {_active_path(repo)}")
+
+    version = active.get("version")
+    build = active.get("build")
+    candidate = active.get("candidate")
+    if not isinstance(version, str) or not isinstance(build, int):
+        raise RuntimeError(f"invalid active release state: {_active_path(repo)}")  # noqa: TRY004 -- malformed external state, not a caller type error
+
+    expected = f"{version}-{build}"
+    root = _candidate_path(repo, version, build)
+    if candidate != expected:
+        raise RuntimeError(f"active release state points to {candidate!r}, expected {expected!r}")
+
+    return version, build, root
+
+
+def _validate_candidate(root: Path, version: str, build: int) -> JsonObject:
+    """Validate candidate metadata against the expected identity.
+
+    Args:
+        root: Candidate directory path.
+        version: Expected release version.
+        build: Expected build number.
+
+    Returns:
+        Parsed release metadata.
+
+    Raises:
+        RuntimeError: If candidate metadata is missing or inconsistent.
+    """
+    release = _read_json(root / "release.json")
+    if release.get("version") != version or release.get("build") != build:
+        raise RuntimeError(f"candidate metadata does not match directory: {root}")
+    if release.get("schema") != 1:
+        raise RuntimeError(f"unsupported release metadata schema in {root / 'release.json'}")
+    return release
+
+
+def _tag_target_commit(release: JsonObject) -> str:
+    """Read the git commit to tag from release metadata.
+
+    Args:
+        release: Candidate release metadata.
+
+    Returns:
+        A commit ref suitable for git tag.
+
+    Raises:
+        RuntimeError: If release metadata does not contain a commit.
+    """
+    commit = release.get("commit")
+    if not isinstance(commit, str) or not commit:
+        raise RuntimeError("release metadata is missing commit")
+
+    match = DIRTY_COMMIT_RE.match(commit)
+    if match:
+        return match.group("sha")
+    return commit
+
+
+def _required_commit(logger: logging.Logger, repo: Path, ref: str) -> str:
+    """Resolve a required git commit ref.
+
+    Args:
+        logger: Logger writing transcript and stream output.
+        repo: Repository root.
+        ref: Commit-ish to resolve.
+
+    Returns:
+        The full commit hash.
+
+    Raises:
+        RuntimeError: If the ref does not resolve to a commit.
+    """
+    commit = _resolve_commit(logger, repo, ref)
+    if commit is None:
+        raise RuntimeError(f"release commit does not resolve: {ref}")
+    return commit
+
+
+def _resolve_commit(logger: logging.Logger, repo: Path, ref: str) -> str | None:
+    """Resolve a git ref to a commit hash.
+
+    Args:
+        logger: Logger writing transcript and stream output.
+        repo: Repository root.
+        ref: Commit-ish to resolve.
+
+    Returns:
+        The full commit hash, or None when the ref is missing.
+    """
+    rc, output = _run_command_capture(
+        logger,
+        repo,
+        ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+        allow_failure=True,
+    )
+    if rc != 0:
+        return None
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines:
+        return None
+    return lines[-1]
+
+
+def _ensure_local_tag(
+    logger: logging.Logger,
+    repo: Path,
+    root: Path,
+    publish: JsonObject,
+    tag: str,
+    target_ref: str,
+    target_commit: str,
+) -> None:
+    """Create or verify the local release tag.
+
+    Args:
+        logger: Logger writing transcript and stream output.
+        repo: Repository root.
+        root: Candidate directory path.
+        publish: Mutable publish metadata.
+        tag: Release tag name.
+        target_ref: Commit-ish recorded in release metadata.
+        target_commit: Full commit hash expected for the tag.
+
+    Raises:
+        RuntimeError: If an existing local tag points elsewhere.
+    """
+    local_commit = _resolve_commit(logger, repo, f"refs/tags/{tag}")
+    if local_commit is None:
+        _run_command(logger, repo, ["git", "tag", tag, target_ref])
+    elif local_commit != target_commit:
+        raise RuntimeError(
+            f"local tag {tag} points to {local_commit[:12]}, expected {target_commit[:12]}"
+        )
+    else:
+        logger.info(f":: Local tag {tag} already exists at {local_commit[:12]}; continuing")
+    _set_publish_step(root, publish, "local_tag_created", True)
+
+
+def _ensure_remote_tag(
+    logger: logging.Logger,
+    repo: Path,
+    root: Path,
+    publish: JsonObject,
+    tag: str,
+    target_commit: str,
+) -> None:
+    """Push or verify the remote release tag.
+
+    Args:
+        logger: Logger writing transcript and stream output.
+        repo: Repository root.
+        root: Candidate directory path.
+        publish: Mutable publish metadata.
+        tag: Release tag name.
+        target_commit: Full commit hash expected for the tag.
+
+    Raises:
+        RuntimeError: If an existing remote tag points elsewhere.
+    """
+    remote_commit = _remote_tag_commit(logger, repo, tag)
+    if remote_commit is None:
+        _run_command(logger, repo, ["git", "push", "origin", tag])
+    elif remote_commit != target_commit:
+        raise RuntimeError(
+            f"remote tag {tag} points to {remote_commit[:12]}, expected {target_commit[:12]}"
+        )
+    else:
+        logger.info(f":: Remote tag {tag} already exists at {remote_commit[:12]}; continuing")
+    _set_publish_step(root, publish, "remote_tag_pushed", True)
+
+
+def _remote_tag_commit(logger: logging.Logger, repo: Path, tag: str) -> str | None:
+    """Read the remote release tag commit.
+
+    Args:
+        logger: Logger writing transcript and stream output.
+        repo: Repository root.
+        tag: Release tag name.
+
+    Returns:
+        The remote tag commit hash, or None when the tag is missing.
+    """
+    tag_ref = f"refs/tags/{tag}"
+    peeled_ref = f"{tag_ref}^{{}}"
+    _, output = _run_command_capture(
+        logger,
+        repo,
+        ["git", "ls-remote", "--tags", "origin", tag_ref, peeled_ref],
+    )
+    remote_commit = None
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        commit, ref = parts
+        if ref == peeled_ref:
+            return commit
+        if ref == tag_ref:
+            remote_commit = commit
+    return remote_commit
+
+
+def _ensure_github_release(
+    logger: logging.Logger,
+    repo: Path,
+    root: Path,
+    publish: JsonObject,
+    tag: str,
+    artifacts: list[Path],
+    changelog: Path,
+) -> None:
+    """Create or verify the GitHub release.
+
+    Args:
+        logger: Logger writing transcript and stream output.
+        repo: Repository root.
+        root: Candidate directory path.
+        publish: Mutable publish metadata.
+        tag: Release tag name.
+        artifacts: Artifact paths to attach.
+        changelog: Release notes file.
+    """
+    release = _github_release_state(logger, repo, tag)
+    if release is None:
+        _create_github_release(logger, repo, tag, artifacts, changelog)
+    else:
+        _ensure_existing_github_release(logger, repo, tag, artifacts, changelog, release)
+    _set_publish_step(root, publish, "github_release_created", True)
+
+
+def _create_github_release(
+    logger: logging.Logger,
+    repo: Path,
+    tag: str,
+    artifacts: list[Path],
+    changelog: Path,
+) -> None:
+    """Create the GitHub release.
+
+    Args:
+        logger: Logger writing transcript and stream output.
+        repo: Repository root.
+        tag: Release tag name.
+        artifacts: Artifact paths to attach.
+        changelog: Release notes file.
+    """
+    _run_command(
+        logger,
+        repo,
+        [
+            "gh",
+            "release",
+            "create",
+            tag,
+            *(str(artifact) for artifact in artifacts),
+            "--title",
+            tag,
+            "--notes-file",
+            str(changelog),
+            "--verify-tag",
+        ],
+    )
+
+
+def _ensure_existing_github_release(
+    logger: logging.Logger,
+    repo: Path,
+    tag: str,
+    artifacts: list[Path],
+    changelog: Path,
+    release: JsonObject,
+) -> None:
+    """Update and complete an existing GitHub release.
+
+    Args:
+        logger: Logger writing transcript and stream output.
+        repo: Repository root.
+        tag: Release tag name.
+        artifacts: Artifact paths to attach.
+        changelog: Release notes file.
+        release: Parsed GitHub release metadata.
+
+    Raises:
+        RuntimeError: If the existing release has incompatible state.
+    """
+    if release.get("isDraft"):
+        raise RuntimeError(f"GitHub release {tag} already exists as a draft")
+    if release.get("isPrerelease"):
+        raise RuntimeError(f"GitHub release {tag} already exists as a prerelease")
+
+    _run_command(
+        logger,
+        repo,
+        ["gh", "release", "edit", tag, "--title", tag, "--notes-file", str(changelog)],
+    )
+
+    asset_names = _github_release_asset_names(release, tag)
+    missing = [artifact for artifact in artifacts if artifact.name not in asset_names]
+    if missing:
+        _run_command(
+            logger,
+            repo,
+            ["gh", "release", "upload", tag, *(str(artifact) for artifact in missing)],
+        )
+    else:
+        logger.info(f":: GitHub release {tag} already has all expected assets; continuing")
+
+
+def _github_release_state(logger: logging.Logger, repo: Path, tag: str) -> JsonObject | None:
+    """Read GitHub release metadata.
+
+    Args:
+        logger: Logger writing transcript and stream output.
+        repo: Repository root.
+        tag: Release tag name.
+
+    Returns:
+        Parsed release metadata, or None when the release is missing.
+
+    Raises:
+        RuntimeError: If gh returns malformed release metadata.
+    """
+    rc, output = _run_command_capture(
+        logger,
+        repo,
+        ["gh", "release", "view", tag, "--json", "isDraft,isPrerelease,assets"],
+        allow_failure=True,
+    )
+    if rc != 0:
+        return None
+    try:
+        release = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"GitHub release {tag} returned invalid metadata") from exc
+    if not isinstance(release, dict):
+        raise RuntimeError(f"GitHub release {tag} returned invalid metadata")  # noqa: TRY004 -- malformed external response
+    return release
+
+
+def _github_release_asset_names(release: JsonObject, tag: str) -> set[str]:
+    """Read asset names from GitHub release metadata.
+
+    Args:
+        release: Parsed GitHub release metadata.
+        tag: Release tag name.
+
+    Returns:
+        Asset names already present on the release.
+
+    Raises:
+        RuntimeError: If asset metadata is malformed.
+    """
+    assets = release.get("assets")
+    if not isinstance(assets, list):
+        raise RuntimeError(f"GitHub release {tag} returned invalid asset metadata")  # noqa: TRY004 -- malformed external response
+
+    names: set[str] = set()
+    for asset in assets:
+        if not isinstance(asset, dict) or not isinstance(asset.get("name"), str):
+            raise RuntimeError(f"GitHub release {tag} returned invalid asset metadata")  # noqa: TRY004 -- malformed external response
+        names.add(asset["name"])
+    return names
+
+
+def _print_previous_failed_candidate(candidate_path: Path, release: JsonObject) -> None:
+    """Print context for the previous failed candidate.
+
+    Args:
+        candidate_path: Failed candidate directory.
+        release: Failed candidate metadata.
+    """
+    failure = release.get("failure") or {}
+    transcript = failure.get("transcript_path") or failure.get("transcript")
+    candidate_transcript = candidate_path / "transcripts" / "candidate.log"
+    if candidate_transcript.is_file() and (
+        not isinstance(transcript, str) or not Path(transcript).is_file()
+    ):
+        transcript = str(candidate_transcript)
+    print("Previous failed candidate", file=sys.stderr)
+    print(file=sys.stderr)
+    print(f"  candidate:  {candidate_path.name}", file=sys.stderr)
+    print(f"  transcript: {transcript or 'unknown'}", file=sys.stderr)
+    print(file=sys.stderr, flush=True)
+
+
+def _print_candidate_preview(metadata: dict[str, str | int]) -> None:
+    """Print candidate details before confirmation.
+
+    Args:
+        metadata: Candidate values shown to the user.
+    """
+    print("Release candidate", file=sys.stderr)
+    print(file=sys.stderr)
+    print(f"  version:       {metadata['version']}", file=sys.stderr)
+    print(f"  build:         {metadata['build']}", file=sys.stderr)
+    print(f"  tag:           {metadata['tag']}", file=sys.stderr)
+    print(f"  commit:        {metadata['commit']}", file=sys.stderr)
+    print(f"  candidate_dir: {metadata['candidate_dir']}", file=sys.stderr)
+    print(file=sys.stderr, flush=True)
+
+
+def _print_active_candidate(version: str, build: int, release: JsonObject, root: Path) -> None:
+    """Print active candidate details.
+
+    Args:
+        version: Candidate version.
+        build: Candidate build number.
+        release: Candidate metadata.
+        root: Candidate directory path.
+    """
+    print("Active release candidate", file=sys.stderr)
+    print(file=sys.stderr)
+    print(f"  version:       {version}", file=sys.stderr)
+    print(f"  build:         {build}", file=sys.stderr)
+    print(f"  tag:           {release['tag']}", file=sys.stderr)
+    print(f"  commit:        {release['commit']}", file=sys.stderr)
+    print(f"  status:        {release.get('status', 'unknown')}", file=sys.stderr)
+    print(f"  candidate_dir: {root}", file=sys.stderr)
+    print(file=sys.stderr, flush=True)
+
+
+def _print_candidate_result(candidate_root: Path) -> None:
+    """Print the successful candidate summary.
+
+    Args:
+        candidate_root: Candidate directory path.
+    """
+    release = _read_json(candidate_root / "release.json")
+    artifacts = _collect_artifacts(candidate_root / "dist")
+    transcript_path = candidate_root / "transcripts" / "candidate.log"
+
+    print("Release candidate created")
+    print()
+    print(f"  version:       {release['version']}")
+    print(f"  build:         {release['build']}")
+    print(f"  tag:           {release['tag']}")
+    print(f"  commit:        {release['commit']}")
+    print(f"  candidate_dir: {candidate_root}")
+    print(f"  transcript:    {transcript_path}")
+    print()
+    print("Artifacts")
+    if artifacts:
+        for artifact in artifacts:
+            print(f"  - {artifact}")
+    else:
+        print("  none")
+
+    checksums = candidate_root / "checksums.txt"
+    if checksums.is_file():
+        print(f"  checksums: {checksums}")
+
+
+def _require_release_tools() -> None:
+    """Check that required release tools are installed.
+
+    Raises:
+        RuntimeError: If a required tool is missing.
+    """
+    missing = [name for name in ("git-cliff", "nfpm") if shutil.which(name) is None]
+    if missing:
+        raise RuntimeError(
+            f"missing release tool(s): {', '.join(missing)}; run the release-tools setup"
+        )
+
+
+def _write_checksums(repo: Path) -> None:
+    """Write checksums for files in dist.
+
+    Args:
+        repo: Repository root.
+
+    Raises:
+        RuntimeError: If dist has no artifacts.
+    """
+    artifacts = _collect_artifacts(repo / DIST_DIR)
+    if not artifacts:
+        raise RuntimeError(f"no release artifacts found in {repo / DIST_DIR}")
+    checksum_path = repo / DIST_DIR / "checksums.txt"
+    with checksum_path.open("w", encoding="utf-8") as handle:
+        for artifact in artifacts:
+            digest = _sha256(artifact)
+            handle.write(f"{digest}  {artifact.relative_to(repo)}\n")
+
+
+def _capture_candidate_outputs(repo: Path, candidate_root: Path) -> None:
+    """Copy release outputs into the candidate directory.
+
+    Args:
+        repo: Repository root.
+        candidate_root: Candidate directory path.
+    """
+    notes = repo / RELEASE_NOTES
+    if notes.exists():
+        shutil.copy2(notes, candidate_root / "changelog.md")
+    binary = repo / "zaigr"
+    if binary.exists():
+        shutil.copy2(binary, candidate_root / "zaigr")
+    dist = repo / DIST_DIR
+    if dist.is_dir():
+        target = candidate_root / "dist"
+        for path in dist.iterdir():
+            if path.is_file():
+                shutil.copy2(path, target / path.name)
+        checksums = dist / "checksums.txt"
+        if checksums.is_file():
+            shutil.copy2(checksums, candidate_root / "checksums.txt")
+
+
+def _restore_candidate_outputs(repo: Path, candidate_root: Path) -> None:
+    """Restore candidate outputs into the repository.
+
+    Args:
+        repo: Repository root.
+        candidate_root: Candidate directory path.
+    """
+    notes = candidate_root / "changelog.md"
+    if notes.exists():
+        _copy_restored_candidate_output(notes, repo / RELEASE_NOTES, "release notes")
+    binary = candidate_root / "zaigr"
+    if binary.exists():
+        _copy_restored_candidate_output(binary, repo / "zaigr", "binary")
+    dist = candidate_root / "dist"
+    if dist.is_dir():
+        target = repo / DIST_DIR
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(dist, target)
+
+
+def _copy_restored_candidate_output(source: Path, target: Path, name: str) -> None:
+    """Replace one repository output with a saved candidate output.
+
+    Args:
+        source: Candidate output path.
+        target: Repository output path.
+        name: User-facing output name.
+
+    Raises:
+        RuntimeError: If the output cannot be restored.
+    """
+    temp_path: Path | None = None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".restore",
+        )
+        temp_path = Path(temp_name)
+        os.close(fd)
+        shutil.copy2(source, temp_path)
+        os.replace(temp_path, target)
+        temp_path = None
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot restore candidate {name} from {source} to {target}: {exc}"
+        ) from exc
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def _mark_candidate_failed(
+    candidate_root: Path,
+    transcript_path: Path,
+    exc: Exception,
+    command_display: str | None,
+) -> None:
+    """Record candidate failure state.
+
+    Args:
+        candidate_root: Candidate directory path.
+        transcript_path: Transcript path for the failed candidate command.
+        exc: Exception that caused the failure.
+        command_display: Optional step name active when the failure happened.
+    """
+    release = _read_json(candidate_root / "release.json")
+    failure = {
+        "error": str(exc),
+        "stage": "candidate",
+        "transcript_path": str(transcript_path),
+    }
+    if command_display:
+        failure["command_display"] = command_display
+    release["failed"] = True
+    release["failed_at"] = _utc_now()
+    release["failure"] = failure
+    release["status"] = "failed"
+    _write_json(candidate_root / "release.json", release)
+
+
+def _set_publish_step(root: Path, publish: JsonObject, key: str, value: bool) -> None:
+    """Persist one publish progress flag.
+
+    Args:
+        root: Candidate directory path.
+        publish: Mutable publish metadata.
+        key: Publish state field to set.
+        value: Publish state value.
+    """
+    publish[key] = value
+    _write_json(root / "publish.json", publish)
+
+
+def _collect_artifacts(dist: Path) -> list[Path]:
+    """Collect artifact files from a dist directory.
+
+    Args:
+        dist: Directory containing release artifacts.
+
+    Returns:
+        Sorted artifact paths, excluding checksums.txt.
+    """
+    if not dist.is_dir():
+        return []
+    return sorted(path for path in dist.iterdir() if path.is_file() and path.name != "checksums.txt")
+
+
+def _sha256(path: Path) -> str:
+    """Calculate a file SHA-256 digest.
+
+    Args:
+        path: File to hash.
+
+    Returns:
+        The hexadecimal digest.
+    """
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _read_json(path: Path) -> JsonObject:
+    """Read a JSON object from disk.
+
+    Args:
+        path: JSON file path.
+
+    Returns:
+        Parsed JSON object.
+
+    Raises:
+        RuntimeError: If the file is missing, corrupt, or not an object.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"missing state file: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"corrupt release state: {path}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise RuntimeError(f"state file must contain a JSON object: {path}")  # noqa: TRY004 -- malformed external state, not a caller type error
+    return data
+
+
+def _write_json(path: Path, data: JsonObject) -> None:
+    """Write a JSON object with stable formatting.
+
+    Args:
+        path: Destination file path.
+        data: JSON object to write.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _state_root(repo: Path) -> Path:
+    """Build the candidate state root path.
+
+    Args:
+        repo: Repository root.
+
+    Returns:
+        Path to the candidate state directory.
+    """
+    return repo / STATE_ROOT
+
+
+def _active_path(repo: Path) -> Path:
+    """Build the active candidate state path.
+
+    Args:
+        repo: Repository root.
+
+    Returns:
+        Path to active candidate metadata.
+    """
+    return repo / ACTIVE_FILE
+
+
+def _candidate_path(repo: Path, version: str, build: int) -> Path:
+    """Build a candidate directory path.
+
+    Args:
+        repo: Repository root.
+        version: Release version.
+        build: Candidate build number.
+
+    Returns:
+        Path to the candidate directory.
+    """
+    return _state_root(repo) / f"{version}-{build}"
+
+
+def _utc_now() -> str:
+    """Return the current UTC timestamp for metadata.
+
+    Returns:
+        ISO-8601 UTC timestamp.
+    """
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _release_build_time() -> str:
+    """Return the current UTC timestamp for build flags.
+
+    Returns:
+        Compact UTC timestamp.
+    """
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+
+def _git_commit(repo: Path) -> str:
+    """Read the current commit hash.
+
+    Args:
+        repo: Repository root.
+
+    Returns:
+        Short commit hash.
+    """
+    return subprocess.check_output(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=repo,
+        text=True,
+    ).strip()
+
+
+def _git_dirty(repo: Path) -> bool:
+    """Check whether the repo has uncommitted changes.
+
+    Args:
+        repo: Repository root.
+
+    Returns:
+        True when git reports tracked or untracked changes.
+    """
+    output = subprocess.check_output(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=repo,
+        text=True,
+    ).strip()
+    return bool(output)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

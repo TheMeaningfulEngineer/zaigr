@@ -1,0 +1,13 @@
+[Unit]
+Description=Prepare zaigr guest runtime before SSH
+DefaultDependencies=no
+After=local-fs.target systemd-udevd.service
+Before=ssh.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/zaigr/runtime-setup
+
+[Install]
+WantedBy=multi-user.target
