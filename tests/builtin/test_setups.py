@@ -676,7 +676,7 @@ kubectl delete pod net-test --wait=true
 
     package_tools_script = """
 set -eu
-for tool in podman fuse-overlayfs pasta slirp4netns file rpm newuidmap newgidmap; do
+for tool in podman crun fuse-overlayfs pasta slirp4netns file rpm newuidmap newgidmap; do
     command -v "$tool" >/dev/null
 done
 """

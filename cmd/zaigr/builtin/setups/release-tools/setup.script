@@ -8,6 +8,7 @@ echo ":: Installing release packages ..."
 apt-get update -qq
 apt-get install -y --no-install-recommends \
     ca-certificates \
+    crun \
     curl \
     file \
     fuse-overlayfs \
