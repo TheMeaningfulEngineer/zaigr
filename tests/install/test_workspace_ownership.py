@@ -192,12 +192,16 @@ def test_shared_workspace_preserves_guest_owners_and_host_caller(ownership_host)
                         continue
                     statements.extend(
                         [
-                            f"if cat {path} >/dev/null 2>&1; then "
-                            f"printf '%s\\n' '{name} read {other} private file' >&2; "
-                            "exit 1; fi",
-                            f"if printf forbidden 2>/dev/null >> {path}; then "
-                            f"printf '%s\\n' '{name} wrote {other} private file' >&2; "
-                            "exit 1; fi",
+                            (
+                                f"if cat {path} >/dev/null 2>&1; then "
+                                f"printf '%s\\n' '{name} read {other} private file' >&2; "
+                                "exit 1; fi"
+                            ),
+                            (
+                                f"if printf forbidden 2>/dev/null >> {path}; then "
+                                f"printf '%s\\n' '{name} wrote {other} private file' >&2; "
+                                "exit 1; fi"
+                            ),
                         ]
                     )
                 privacy_checks.append((name, uid, gid, "; ".join(statements)))
