@@ -382,7 +382,7 @@ def _verification_inputs(repo: Path, root: Path, release: JsonObject) -> JsonObj
 
 
 def _cmd_publish(repo: Path, args: argparse.Namespace) -> int:
-    """Publish the active verified release candidate.
+    """Publish the active release candidate after confirmation.
 
     Args:
         repo: Repository root.
@@ -392,7 +392,7 @@ def _cmd_publish(repo: Path, args: argparse.Namespace) -> int:
         The command exit code.
 
     Raises:
-        RuntimeError: If the active candidate is unverified or publish state is invalid.
+        RuntimeError: If confirmation is declined or publish state is invalid.
     """
     del args
     version, build, root = _resolve_active_candidate(repo)
@@ -400,10 +400,7 @@ def _cmd_publish(repo: Path, args: argparse.Namespace) -> int:
 
     _print_active_candidate(version, build, release, root)
     if not release.get("verified"):
-        raise RuntimeError(
-            f"refusing to publish unverified candidate {version}-{build} "
-            f"(status: {release.get('status', 'unknown')})"
-        )
+        _confirm_unverified_candidate(version, build)
     _confirm_action("publishing", version, build)
 
     publish_state = _read_json(root / "publish.json")
@@ -419,6 +416,12 @@ def _cmd_publish(repo: Path, args: argparse.Namespace) -> int:
     transcript_path = root / "transcripts" / "publish.log"
     logger = _transcript_logger(transcript_path)
     try:
+        if not release.get("verified"):
+            logger.info(
+                ":: Publishing unverified candidate %s-%s with explicit confirmation.",
+                version,
+                build,
+            )
         tag_target = _tag_target_commit(release)
         tag_commit = _required_commit(logger, repo, tag_target)
         _ensure_local_tag(logger, repo, root, publish_state, release["tag"], tag_target, tag_commit)
@@ -486,6 +489,27 @@ def _confirm_action(action: str, version: str, build: int) -> None:
             raise RuntimeError("release candidate creation cancelled")
         raise RuntimeError(f"{action} cancelled")
     print(file=sys.stderr, flush=True)
+
+
+def _confirm_unverified_candidate(version: str, build: int) -> None:
+    """Require confirmation before publishing an unverified candidate.
+
+    Args:
+        version: Candidate version.
+        build: Candidate build number.
+
+    Raises:
+        RuntimeError: If the user declines or stdin is closed.
+    """
+    prompt = (
+        f"Candidate {version}-{build} has not passed verification. "
+        "Publish this unverified candidate anyway? [y/N] "
+    )
+    print(prompt, end="", file=sys.stderr, flush=True)
+    answer = sys.stdin.readline()
+    print(file=sys.stderr, flush=True)
+    if not answer or answer.strip().lower() not in {"y", "yes"}:
+        raise RuntimeError("unverified candidate publishing cancelled")
 
 
 def _confirm_dirty_candidate(version: str, build: int, commit: str) -> None:

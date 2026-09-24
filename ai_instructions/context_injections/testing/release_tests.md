@@ -16,8 +16,9 @@ Failure tests must assert that the candidate is marked failed, the transcript is
 kept, and the next candidate preview reports the previous failed candidate.
 
 Verify and publish tests should use the active candidate. Verification marks a
-candidate verified after running fake pytest commands; publishing refuses
-unverified candidates and records publish progress.
+candidate verified after running fake pytest commands; publishing requires extra
+confirmation for unverified candidates and records publish progress. Test both
+confirmation and cancellation without changing verification metadata.
 
 Canonical examples:
 

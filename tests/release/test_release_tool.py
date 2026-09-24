@@ -763,10 +763,11 @@ def test_publish_refuses_missing_active_candidate(tmp_path):
     assert "release/state/active.json" in out + err
 
 
-def test_publish_uses_active_candidate_and_records_progress(tmp_path):
+@pytest.mark.parametrize("status", ["verified", "candidate"])
+def test_publish_uses_active_candidate_and_records_progress(tmp_path, status):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
-    candidate = _write_candidate(repo, "1.0.0", 1, status="verified")
+    candidate = _write_candidate(repo, "1.0.0", 1, status=status)
     _write_active_candidate(repo, "1.0.0", 1)
     original_release = json.loads((candidate / "release.json").read_text(encoding="utf-8"))
     commit = original_release["commit"]
@@ -801,7 +802,7 @@ esac
         [RELEASE, "publish"],
         cwd=repo,
         env=_release_env(tmp_path),
-        input="y\n",
+        input="y\n" if status == "verified" else "yes\ny\n",
         timeout=10,
     )
 
@@ -809,7 +810,13 @@ esac
     assert "Active release candidate" in err
     assert "version:" in err and "1.0.0" in err
     assert "build:" in err and "1" in err
-    assert "status:" in err and "verified" in err
+    assert "status:" in err and status in err
+    warning = "Candidate 1.0.0-1 has not passed verification."
+    if status == "candidate":
+        assert "Publish this unverified candidate anyway? [y/N]" in err
+        assert err.index(warning) < err.index("Do you want to proceed with publishing")
+    else:
+        assert warning not in err
     assert "Detected active candidate 1.0.0-1." in err
     assert "Do you want to proceed with publishing version 1.0.0, build 1?" in err
     assert "Publishing candidate:" in err
@@ -819,6 +826,12 @@ esac
     release = json.loads((candidate / "release.json").read_text(encoding="utf-8"))
     publish = json.loads((candidate / "publish.json").read_text(encoding="utf-8"))
     assert release["status"] == "published"
+    assert release["verified"] is (status == "verified")
+    assert "verified_at" not in release
+    assert not (candidate / "verification.json").exists()
+    transcript = (candidate / "transcripts" / "publish.log").read_text(encoding="utf-8")
+    if status == "candidate":
+        assert "Publishing unverified candidate 1.0.0-1 with explicit confirmation." in transcript
     assert publish["local_tag_created"] is True
     assert publish["remote_tag_pushed"] is True
     assert publish["github_release_created"] is True
@@ -1122,16 +1135,27 @@ esac
     assert "Published: v1.0.0" in out
 
 
-def test_publish_refuses_unverified_candidate(tmp_path):
+@pytest.mark.parametrize("answer", ["", "\n", "n\n", "no\n", "invalid\n", "y\nn\n", "y\n"])
+def test_publish_unverified_candidate_cancellation_preserves_state(tmp_path, answer):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
-    _write_candidate(repo, "1.0.0", 1, status="created")
+    candidate = _write_candidate(repo, "1.0.0", 1, status="candidate")
     _write_active_candidate(repo, "1.0.0", 1)
+    original_files = {path: path.read_bytes() for path in candidate.rglob("*") if path.is_file()}
+    active_path = repo / "release/state" / "active.json"
+    original_active = active_path.read_bytes()
+    for command in ("git", "gh"):
+        _fake_command(
+            tmp_path / "bin",
+            command,
+            "touch release/state/unexpected-publish-command\nexit 64\n",
+        )
 
     out, err, rc = run(
         [RELEASE, "publish"],
         cwd=repo,
         env=_release_env(tmp_path),
+        input=answer,
         timeout=10,
     )
 
@@ -1141,7 +1165,12 @@ def test_publish_refuses_unverified_candidate(tmp_path):
     assert "version:" in err and "1.0.0" in err
     assert "build:" in err and "1" in err
     assert "unverified candidate" in combined
-    assert "created" in combined
+    assert "publishing cancelled" in combined
+    assert "Publish this unverified candidate anyway? [y/N]" in err
+    assert ("Do you want to proceed with publishing" in err) == answer.startswith("y\n")
+    assert not (repo / "release/state/unexpected-publish-command").exists()
+    assert active_path.read_bytes() == original_active
+    assert {path: path.read_bytes() for path in candidate.rglob("*") if path.is_file()} == original_files
 
 
 def test_publish_refuses_corrupt_candidate(tmp_path):
