@@ -631,7 +631,11 @@ def test_verify_replaces_running_candidate_binary_without_writing_to_it(tmp_path
     assert "Traceback" not in combined
 
 
-def test_verify_uses_active_candidate_and_records_verification(tmp_path):
+@pytest.mark.parametrize("overlap_workers", [None, "2"])
+def test_verify_uses_active_candidate_and_records_verification(tmp_path, monkeypatch, overlap_workers):
+    monkeypatch.delenv("PYTEST_OVERLAP_WORKERS", raising=False)
+    if overlap_workers is not None:
+        monkeypatch.setenv("PYTEST_OVERLAP_WORKERS", overlap_workers)
     repo = tmp_path / "repo"
     _init_git_repo(repo)
     candidate = _write_candidate(repo, "1.0.0", 1, status="candidate")
@@ -677,6 +681,7 @@ printf 'make %s\\n' "$*" >> "$PWD/release/state/commands.log"
     ).hexdigest()
     assert evidence["inputs"]["test_commit"] == release["commit"]
     assert evidence["environment"]["ZAIGR_TEST_BINARY"] == str(candidate / "zaigr")
+    assert evidence["environment"]["PYTEST_OVERLAP_WORKERS"] == (overlap_workers or "4")
     transcript = (candidate / "transcripts" / "verify.log").read_text(encoding="utf-8")
     assert "stale transcript" not in transcript
     assert "make test-all" in transcript

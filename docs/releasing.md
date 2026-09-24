@@ -20,6 +20,20 @@ Inside the VM:
 
 After verification succeeds, run `exit` to return to the host.
 
+Verification runs release and versioning tests first, then overlaps the CLI
+tests at four workers with serial install tests. Builtin tests run afterward
+at two workers. Both overlapping groups must finish successfully before
+verification continues. Set `PYTEST_OVERLAP_WORKERS` to adjust CLI concurrency
+during verification; `PYTEST_XDIST_WORKERS` still controls standalone
+`make test-cli` runs (default eight).
+
+`make test-all` uses the same schedule; `make test-cli-install` runs just the
+overlapping group. UID install tests prepare their system dependencies once per
+pytest session/worker in a temporary image. Each case still installs the selected
+zaigr binary and creates its own container, caller, and VMs. The image is removed
+after the session. Distro package and standalone installation tests continue to
+start from pristine distro images.
+
 ## Publish
 
 Requirements on the host:

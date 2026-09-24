@@ -305,6 +305,7 @@ def _cmd_verify(repo: Path, args: argparse.Namespace) -> int:
         env = {
             "ZAIGR_TEST_BINARY": str((root / "zaigr").resolve()),
             "PYTEST_XDIST_WORKERS": os.environ.get("PYTEST_XDIST_WORKERS", "8"),
+            "PYTEST_OVERLAP_WORKERS": os.environ.get("PYTEST_OVERLAP_WORKERS", "4"),
             "PYTEST_BUILTIN_WORKERS": os.environ.get("PYTEST_BUILTIN_WORKERS", "2"),
         }
         evidence.update({"inputs": inputs, "environment": env, "status": "running"})
