@@ -47,7 +47,7 @@ Requirements on the host:
   sudo apt install ./gh_2.101.0_linux_amd64.deb
   ```
 
-- The verified candidate available in the same checkout.
+- The candidate available in the same checkout.
 - Git authentication and permission to push tags to `origin`.
 - GitHub CLI authentication with permission to create releases and upload assets.
   Use [`gh auth login`](https://cli.github.com/manual/gh_auth_login), or supply a
@@ -60,3 +60,9 @@ On the host, with GitHub authentication configured:
 ```sh
 ./release/release publish
 ```
+
+If the candidate has not passed verification, publishing first asks
+`Publish this unverified candidate anyway? [y/N]`. Answer `y` to continue to the
+normal publishing confirmation. Any other response except `yes`, including
+empty input, cancels. Publishing this way leaves verification metadata unchanged
+and records the explicit confirmation in the publish transcript.

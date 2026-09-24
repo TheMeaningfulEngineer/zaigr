@@ -17,5 +17,5 @@ previous failed candidate.
 
 Verification uses the active candidate, restores saved candidate outputs, runs
 the release verification steps, then marks the candidate verified. Publishing
-must refuse unverified candidates.
-
+unverified candidates requires an additional explicit confirmation, defaults to
+cancellation, and must leave verification metadata unchanged.
