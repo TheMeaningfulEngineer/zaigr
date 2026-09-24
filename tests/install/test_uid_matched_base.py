@@ -1,11 +1,12 @@
 """UID-only usability parity through the installed public CLI, not ID mapping."""
 
 import json
+import uuid
 from functools import partial
 
 import pytest
 
-from tests.conftest import err_msg
+from tests.conftest import err_msg, run
 
 HOME = "/home/uid-host"
 PREPARATION_WARNING = "Preparing the base image for your account automatically"
@@ -18,18 +19,53 @@ def checked(container, command, **kwargs):
     return stdout
 
 
+def checked_host(command, **kwargs):
+    """Run visible container infrastructure commands with transcript capture."""
+    stdout, stderr, rc = run(command, **kwargs)
+    assert rc == 0, err_msg(stdout, stderr)
+    return stdout
+
+
+@pytest.fixture(scope="session")
+def uid_dependencies_image():
+    """Prepare host tools once per worker, retaining fresh users and VMs in every case."""
+    token = uuid.uuid4().hex
+    builder = f"zaigr-uid-dependencies-{token}"
+    image = f"localhost/zaigr-uid-dependencies:{token}"
+    try:
+        try:
+            checked_host(
+                ["podman", "run", "-d", "--rm", "--network", "host", "--name", builder,
+                 "docker.io/library/debian:trixie", "sleep", "infinity"],
+                timeout=600,
+            )
+            checked_host(
+                ["podman", "exec", builder, "bash", "-lc",
+                 "printf 'Acquire::ForceIPv4 \"true\";\\n' > /etc/apt/apt.conf.d/99zaigr-install-test-ipv4"],
+                timeout=30,
+            )
+            checked_host(["podman", "exec", builder, "apt-get", "update"], timeout=180)
+            checked_host(
+                ["podman", "exec", "--env", "DEBIAN_FRONTEND=noninteractive", builder,
+                 "apt-get", "install", "-y", "--no-install-recommends",
+                 "coreutils", "e2fsprogs", "openssh-client", "qemu-system-x86", "qemu-utils"],
+                timeout=240,
+            )
+            checked_host(["podman", "commit", "--pause=false", builder, image], timeout=120)
+        finally:
+            checked_host(
+                ["podman", "rm", "--ignore", "--force", "--time", "0", builder], timeout=30,
+            )
+        yield image
+    finally:
+        checked_host(["podman", "image", "rm", "--ignore", image], timeout=60)
+
+
 @pytest.fixture
-def uid_caller(request, container_factory):
+def uid_caller(request, container_factory, uid_dependencies_image):
     """Install zaigr in an isolated container with a real numeric host caller."""
     uid, gid = request.param
-    container = container_factory("debian:trixie", standalone=True)
-    checked(container, "apt-get update", timeout=180)
-    checked(
-        container,
-        "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
-        "coreutils e2fsprogs openssh-client qemu-system-x86 qemu-utils",
-        timeout=240,
-    )
+    container = container_factory(uid_dependencies_image, standalone=True)
     checked(container, "install -m 0755 /dist/zaigr /usr/local/bin/zaigr")
     checked(container, f"getent group {gid} >/dev/null || groupadd -g {gid} uid-host")
     # -o permits the UID-1 collision probe without changing the container's daemon account.

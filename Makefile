@@ -6,13 +6,11 @@ LDFLAGS = -X main.version=$(VERSION) -X main.build=$(BUILD) -X main.commit=$(COM
 TAG = v$(VERSION)
 INSTALL_TEST_TIMEOUT ?= 1800
 PYTEST_XDIST_WORKERS ?= 8
+PYTEST_OVERLAP_WORKERS ?= 4
 PYTEST_BUILTIN_WORKERS ?= 2
 TEST_BINARY = $(if $(strip $(ZAIGR_TEST_BINARY)),$(abspath $(ZAIGR_TEST_BINARY)),$(CURDIR)/zaigr)
 
-.PHONY: build lint lint-golang lint-python test-all test-prepare test-cli test-builtin test-versioning test-install test-release test-logged clean base-rootfs base-kernel clean-kernel
-
-# Versioning tests temporarily edit embedded inputs; never overlap gate phases.
-.NOTPARALLEL: test-all
+.PHONY: build lint lint-golang lint-python test-all test-prepare test-cli test-cli-install test-builtin test-versioning test-install test-release test-logged clean base-rootfs base-kernel clean-kernel
 
 # Build the base image, then compile the Go binary
 build: base-kernel base-rootfs
@@ -47,7 +45,16 @@ test-cli: test-prepare
 test-builtin: test-prepare
 	ZAIGR_TEST_BINARY="$(TEST_BINARY)" pytest -c tests/pytest.ini tests/builtin -v -x -n $(PYTEST_BUILTIN_WORKERS) --maxschedchunk=1 --timeout=1800 -o timeout_func_only=true
 
-test-all: test-release test-versioning test-cli test-builtin test-install
+test-cli-install: test-prepare
+	$(MAKE) -j2 test-cli test-install PYTEST_XDIST_WORKERS=$(PYTEST_OVERLAP_WORKERS) ZAIGR_TEST_BINARY="$(TEST_BINARY)"
+
+# Keep versioning's embedded-input edits separate even under make -j.
+# Separate recipes also work with GNU Make versions before target-scoped .NOTPARALLEL.
+test-all:
+	$(MAKE) test-release
+	$(MAKE) test-versioning
+	$(MAKE) test-cli-install
+	$(MAKE) test-builtin ZAIGR_TEST_BINARY="$(TEST_BINARY)"
 
 test-release:
 	pytest -c tests/pytest.ini tests/release -v -x
