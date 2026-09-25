@@ -59,6 +59,9 @@ func cleanProjectToCurrentBase() error {
 		if err := stagedStore.writeFirewallIPs(firewallIPs); err != nil {
 			return fmt.Errorf("preserve project firewall IP permissions: %w", err)
 		}
+		if err := preserveHostAccessGrants(store, stagedStore); err != nil {
+			return err
+		}
 		fmt.Fprintln(os.Stderr, ":: Discarding incompatible legacy project image and setup state")
 		if err := publishLegacyCleanStore(store, stagedStore.Path); err != nil {
 			return err
@@ -599,6 +602,13 @@ func publishProjectReplacement(store projectStore, candidate string, metadataPat
 }
 
 func publishLegacyCleanStore(store projectStore, stagedStore string) error {
+	// Claims scan both the current store and its backup. Serialize the rename
+	// with those scans so an enumeration cannot miss both names.
+	ownership := &projectMutationLock{}
+	defer ownership.releaseWithWarning()
+	if err := ownership.lockHostDeviceOwners(); err != nil {
+		return err
+	}
 	backupPath := store.Path + ".legacy-clean-transaction-old"
 	if _, err := os.Lstat(backupPath); err == nil {
 		return fmt.Errorf("stale legacy clean transaction backup exists: %s", backupPath)
@@ -650,6 +660,11 @@ func recoverLegacyCleanTransaction(store projectStore) error {
 	}
 	if !backupInfo.IsDir() {
 		return fmt.Errorf("legacy clean backup is not a directory: %s", backupPath)
+	}
+	ownership := &projectMutationLock{}
+	defer ownership.releaseWithWarning()
+	if err := ownership.lockHostDeviceOwners(); err != nil {
+		return err
 	}
 
 	if _, err := os.Lstat(store.Path); err == nil {
@@ -924,6 +939,9 @@ func rebuildLegacyProjectStore(store projectStore, definitions []setupDefinition
 	}
 	if err := stagedStore.writeFirewallIPs(firewallIPs); err != nil {
 		return nil, fmt.Errorf("preserve project firewall IP permissions: %w", err)
+	}
+	if err := preserveHostAccessGrants(store, stagedStore); err != nil {
+		return nil, err
 	}
 	if hadSetupFailure {
 		if err := stagedStore.markSetupFailure(); err != nil {

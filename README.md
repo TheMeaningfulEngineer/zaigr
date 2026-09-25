@@ -230,6 +230,54 @@ Rebuilding replaces the [project image](docs/terminology.md#project-image).
 Preserve manual changes that are not recorded in
 [setups](docs/terminology.md#setup) before rebuilding.
 
+### I want to open a project server in my host browser
+
+Start the server inside your project, listening on `0.0.0.0:3000`, then run on
+the host:
+
+```sh
+zaigr project host-access allow 8080 --vm-port 3000
+zaigr project host-access show
+```
+
+Open `http://127.0.0.1:8080`. Omitting `--vm-port` uses the host port inside the
+project too. Forwarding is TCP over IPv4 and binds only to host `127.0.0.1`.
+Allow and remove take effect on a running VM. Removing a forward prevents new
+connections; existing connections may finish.
+
+```sh
+zaigr project host-access remove 8080
+```
+
+### I need a host serial device inside the project
+
+```sh
+zaigr project host-access allow /dev/ttyUSB0
+zaigr project vm stop
+zaigr project vm start
+zaigr project host-access show
+```
+
+The device appears at the same absolute path for project shells and presets.
+Up to two serial TTYs are supported. Your host account needs read/write access.
+New device grants need a VM restart; stop the VM before removing an exposed
+device with `zaigr project host-access remove /dev/ttyUSB0`.
+
+Grants survive stop/start, clean, and rebuild. A device remains reserved to its
+project while stopped or unplugged; remove its grant or delete the stopped
+project to release it. A changed device identity requires explicit removal and
+authorization of the replacement. Grants are not inherited by reusable setups.
+
+`show` observes listeners and open device descriptors inside the VM without
+connecting to your services or opening devices. `Available` means sharing is
+active with no guest consumer; `Attached` means a guest listener or device user
+is present. It also reports stopped, pending, unavailable, and unknown states.
+
+Serial byte transfer and baud changes have automated PTY coverage. Physical
+USB reconnect, modem-control lines, and board-specific flashing tools remain
+unverified. This feature does not provide generic USB or arbitrary-device
+passthrough. See the [transport notes](docs/project-host-access-transport.md).
+
 ### I need to access a server running on the host
 
 Inside the [VM](docs/terminology.md#project-vm), the host is reachable at
@@ -248,6 +296,82 @@ This permission allows **all ports** at that address for this
 
 ```sh
 zaigr project firewall remove 10.0.2.2
+```
+
+### I want to SSH from the VM into a Docker container on my host
+
+This example requires Docker running on the host. It creates an SSH server
+with username `user` and password `user`; no SSH keys need to be configured.
+Run the following in a host terminal:
+
+```sh
+mkdir zaigr-ssh-demo
+cd zaigr-ssh-demo
+cat > Dockerfile <<'EOF'
+FROM debian:trixie-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssh-server \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -s /bin/sh user \
+    && echo 'user:user' | chpasswd \
+    && mkdir -p /run/sshd \
+    && rm -f /etc/ssh/ssh_host_*
+EXPOSE 22
+CMD ["sh", "-c", "ssh-keygen -A && exec /usr/sbin/sshd -D -e -o PasswordAuthentication=yes -o PermitRootLogin=no"]
+EOF
+docker build -t zaigr-ssh-demo .
+docker run -d --rm --name zaigr-ssh-demo \
+    -p 127.0.0.1:2222:22 zaigr-ssh-demo
+```
+
+Docker [publishes the container's SSH port on host loopback](https://docs.docker.com/engine/network/port-publishing/).
+Wait up to 30 seconds for SSH to become ready, then connect from the host:
+
+```sh
+timeout 30s sh -c 'until docker exec zaigr-ssh-demo ssh-keyscan -T 1 127.0.0.1 >/dev/null 2>&1; do sleep 1; done' &&
+    ssh -o PubkeyAuthentication=no -p 2222 user@127.0.0.1
+```
+
+If the readiness check times out, inspect `docker logs zaigr-ssh-demo` before
+continuing.
+
+Accept the host-key prompt on this first connection and enter `user` at the
+password prompt. Inside the container, check the login and note its hostname,
+then return to the host:
+
+```sh
+whoami
+hostname
+exit
+```
+
+`whoami` prints `user`; `hostname` prints the container's ID. From the same host
+directory, start the project VM, answer `y` to initialization, and grant it
+access to the host:
+
+```sh
+zaigr project vm start
+zaigr project firewall allow 10.0.2.2
+zaigr shell
+```
+
+Now **inside the VM**, connect to the same container through the host gateway:
+
+```sh
+ssh -o PubkeyAuthentication=no -p 2222 user@10.0.2.2
+```
+
+Accept the first host-key prompt and enter password `user` again. Run `whoami`
+and `hostname`: they should print `user` and the same container ID as before.
+Run `exit` twice to return through the VM shell to the host.
+
+The firewall grant persists for this project and permits **all ports** at
+`10.0.2.2`. To finish the demo, run on the host:
+
+```sh
+zaigr project firewall remove 10.0.2.2
+docker stop zaigr-ssh-demo
+zaigr project vm stop
 ```
 
 ### I want to see what is running and stop something

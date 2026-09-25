@@ -45,6 +45,9 @@ write_proc() {
 }
 
 log "preparing devices and runtime directories"
+# Remove only aliases recorded by a previous interrupted host-access runtime.
+# Device grants are supplied anew by the host, never inherited from an image.
+/usr/local/lib/zaigr/host-access cleanup || log "warning: host-access alias cleanup is incomplete"
 mkdir -p /dev/shm
 ensure_mount /dev/shm -t tmpfs -o mode=1777,nosuid,nodev shm
 chmod 1777 /dev/shm

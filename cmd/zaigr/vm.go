@@ -54,6 +54,7 @@ func newProjectCommand() *cobra.Command {
 	cmd.AddCommand(newProjectSetupCommand())
 	cmd.AddCommand(newProjectVMCommand())
 	cmd.AddCommand(newProjectFirewallCommand())
+	cmd.AddCommand(newProjectHostAccessCommand())
 	cmd.AddCommand(newProjectStatusCommand())
 	cmd.AddCommand(newProjectRebuildCommand())
 	cmd.AddCommand(newProjectCleanCommand())
@@ -340,7 +341,7 @@ func newProjectVMSetConfigCommand() *cobra.Command {
 The project must already be initialized and its VM stopped.
 For a new project, run 'zaigr project vm start' to initialize it, then
 'zaigr project vm stop' before using this command.`,
-		Args:  cobra.NoArgs,
+		Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			return cmdProjectSetVMConfig(ram, cpu)
 		},

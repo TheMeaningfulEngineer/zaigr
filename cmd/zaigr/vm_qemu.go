@@ -307,13 +307,28 @@ func prepareProjectForVMStart(ram string, cpu string) (*runningVMInfo, error) {
 }
 
 func startPreparedProjectVM(ram string, cpu string) (string, error) {
+	store := currentProjectStore()
+	hostLock := &projectMutationLock{}
+	defer hostLock.releaseWithWarning()
+	grants := hostAccessGrants{Version: hostAccessVersion, Ports: []hostAccessPort{}, Devices: []hostAccessDevice{}}
+	// Capture-only VMs use an image override and must not receive project grants.
+	if projectImagePathOverrideForNextBoot == "" {
+		if err := hostLock.lockHostAccess(store, "project host-access startup"); err != nil {
+			return "", err
+		}
+		var err error
+		grants, err = store.hostAccess()
+		if err != nil {
+			return "", err
+		}
+	}
 	ramValue, _ := resolveRAM(ram)
 	cpuValue, _, err := resolveCPU(cpu)
 	if err != nil {
 		return "", err
 	}
 	logInfo("starting prepared project VM", "ram", ramValue, "cpu", cpuValue)
-	imagePort, err := bootProjectVM(ramValue, cpuValue)
+	imagePort, err := bootProjectVM(ramValue, cpuValue, grants)
 	if err != nil {
 		return "", err
 	}
@@ -327,6 +342,11 @@ func startPreparedProjectVM(ram string, cpu string) (string, error) {
 	}
 	if err := syncAppliedSetupFirewallToVM(imagePort); err != nil {
 		return "", err
+	}
+	if projectImagePathOverrideForNextBoot == "" {
+		if err := activateHostAccess(store, imagePort, grants, hostLock); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: VM started, but saved host-access activation is incomplete: %v; inspect with 'zaigr project host-access show'\n", err)
+		}
 	}
 	return imagePort, nil
 }
@@ -557,7 +577,7 @@ func syncPresetSelection(presetDef *presetDefinition) error {
 	return currentProjectStore().writePresetSelection(presetDef.Name, presetDef.Version)
 }
 
-func bootProjectVM(ram string, cpu string) (string, error) {
+func bootProjectVM(ram string, cpu string, grants hostAccessGrants) (string, error) {
 	store := currentProjectStore()
 	logDebug("booting project VM", "store", store.Path, "ram", ram, "cpu", cpu)
 	if err := requireKVMAccess(); err != nil {
@@ -594,12 +614,22 @@ func bootProjectVM(ram string, cpu string) (string, error) {
 		return "", fmt.Errorf("project image cannot be found: %s", filepath.Base(imgPath))
 	}
 
-	ln, err := net.Listen("tcp", ":0")
-	if err != nil {
-		return "", fmt.Errorf("allocate SSH port: %w", err)
+	sshPort := ""
+	for attempt := 0; attempt < 32; attempt++ {
+		ln, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			return "", fmt.Errorf("allocate SSH port: %w", err)
+		}
+		port := ln.Addr().(*net.TCPAddr).Port
+		_ = ln.Close()
+		if !hostAccessPortReserved(grants, port) {
+			sshPort = fmt.Sprint(port)
+			break
+		}
 	}
-	sshPort := fmt.Sprintf("%d", ln.Addr().(*net.TCPAddr).Port)
-	_ = ln.Close()
+	if sshPort == "" {
+		return "", fmt.Errorf("cannot allocate management port outside saved host-access ports")
+	}
 	logDebug("project VM SSH port is available", "port", sshPort)
 	if err := store.clearRuntimeState(); err != nil {
 		return "", err
@@ -630,6 +660,7 @@ func bootProjectVM(ram string, cpu string) (string, error) {
 
 	format := "qcow2"
 	args := buildQEMUArgs(imgPath, kernelPath, format, false, ram, cpu, sshPort, rootPubKey, userPubKey, store.hostname(), store.monitorSockPath())
+	args = append(args, hostAccessQEMUDevices(grants)...)
 	diskSize := store.disk()
 
 	fmt.Printf(":: Booting VM (kernel=%s, rootfs=%s, ram=%sMB, cpu=%s, disk=%s)\n",
