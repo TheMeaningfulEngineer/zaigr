@@ -410,6 +410,12 @@ func cmdProjectDelete(force bool) error {
 	}
 	defer lock.releaseWithWarning()
 	logInfo("starting project delete command", "store", storeDir(), "force", force)
+	if err := lock.lockHostAccess(currentProjectStore(), "project delete"); err != nil {
+		return err
+	}
+	if err := recoverLegacyCleanTransaction(currentProjectStore()); err != nil {
+		return err
+	}
 	storePath, err := requireProject("project delete")
 	if err != nil {
 		return err
@@ -436,8 +442,16 @@ func cmdProjectDelete(force bool) error {
 		fmt.Fprintf(os.Stderr, ":: Project delete cancelled\n")
 		return nil
 	}
+	if err := lock.lockHostDeviceOwners(); err != nil {
+		return err
+	}
+	// Check the whole tree before deleting anything, so a permission failure
+	// cannot erase device reservations while leaving a failed deletion behind.
+	if err := requireRemovableTree(storePath); err != nil {
+		return err
+	}
 
-	if err := os.RemoveAll(storePath); err != nil {
+	if err := removeProjectStorePreservingHostClaims(storePath); err != nil {
 		return fmt.Errorf("delete project store %s: %w", storePath, err)
 	}
 	fmt.Printf(":: Deleted project store: %s\n", storePath)
@@ -506,6 +520,13 @@ func stopProjectVMInStore(store projectStore, abrupt bool) (projectVMStopResult,
 			return projectVMStopResult{State: projectVMStopStateStale}, nil
 		}
 		return projectVMStopResult{State: projectVMStopStateOff}, nil
+	}
+	if running != nil && running.Port != "" {
+		if state, err := store.readHostAccessRuntime(); err == nil && len(state.Devices) > 0 {
+			if _, err := hostAccessGuestCommand(running.Port, "cleanup"); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: device aliases will be cleaned on the next boot: %v\n", err)
+			}
+		}
 	}
 
 	if abrupt {
