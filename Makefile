@@ -1,4 +1,4 @@
-VERSION ?= dev-$(shell ./release/dev-version.sh 2>/dev/null || echo unknown)
+VERSION ?= $(shell ./release/dev-version.sh 2>/dev/null || echo dev-unknown)
 BUILD ?= undefined
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo undefined)
 BUILD_TIME ?= $(shell date -u '+%Y%m%d-%H%M%S')
