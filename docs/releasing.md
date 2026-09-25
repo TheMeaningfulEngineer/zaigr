@@ -3,6 +3,29 @@
 Commit the release changes first. Run commands from the repository root and
 replace `0.1.0` with the version you want to release.
 
+## Development versions
+
+`make build` names development builds using `git describe` and the existing
+12-character worktree fingerprint, for example:
+
+```text
+v0.2.1-3-g1b5a8ce-dev-64574dfae435
+```
+
+This identifies a build three commits after release `v0.2.1`, at commit
+`1b5a8ce`. The final hash fingerprints tracked changes and non-ignored untracked
+files, so different local changes still produce different development versions.
+Ignored files do not affect it. Build number, commit, and build time remain
+available through `zaigr misc full-version`.
+
+The nearest reachable `vMAJOR.MINOR.PATCH` tag supplies the release base;
+lightweight and annotated tags are supported, and prerelease or unrelated tags
+are ignored. A development build at the release tag still includes `-0-g<commit>`
+and `-dev-<worktree-hash>`. Without a reachable release tag (including shallow
+clones without that history), the format is `<commit>-dev-<worktree-hash>`.
+Without usable Git metadata, `make build` falls back to `dev-unknown`.
+An explicit `VERSION=...` override and release candidate versions are unchanged.
+
 ## Build and verify
 
 On the host, enter the development VM (adjust resources for your machine):
