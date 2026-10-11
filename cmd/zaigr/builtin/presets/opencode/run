@@ -1,0 +1,60 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+
+agent_state=/home/user/.zaigr-agent-state
+if ! mountpoint -q "$agent_state"; then
+	echo "agent state mount not available: $agent_state" >&2
+	exit 1
+fi
+
+opencode_state="$agent_state/opencode"
+export XDG_CONFIG_HOME="$opencode_state/config"
+export XDG_DATA_HOME="$opencode_state/data"
+export XDG_STATE_HOME="$opencode_state/state"
+export XDG_CACHE_HOME="$opencode_state/cache"
+mkdir -p "$XDG_CONFIG_HOME/opencode" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME"
+
+opencode_config="$XDG_CONFIG_HOME/opencode/opencode.json"
+if [[ ! -e "$opencode_config" && ! -e "${opencode_config}c" ]]; then
+	opencode_defaults="$(mktemp "$XDG_CONFIG_HOME/opencode/.zaigr-defaults.XXXXXX")"
+	cat > "$opencode_defaults" <<'JSON'
+{
+  "default_agent": "build",
+  "update": "disable",
+  "providers": {
+    "mistral": {
+      "settings": { "baseURL": "https://api.eu.mistral.ai/v1" }
+    },
+    "togetherai": {
+      "settings": { "baseURL": "https://api.together.ai/v1" }
+    }
+  }
+}
+JSON
+	mv -n -- "$opencode_defaults" "$opencode_config"
+	rm -f -- "$opencode_defaults"
+fi
+
+# Keep runtime files off the persistent share. Standalone creates an authenticated
+# loopback server with a random password and a lifetime tied to this client.
+opencode_runtime="$(mktemp -d /tmp/zaigr-opencode.XXXXXX)"
+export TMPDIR="$opencode_runtime"
+trap 'rm -rf -- "$opencode_runtime"' EXIT
+
+opencode --standalone --auto <&0 >&1 2>&2 &
+opencode_pid=$!
+trap 'kill -HUP "$opencode_pid" 2>/dev/null || true' HUP
+trap 'kill -INT "$opencode_pid" 2>/dev/null || true' INT
+trap 'kill -QUIT "$opencode_pid" 2>/dev/null || true' QUIT
+trap 'kill -TERM "$opencode_pid" 2>/dev/null || true' TERM
+
+set +e
+while true; do
+	wait "$opencode_pid"
+	opencode_status=$?
+	if ! kill -0 "$opencode_pid" 2>/dev/null; then
+		break
+	fi
+done
+exit "$opencode_status"

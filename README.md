@@ -88,6 +88,16 @@ Or, for Claude Code:
 zaigr shell --preset claude
 ```
 
+Or, to use hosted models through OpenCode:
+
+```sh
+zaigr shell --preset opencode
+```
+
+Use `/connect` and `/models` inside OpenCode to choose your provider and model.
+See the [OpenCode guide](docs/opencode.md) for European hosting options, saved
+state, and updates.
+
 The first run initializes this directory as a
 [project](docs/terminology.md#project) for the following examples.
 

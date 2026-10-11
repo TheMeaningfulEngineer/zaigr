@@ -2517,6 +2517,7 @@ def test_zaigr_dev_preset_depends_on_every_builtin_setup(project, tmp_path):
         "kernel-mmdebstrap",
         "mistral",
         "nodejs",
+        "opencode",
         "podman",
         "python",
         "release-tools",
