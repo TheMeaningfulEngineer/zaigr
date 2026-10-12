@@ -563,9 +563,8 @@ func resolveAppliedSetupDefinitionsReadOnly(records []appliedSetup) ([]setupDefi
 		} else {
 			root = filepath.Join(zaigDir(), "setups", record.Name)
 			sourceRoot := path.Join("builtin/setups", record.Name)
-			if _, err := fs.Stat(builtinAssets, sourceRoot); err == nil {
-				// Execution refreshes bundled setups from this binary. Inspect
-				// that same source without rewriting the user's setup directory.
+			if _, embeddedErr := fs.Stat(builtinAssets, sourceRoot); embeddedErr == nil {
+				// Batch preflight inspects current embedded defaults without mutation.
 				temporaryRoot, tempErr := os.MkdirTemp("", "zaigr-rebuild-preflight-")
 				if tempErr != nil {
 					return nil, nil, tempErr
@@ -575,17 +574,16 @@ func resolveAppliedSetupDefinitionsReadOnly(records []appliedSetup) ([]setupDefi
 					return nil, nil, tempErr
 				}
 				root = temporaryRoot
-			} else if !os.IsNotExist(err) {
-				return nil, nil, err
-			} else {
-				info, err := os.Stat(root)
-				if os.IsNotExist(err) {
-					missing = append(missing, record)
-					continue
-				}
-				if err != nil || !info.IsDir() {
-					return nil, nil, fmt.Errorf("invalid setup path: %s", record.Name)
-				}
+			} else if !os.IsNotExist(embeddedErr) {
+				return nil, nil, embeddedErr
+			}
+			info, err := os.Stat(root)
+			if os.IsNotExist(err) {
+				missing = append(missing, record)
+				continue
+			}
+			if err != nil || !info.IsDir() {
+				return nil, nil, fmt.Errorf("invalid setup path: %s", record.Name)
 			}
 		}
 		definition, err := loadSetupDefinitionAt(record.Name, root, record.ProjectLocal)

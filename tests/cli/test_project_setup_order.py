@@ -2,6 +2,7 @@
 
 import json
 import re
+from pathlib import Path
 
 import pexpect
 import pytest
@@ -46,6 +47,124 @@ def _write_setup(project, name, script):
     setup_dir.mkdir(parents=True, exist_ok=True)
     (setup_dir / "setup.script").write_text(script, encoding="utf-8")
     (setup_dir / "setup.firewall").write_text("", encoding="utf-8")
+
+
+def _make_extracted_python_stale(project):
+    """Replace the extracted builtin recipe with a marker-producing stale copy."""
+    setups = project.home / ".zaigr" / "setups"
+    python_setup = setups / "python"
+    python_setup.mkdir(parents=True, exist_ok=True)
+    (python_setup / "setup.script").write_text(
+        "#!/bin/bash\nset -eu\nprintf stale > /etc/zaigr-stale-python\n",
+        encoding="utf-8",
+    )
+    (python_setup / "setup.firewall").write_text("stale.example\n", encoding="utf-8")
+    (python_setup / "obsolete.recipe").write_text("obsolete\n", encoding="utf-8")
+    custom_setup = setups / "custom-kept"
+    custom_setup.mkdir(parents=True, exist_ok=True)
+    (custom_setup / "setup.script").write_text("#!/bin/bash\n", encoding="utf-8")
+    local_setup = project.cwd / ".zaigr" / "setups" / "local-kept"
+    local_setup.mkdir(parents=True, exist_ok=True)
+    (local_setup / "setup.script").write_text("#!/bin/bash\n", encoding="utf-8")
+
+
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
+def test_rebuild_adopts_current_builtin_recipe(project, batch):
+    """Rebuild adopts the shipped builtin recipe and restores its full directory."""
+    _make_extracted_python_stale(project)
+    _checked_run(
+        project,
+        "project setup run python",
+        input="y\ny\n",
+        timeout=360,
+    )
+    _checked_run(project, "project vm stop", timeout=60)
+
+    python_setup = project.home / ".zaigr" / "setups" / "python"
+    builtin_setup = Path(__file__).parents[2] / "cmd" / "zaigr" / "builtin" / "setups" / "python"
+    assert (python_setup / "obsolete.recipe").exists()
+    custom_script = project.home / ".zaigr" / "setups" / "custom-kept" / "setup.script"
+    local_script = project.cwd / ".zaigr" / "setups" / "local-kept" / "setup.script"
+    custom_before = custom_script.read_bytes()
+    local_before = local_script.read_bytes()
+    (python_setup / "setup.script").write_text(
+        "#!/bin/bash\nset -eu\n"
+        "if false; then apt-get install stale-python-package; fi\n"
+        "printf stale > /etc/zaigr-stale-python\n",
+        encoding="utf-8",
+    )
+    (python_setup / "setup.firewall").write_text("stale.example\n", encoding="utf-8")
+    (python_setup / "obsolete.recipe").write_text("obsolete\n", encoding="utf-8")
+
+    if batch:
+        declined, decline_error, rc = _run(
+            f"{project.zaigr_bin} global projects rebuild {project.cwd.name} --force",
+            cwd=project.cwd,
+            env=project.env,
+            input="n\n",
+            timeout=120,
+        )
+        assert rc == 0, err_msg(declined, decline_error)
+        assert "cancel" in (declined + decline_error).lower()
+        assert "APT command without automatic confirmation" not in (
+            declined + decline_error
+        )
+        assert (python_setup / "obsolete.recipe").exists()
+        assert (python_setup / "setup.script").read_text(encoding="utf-8").startswith(
+            "#!/bin/bash\nset -eu\nif false; then apt-get install stale-python-package; fi"
+        )
+        _checked_run(
+            project,
+            f"global projects rebuild {project.cwd.name} --force --yes",
+            timeout=360,
+        )
+    else:
+        _checked_run(project, "project vm start", input="y\n", timeout=180)
+        _checked_run(
+            project,
+            "project vm exec --root -- tee /etc/zaigr-rebuild-dirty-marker",
+            input="y\nmanual-change\n",
+            timeout=60,
+        )
+        _checked_run(project, "project vm exec --root -- sync", input="y\n", timeout=30)
+        _checked_run(project, "project vm stop", timeout=60)
+        stdout, stderr, rc = _run(
+            f"{project.zaigr_bin} project rebuild",
+            cwd=project.cwd,
+            env=project.env,
+            timeout=30,
+        )
+        assert rc != 0
+        assert "Rerun with --force to rebuild" in (stdout + stderr)
+        assert (python_setup / "obsolete.recipe").exists()
+        assert "stale-python-package" in (python_setup / "setup.script").read_text(
+            encoding="utf-8"
+        )
+        _checked_run(
+            project,
+            "project rebuild --force",
+            input="y\na\ny\n",
+            timeout=360,
+        )
+
+    assert sorted(path.name for path in python_setup.iterdir()) == sorted(
+        path.name for path in builtin_setup.iterdir()
+    )
+    for recipe_file in builtin_setup.iterdir():
+        assert (python_setup / recipe_file.name).read_bytes() == recipe_file.read_bytes()
+    assert custom_script.read_bytes() == custom_before
+    assert local_script.read_bytes() == local_before
+
+    _checked_run(project, "project vm start", input="y\n", timeout=180)
+    _checked_run(project, "project vm exec -- ruff --version", timeout=60)
+    stdout, stderr, rc = _run(
+        f"{project.zaigr_bin} project vm exec -- test ! -e /etc/zaigr-stale-python",
+        cwd=project.cwd,
+        env=project.env,
+        timeout=60,
+    )
+    assert rc == 0, err_msg(stdout, stderr)
 
 
 @pytest.mark.timeout(600)

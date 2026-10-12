@@ -719,7 +719,14 @@ func rebuildProjectFromAppliedState(force bool) error {
 	if err != nil {
 		return err
 	}
-	return rebuildProjectFromRecords(force, records)
+	working, currentFormat, err := prepareProjectRebuild(force, records)
+	if err != nil {
+		return err
+	}
+	if err := refreshAppliedBuiltinSetups(working); err != nil {
+		return err
+	}
+	return replayProjectRebuild(working, currentFormat)
 }
 
 // rebuildProjectFromRecordsBatch is the non-interactive rebuild path used by
@@ -741,13 +748,6 @@ func rebuildProjectFromRecordsBatch(force bool) error {
 			working = append(working, record)
 		}
 	}
-	definitions, missing, err := resolveAppliedSetupDefinitions(working)
-	if err != nil {
-		return err
-	}
-	if len(missing) > 0 {
-		return fmt.Errorf("missing applied setup definitions: %s", strings.Join(displayAppliedSetupNames(missing), ", "))
-	}
 	if !force {
 		dirty, hasDirty, err := store.readProjectImageDirty()
 		if err != nil {
@@ -760,6 +760,16 @@ func rebuildProjectFromRecordsBatch(force bool) error {
 			}
 			return fmt.Errorf("project image has changes made with %s; rerun with --force to rebuild", source)
 		}
+	}
+	if err := refreshAppliedBuiltinSetups(working); err != nil {
+		return err
+	}
+	definitions, missing, err := resolveAppliedSetupDefinitions(working)
+	if err != nil {
+		return err
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing applied setup definitions: %s", strings.Join(displayAppliedSetupNames(missing), ", "))
 	}
 	if currentFormat {
 		_, err = buildRebuildCandidate(store, store, definitions)
@@ -792,22 +802,30 @@ func readBatchRebuildRecords(store projectStore, currentFormat bool) ([]appliedS
 }
 
 func rebuildProjectFromRecords(force bool, records []appliedSetup) error {
+	working, currentFormat, err := prepareProjectRebuild(force, records)
+	if err != nil {
+		return err
+	}
+	return replayProjectRebuild(working, currentFormat)
+}
+
+func prepareProjectRebuild(force bool, records []appliedSetup) ([]appliedSetup, bool, error) {
 	store := currentProjectStore()
 	currentFormat, err := store.usesCurrentImageFormat()
 	if err != nil {
-		return err
+		return nil, false, err
 	}
 	if !force {
 		dirty, hasDirty, err := store.readProjectImageDirty()
 		if err != nil {
-			return err
+			return nil, false, err
 		}
 		if hasDirty {
 			source := dirty.Source
 			if source == "" {
 				source = dirty.Reason
 			}
-			return fmt.Errorf(
+			return nil, false, fmt.Errorf(
 				"project image has changes made with %s. "+
 					"Zaigr cannot recover these changes or determine what they are. "+
 					"A rebuild will not include them. Rerun with --force to rebuild",
@@ -820,13 +838,13 @@ func rebuildProjectFromRecords(force bool, records []appliedSetup) error {
 		if _, statErr := os.Stat(store.appliedSetupsPath()); os.IsNotExist(statErr) {
 			records, err = readLegacyCommittedSetups(store)
 			if err != nil {
-				return err
+				return nil, false, err
 			}
 			if len(records) == 0 {
-				return fmt.Errorf("project rebuild found no recoverable applied setups in the incompatible legacy store; refusing to replace it with a blank image")
+				return nil, false, fmt.Errorf("project rebuild found no recoverable applied setups in the incompatible legacy store; refusing to replace it with a blank image")
 			}
 		} else if statErr != nil {
-			return fmt.Errorf("inspect applied setup records: %w", statErr)
+			return nil, false, fmt.Errorf("inspect applied setup records: %w", statErr)
 		}
 	}
 	working := make([]appliedSetup, 0, len(records))
@@ -835,6 +853,11 @@ func rebuildProjectFromRecords(force bool, records []appliedSetup) error {
 			working = append(working, record)
 		}
 	}
+	return working, currentFormat, nil
+}
+
+func replayProjectRebuild(working []appliedSetup, currentFormat bool) error {
+	store := currentProjectStore()
 	for {
 		definitions, missing, err := resolveAppliedSetupDefinitions(working)
 		if err != nil {
@@ -874,6 +897,23 @@ func rebuildProjectFromRecords(force bool, records []appliedSetup) error {
 		}
 		return nil
 	}
+}
+
+func refreshAppliedBuiltinSetups(records []appliedSetup) error {
+	seen := make(map[string]struct{})
+	for _, record := range records {
+		if record.Inherited || record.ProjectLocal {
+			continue
+		}
+		if _, ok := seen[record.Name]; ok {
+			continue
+		}
+		seen[record.Name] = struct{}{}
+		if err := refreshBuiltinSetupDefinition(record.Name); err != nil {
+			return fmt.Errorf("refresh built-in setup %q: %w", record.Name, err)
+		}
+	}
+	return nil
 }
 
 func readLegacyCommittedSetups(store projectStore) ([]appliedSetup, error) {

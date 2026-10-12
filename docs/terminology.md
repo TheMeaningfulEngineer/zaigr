@@ -21,6 +21,19 @@ Stopping the VM keeps the saved environment and your working files for later use
 A reusable recipe for adding tools and their network permissions to the
 environment. For example, the `python` setup adds Python tooling.
 
+Global setup definitions live in `~/.zaigr/setups/<name>/` and can be edited.
+Built-in defaults populate a setup only when its directory is absent. A
+`project rebuild` or `global projects rebuild` that replays an applied global
+built-in setup replaces it with the default shipped in the current zaigr
+binary before replay. This also removes files that are no longer part of that
+recipe. Custom global setups and project-local setups are preserved. Other
+entry points such as `project vm start`, `zaigr shell`, and `project setup
+run` continue to preserve an existing extracted copy and warn if it differs
+from the bundled default. The refreshed default remains installed if a later
+replay step fails; projects sharing the global setup directory see the adopted
+recipe as well. Use a project-local setup for per-project changes to a built-in
+recipe.
+
 Once applied, its tools and permissions remain available on later VM starts.
 A **project-local setup** is kept with one [project](#project)'s code so it can
 be shared with that code.
