@@ -4,3 +4,5 @@ pytest-xdist
 pexpect
 pyzstd
 ruff
+mypy
+types-pexpect

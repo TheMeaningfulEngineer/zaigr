@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -1541,7 +1541,7 @@ def _utc_now() -> str:
     Returns:
         ISO-8601 UTC timestamp.
     """
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _release_build_time() -> str:
@@ -1550,7 +1550,7 @@ def _release_build_time() -> str:
     Returns:
         Compact UTC timestamp.
     """
-    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
 
 
 def _git_commit(repo: Path) -> str:
