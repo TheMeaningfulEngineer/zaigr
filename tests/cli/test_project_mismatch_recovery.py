@@ -601,6 +601,8 @@ def test_failed_rebuild_abort_is_transactional_and_remove_restarts_clean(
     assert _file_digest(_project_image(project)) == original_digest
     assert (project.store_dir / "base-image-version").read_bytes() == recorded_base
     assert _tree_snapshot(project.store_dir / "agent-state") == agent_state_snapshot
+    assert mode.read_text(encoding="utf-8") == "fail\n"
+    assert later_mode.read_text(encoding="utf-8") == "rebuild\n"
     assert not later_ran.exists()
     assert not list(project.store_dir.glob("*wip*"))
 

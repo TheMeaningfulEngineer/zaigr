@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -186,14 +185,8 @@ func (store projectStore) writeAppliedSetups(records []appliedSetup) error {
 		}
 		return nil
 	}
-	copyRecords := append([]appliedSetup(nil), records...)
-	sort.Slice(copyRecords, func(i, j int) bool {
-		if copyRecords[i].Name != copyRecords[j].Name {
-			return copyRecords[i].Name < copyRecords[j].Name
-		}
-		return !copyRecords[i].ProjectLocal && copyRecords[j].ProjectLocal
-	})
-	body, err := json.MarshalIndent(copyRecords, "", "  ")
+	// Record sequence is replay order; sorting here can break setup dependencies.
+	body, err := json.MarshalIndent(records, "", "  ")
 	if err != nil {
 		return fmt.Errorf("serialize applied setups: %w", err)
 	}

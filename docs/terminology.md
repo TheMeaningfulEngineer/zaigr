@@ -25,6 +25,16 @@ Once applied, its tools and permissions remain available on later VM starts.
 A **project-local setup** is kept with one [project](#project)'s code so it can
 be shared with that code.
 
+During a rebuild, project-applied setups run in their recorded order. Inherited
+setups come from the base image and are not replayed. Reapplying an existing
+project setup keeps its place; applying a new setup adds it to the end.
+
+Older versions alphabetized project setup histories. An upgrade retains that
+stored order; it cannot reconstruct the original application order. Captured
+recipes in affected histories may still need to be self-contained. If replay
+fails, abort the rebuild and run `zaigr project vm start` to continue using the
+existing environment. Running an older binary can alphabetize the history again.
+
 ## Preset
 
 A named way to launch an agent or shell with the [setups](#setup) it needs.

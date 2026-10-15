@@ -16,31 +16,6 @@ The workaround gives other host UIDs the same shared-file usability as UID
 `1000`; it does not provide independent guest root or service-user ownership
 mapping on shared host files.
 
-## Captured setup can run before its prerequisite during rebuild
-
-Observed in version `0.1.0`.
-
-A captured [setup](docs/terminology.md) can replay before a previously applied
-project-local setup that it depends on. This can make `project rebuild` fail even
-though the capture worked when it was recorded.
-
-Example:
-
-1. Apply a project-local setup that installs `my-tool`.
-2. Start a capture and run `my-tool` successfully.
-3. Accept the capture, stop the VM, and run `zaigr project rebuild --force`.
-4. The captured setup runs before the project-local setup and fails with
-   `my-tool: command not found`.
-
-The observed failure aborted safely: the original project image and workspace
-files remained intact, and the existing environment worked after restarting.
-
-**Workaround:** Keep captured recipes self-contained rather than relying on tools
-installed by another project setup. If this rebuild failure occurs, choose abort
-and run `zaigr project vm start` to continue using the existing environment. This
-recovers the working environment but does not fix the captured recipe's replay
-order.
-
 ## Removing a domain may not block access immediately
 
 Observed in version `0.1.0`.
