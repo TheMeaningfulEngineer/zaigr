@@ -22,6 +22,14 @@ def checked(command):
 class HTTPHandler(http.server.BaseHTTPRequestHandler):
     """Return a sentinel or a continuous stream with fresh host-controlled nonces."""
 
+    def log_message(self, format, *args):
+        """Keep access logs in a file instead of blocking the readiness PTY."""
+        with self.server.log_path.open("a", encoding="utf-8") as log:
+            log.write(
+                f"{self.client_address[0]} - - [{self.log_date_time_string()}] "
+                f"{format % args}\n"
+            )
+
     def do_GET(self):
         """Serve traffic whose delivery can be observed after permission removal."""
         if self.path.startswith("/mark/"):
@@ -73,6 +81,17 @@ def wait_for_ssh(address, process):
     raise RuntimeError(f"SSH endpoint did not become ready: {address}")
 
 
+def print_service_log_tails(directory):
+    """Keep bounded endpoint logs in the pytest transcript before cleanup."""
+    for path in sorted(directory.glob("*.log")):
+        contents = path.read_text(encoding="utf-8", errors="replace")
+        print(
+            f":: endpoint log {path.name} ({len(contents)} bytes)\n"
+            + contents[-4000:],
+            flush=True,
+        )
+
+
 def serve(directory):
     """Provision only namespace-local interfaces, then supervise all services."""
     config = json.loads((directory / "services.json").read_text(encoding="utf-8"))
@@ -86,7 +105,8 @@ def serve(directory):
         checked(["ip", "address", "add", endpoint["ip"] + "/32", "dev", "lo"])
     command = ["/usr/sbin/sshd", "-D", "-e", "-f", str(directory / "sshd.conf")]
     print(":: endpoint infrastructure: " + shlex.join(command), flush=True)
-    sshd = subprocess.Popen(command)
+    sshd_log = (directory / "sshd.log").open("a", encoding="utf-8")
+    sshd = subprocess.Popen(command, stdout=sshd_log, stderr=sshd_log)
     servers = []
     threads = []
     started = []
@@ -101,11 +121,15 @@ def serve(directory):
                 service = server_type((endpoint["ip"], port), handler)
                 service.token = endpoint["token"]
                 service.marker = ""
+                service.log_path = directory / (
+                    f"http-{endpoint['ip'].replace('.', '-')}-{port}.log"
+                )
                 servers.append(service)
         host = config["host"]
         service = http.server.ThreadingHTTPServer(("127.0.0.1", host["port"]), HTTPHandler)
         service.token = host["token"]
         service.marker = ""
+        service.log_path = directory / f"http-loopback-{host['port']}.log"
         servers.append(service)
         for service in servers:
             thread = threading.Thread(target=service.serve_forever, daemon=True)
@@ -125,6 +149,7 @@ def serve(directory):
     finally:
         sshd.terminate()
         sshd.wait(timeout=10)
+        sshd_log.close()
         for service in servers:
             if service in started:
                 service.shutdown()
@@ -132,6 +157,7 @@ def serve(directory):
         for thread in threads:
             thread.join(timeout=5)
             assert not thread.is_alive(), "Endpoint server did not stop"
+        print_service_log_tails(directory)
 
 
 if __name__ == "__main__":

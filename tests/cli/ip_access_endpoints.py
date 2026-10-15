@@ -129,6 +129,7 @@ def ip_network(test_root):
                             "kill", "-TERM", namespace_pid,
                         ], timeout=10)
                     process.expect(pexpect.EOF, timeout=15)
+                    print(":: endpoint service log tails\n" + process.before)
                 process.close()
                 assert process.exitstatus == 0, process.before
             finally:
