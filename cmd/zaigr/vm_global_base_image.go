@@ -472,6 +472,14 @@ func cleanupGlobalBaseStaging() error {
 		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "build-") {
 			continue
 		}
+		runtimeStore := projectStore{Path: filepath.Join(globalBaseStagingRoot(), entry.Name(), "runtime-store")}
+		if _, err := os.Stat(runtimeStore.Path); err == nil {
+			if err := requireNoActiveVMSupervisorWithin(runtimeStore, "global base staging cleanup", 22*time.Second); err != nil {
+				return err
+			}
+		} else if !os.IsNotExist(err) {
+			return err
+		}
 		if err := os.RemoveAll(filepath.Join(globalBaseStagingRoot(), entry.Name())); err != nil {
 			return fmt.Errorf("remove stale global base image staging %s: %w", entry.Name(), err)
 		}
@@ -503,7 +511,7 @@ func resolveGlobalBuildResources(ramFlag, cpuFlag string) (string, string, error
 	return ram, cpu, nil
 }
 
-func buildAndPublishGlobalBase(previous globalBaseManifest, customized bool, definitions []setupDefinition, applied []appliedSetup, firewall []string, ram, cpu string, userUID int) error {
+func buildAndPublishGlobalBase(previous globalBaseManifest, customized bool, definitions []setupDefinition, applied []appliedSetup, firewall []string, ram, cpu string, userUID int) (returnErr error) {
 	setupFirewall := make(map[string][]string, len(previous.SetupFirewall)+len(definitions))
 	for name, entries := range previous.SetupFirewall {
 		setupFirewall[name] = append([]string(nil), entries...)
@@ -524,7 +532,14 @@ func buildAndPublishGlobalBase(previous globalBaseManifest, customized bool, def
 	if err != nil {
 		return err
 	}
-	defer func() { _ = os.RemoveAll(staging) }()
+	defer func() {
+		runtimeStore := projectStore{Path: filepath.Join(staging, "runtime-store")}
+		if err := requireNoActiveVMSupervisor(runtimeStore, "global base staging cleanup"); err != nil {
+			returnErr = errors.Join(returnErr, err)
+			return
+		}
+		returnErr = errors.Join(returnErr, os.RemoveAll(staging))
+	}()
 	workspace := filepath.Join(staging, "workspace")
 	agentState := filepath.Join(staging, "agent-state")
 	runtimeStore := projectStore{Hash: "global-base-build", Path: filepath.Join(staging, "runtime-store")}
@@ -582,7 +597,7 @@ func buildAndPublishGlobalBase(previous globalBaseManifest, customized bool, def
 	if err != nil {
 		return err
 	}
-	if err := applyStepsViaSSHInContext(working, scripts, ram, cpu, port, true, agentState, workspace, runtimeStore); err != nil {
+	if err := applyStepsViaSSHInContext(working, scripts, ram, cpu, port, true, agentState, workspace, runtimeStore, globalBaseRoot()); err != nil {
 		name := guestSetupExecutionStep(err)
 		if userUID != 0 && name == "base-prepare.script" {
 			return fmt.Errorf("automatic base image preparation failed; global base image was not changed: %w", err)
@@ -595,6 +610,9 @@ func buildAndPublishGlobalBase(previous globalBaseManifest, customized bool, def
 				return fmt.Errorf("failed to run global setup %s: %w", definitions[i].Name, err)
 			}
 		}
+		return err
+	}
+	if err := requireNoActiveVMSupervisor(runtimeStore, "global base image publication"); err != nil {
 		return err
 	}
 	revision := fmt.Sprintf("%d-%s", time.Now().UTC().UnixNano(), contentVersion([]byte(strings.Join(func() []string {

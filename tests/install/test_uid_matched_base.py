@@ -1,12 +1,14 @@
 """UID-only usability parity through the installed public CLI, not ID mapping."""
 
 import json
+import shlex
 import uuid
 from functools import partial
 
+import pexpect
 import pytest
 
-from tests.conftest import err_msg, run
+from tests.conftest import err_msg, run, spawn_interactive
 
 HOME = "/home/uid-host"
 PREPARATION_WARNING = "Preparing the base image for your account automatically"
@@ -148,6 +150,7 @@ def test_uid_matched_base_workspace_state_restart_and_reset(uid_caller):
     run("zaigr project vm exec -- tee /home/user/.zaigr-agent-state/state-canary", cwd=f"{HOME}/new", input="persistent state\n")
     run("zaigr project vm exec -- chmod 0600 /home/user/.zaigr-agent-state/state-canary", cwd=f"{HOME}/new")
     run("zaigr project vm stop", cwd=f"{HOME}/new", timeout=60)
+
     run("zaigr project vm start", cwd=f"{HOME}/new", timeout=180)
     assert run("zaigr project vm exec -- id -u", cwd=f"{HOME}/new").strip() == str(uid)
     assert run("zaigr project vm exec -- cat /home/user/guest-private", cwd=f"{HOME}/new").strip() == "private"
@@ -177,6 +180,130 @@ def test_uid_matched_base_workspace_state_restart_and_reset(uid_caller):
     assert run("zaigr project vm exec -- cat /home/user/.zaigr-agent-state/state-canary", cwd=f"{HOME}/new").strip() == "persistent state"
     assert run(f"stat -c '%u:%g:%a:%s' {HOME}/new/host-private") == before
     run("zaigr project vm stop", cwd=f"{HOME}/new", timeout=60)
+
+
+@pytest.mark.timeout(300)
+def test_root_caller_uses_factory_guest_identity_for_both_shares(container_factory, uid_dependencies_image):
+    container = container_factory(uid_dependencies_image, standalone=True)
+    checked(container, "install -m 0755 /dist/zaigr /usr/local/bin/zaigr")
+    env = {"HOME": "/tmp/zaigr-home", "ZAIGR_VM_RAM": "512", "ZAIGR_VM_CPU": "1", "ZAIGR_DISK_SIZE": "8G"}
+    run = partial(checked, container, env=env, cwd="/tmp/zaigr-project")
+    run("zaigr project vm start --ram 512 --cpu 1", input="y\n", timeout=180)
+    assert run("zaigr project vm exec -- id -u").strip() == "1000"
+    assert run("zaigr project vm exec -- id -g").strip() == "1001"
+    assert run("zaigr project vm exec -- findmnt -n -o FSTYPE /home/user/workspace").strip() == "virtiofs"
+    assert run("zaigr project vm exec -- findmnt -n -o FSTYPE /home/user/.zaigr-agent-state").strip() == "virtiofs"
+    run("zaigr project vm exec -- touch /home/user/workspace/root-caller-user")
+    run("zaigr project vm exec -- chmod 600 /home/user/workspace/root-caller-user")
+    run("zaigr project vm exec --root -- touch /home/user/.zaigr-agent-state/root-caller-root", input="y\n")
+    run("zaigr project vm exec --root -- chmod 600 /home/user/.zaigr-agent-state/root-caller-root", input="y\n")
+    assert run("stat -c '%u:%g:%a' /tmp/zaigr-project/root-caller-user").strip() == "0:0:600"
+    assert run("find /tmp/zaigr-home/.zaigr -name root-caller-root -exec stat -c '%u:%g:%a' {} \\;").strip() == "0:0:600"
+    run("zaigr project vm stop")
+
+
+@pytest.mark.timeout(600)
+def test_restricted_namespace_requires_consent_and_remembers_project_choice(container_factory, uid_dependencies_image):
+    """A real namespace denial cancels by default; explicit consent survives starts and rebuilds."""
+    container = container_factory(uid_dependencies_image, standalone=True, namespace_capable=False)
+    checked(container, "install -m 0755 /dist/zaigr /usr/local/bin/zaigr")
+    checked(container, "useradd --uid 2000 --create-home --user-group sandbox-user")
+    checked(container, "chown 2000:2000 /tmp/zaigr-home /tmp/zaigr-project")
+    env = {"HOME": "/tmp/zaigr-home", "ZAIGR_VM_RAM": "512", "ZAIGR_VM_CPU": "1", "ZAIGR_DISK_SIZE": "8G"}
+    user = partial(checked, container, user="2000:2000", env=env, cwd="/tmp/zaigr-project")
+    stdout, stderr, rc = container.run("zaigr misc check", env=env, user="2000:2000", timeout=30)
+    assert rc == 1, err_msg(stdout, stderr)
+    assert stdout.startswith("Host: Debian GNU/Linux ")
+    assert "Diagnosis: likely container restrictions" in stdout
+    assert "Kernel audit:" in stdout
+    assert "Daemon output:" in stdout
+    assert "Container setup" in stdout
+    assert "apparmor-profile >" not in stdout
+    assert checked(container, "find /tmp/zaigr-home/.zaigr -name '*.qcow2'").strip() == ""
+
+    # Viewing info and then reaching EOF must never authorize unsafe mode.
+    stdout, stderr, rc = container.run(
+        "zaigr project vm start --ram 512 --cpu 1", user="2000:2000",
+        cwd="/tmp/zaigr-project", env=env, input="y\ninfo\n", timeout=180,
+    )
+    assert rc != 0, err_msg(stdout, stderr)
+    assert "[cancel/info/unsafe] (default: cancel)" in stderr
+    assert "compromise your host user account" in stderr
+    assert "no unsafe preference was saved" in stderr
+    assert "Full diagnostics: zaigr misc check" in stderr
+    assert "Diagnosis:" not in stderr
+    assert "Daemon output:" not in stderr
+    assert checked(container, "find /tmp/zaigr-home/.zaigr -name vm-supervisor.json").strip() == ""
+
+    start = spawn_interactive(shlex.join([
+        "podman", "exec", "-it", "--user", "2000:2000", "--workdir", "/tmp/zaigr-project",
+        *[arg for key, value in env.items() for arg in ("--env", f"{key}={value}")],
+        container.name, "zaigr", "project", "vm", "start", "--ram", "512", "--cpu", "1",
+    ]), timeout=300)
+    try:
+        start.expect_exact("Initialize project and continue? [y/N]")
+        start.sendline("y")
+        start.expect_exact("[cancel/info/unsafe] (default: cancel):")
+        assert "compromise your host user account" in start.before
+        assert "Daemon output:" not in start.before
+        assert "zaigr misc check" not in start.before
+        assert "Continue without file-sharing isolation" not in start.before
+        start.sendline("info")
+        start.expect_exact("Container setup")
+        assert "Diagnosis:" not in start.before
+        assert "Daemon output:" not in start.before
+        start.expect_exact("Full diagnostics: zaigr misc check")
+        start.expect_exact("Your choice [cancel/info/unsafe] (default: cancel):")
+        start.sendline("unsafe")
+        start.expect_exact("Saved for this project: file-sharing sandbox disabled.")
+        start.expect(pexpect.EOF)
+        start.close()
+        assert start.exitstatus == 0, start.transcript.tail(4000)
+    finally:
+        if start.isalive():
+            start.terminate(force=True)
+    assert "virtiofs-sandbox=none" in user("zaigr project vm show-config")
+    assert user("zaigr project vm exec -- id -u").strip() == "2000"
+    user("zaigr project vm exec -- tee /home/user/workspace/shared-canary", input="preserved\n")
+    assert user("cat shared-canary") == "preserved\n"
+    user("zaigr project vm stop")
+
+    stdout, stderr, rc = container.run(
+        "zaigr project vm start", user="2000:2000", cwd="/tmp/zaigr-project", env=env, timeout=180,
+    )
+    assert rc == 0, err_msg(stdout, stderr)
+    assert "WARNING: Without the file-sharing sandbox" in stderr
+    assert "[cancel/info/unsafe]" not in stderr
+    user("zaigr project vm stop")
+    user("mkdir -p /tmp/zaigr-home/.zaigr/setups/sandbox-marker")
+    user("tee /tmp/zaigr-home/.zaigr/setups/sandbox-marker/setup.script",
+         input="#!/bin/sh\nset -eu\nprintf rebuilt > /opt/sandbox-marker\n")
+    # An unrelated global image operation must not inherit the cwd project's opt-out.
+    stdout, stderr, rc = container.run(
+        "zaigr global base-image setup run sandbox-marker --ram 512", user="2000:2000",
+        cwd="/tmp/zaigr-project", env=env, input="cancel\n", timeout=60,
+    )
+    assert rc != 0, err_msg(stdout, stderr)
+    assert "This is a global image operation. Your choice applies only to this" in stderr
+    assert "[cancel/info/unsafe]" in stderr
+    assert "virtiofs-sandbox=none" in user("zaigr project vm show-config")
+    user("zaigr project setup run sandbox-marker", timeout=300)
+    user("tee /tmp/zaigr-home/.zaigr/setups/sandbox-marker/setup.script",
+         input="#!/bin/sh\nset -eu\nprintf rebuilt-again > /opt/sandbox-marker\n")
+    user("zaigr project rebuild", timeout=300)
+    assert "virtiofs-sandbox=none" in user("zaigr project vm show-config")
+    user("zaigr project vm start", timeout=180)
+    assert user("zaigr project vm exec -- cat /opt/sandbox-marker").strip() == "rebuilt-again"
+    assert user("cat shared-canary") == "preserved\n"
+    user("zaigr project vm stop")
+    user("zaigr project vm set-config --virtiofs-sandbox namespace")
+    stdout, stderr, rc = container.run(
+        "zaigr project vm start", user="2000:2000", cwd="/tmp/zaigr-project", env=env,
+        input="cancel\n", timeout=30,
+    )
+    assert rc != 0, err_msg(stdout, stderr)
+    assert "[cancel/info/unsafe]" in stderr
+    assert "virtiofs-sandbox=namespace" in user("zaigr project vm show-config")
 
 
 @pytest.mark.parametrize("uid_caller", [(1001, 1001)], indirect=True)

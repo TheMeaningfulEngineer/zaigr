@@ -30,6 +30,65 @@ or Ubuntu:
 sudo apt install coreutils e2fsprogs openssh-client qemu-system-x86 qemu-utils
 ```
 
+The bundled static virtiofs daemon serves the workspace and agent-state mounts.
+By default, each file server uses a namespace sandbox. This requires permission
+to create user, mount, PID and network namespaces and configure sandbox mounts.
+Run `zaigr misc check` as the account that will
+run zaigr. It checks host tools and QEMU virtiofs support, and starts the bundled
+daemon against an empty temporary export to verify sandbox readiness. It does
+not boot a VM or modify a project; it may populate the normal daemon cache.
+It detects the host distribution and kernel. On failure it diagnoses known
+namespace restrictions, including Ubuntu's AppArmor policy and container
+restrictions, and reports the required host change. It automatically reads
+available kernel logs and correlates denials with the probe's processes.
+Confirmed audit findings are distinguished from likely causes inferred from
+host settings and the failure. If kernel logs are inaccessible, it reports that
+limit and still gives the available diagnosis. A successful check covers the temporary
+export; individual project paths can still have different access restrictions.
+If the host cannot start the sandbox, project startup or rebuild explains the
+risk of proceeding without isolation and offers `cancel`, `info`, or `unsafe`.
+Choosing `info` displays concise host-specific setup instructions, then returns
+to the prompt without changing the setting. Full diagnostics and policy details
+are available through `zaigr misc check`. The prompt defaults to cancel;
+only entering `unsafe` selects and saves `virtiofs-sandbox=none` for that
+project. EOF, an empty answer or any unrecognized answer cancels.
+Subsequent starts and rebuilds use the saved choice and print
+a warning when namespace isolation is disabled. The choice survives project
+clean and rebuild and does not change other projects. Global image operations
+without a project ask for consent for that operation only.
+
+Without the namespace sandbox, an exploit in the file server could compromise
+the invoking host user account: read or change files outside the shares, steal
+credentials, or run commands as that user. The Rust daemon benefits from
+memory-safety protections, but logic flaws such as path-resolution errors,
+race conditions, or protocol confusion can still matter. The sandbox adds
+containment; it does not guarantee protection against every escape. Guest
+access to the selected shares is intentional in either mode. Other daemon
+protections, including its default seccomp filter, remain enabled.
+
+Inspect or change the preference on an initialized, stopped project:
+
+```sh
+zaigr project vm show-config
+zaigr project vm set-config --virtiofs-sandbox namespace
+# Explicitly accept the risk for this project instead:
+zaigr project vm set-config --virtiofs-sandbox none
+```
+
+On Ubuntu with AppArmor user-namespace restrictions, `misc check` prints commands
+to generate, review and load a daemon-specific exception using
+`zaigr misc apparmor-profile`. This does not disable the global restriction or
+install a service. The generated policy applies to the daemon's cached executable
+path, which is user-writable: other code running as your account could replace
+that executable and obtain the same exception. Regenerate the profile after a
+daemon upgrade. The check always tests namespace sandbox availability, even when
+the current project has opted out. Debian and other hosts are probed in the same
+way; zaigr does not assume a distribution is exempt from host restrictions.
+
+If startup fails, inspect the project's
+`vm-supervisor.log`, `virtiofsd-workspace.log`, and
+`virtiofsd-agent-state.log` under `~/.zaigr/store/<project-id>/`.
+
 Your account also needs read/write access to `/dev/kvm`, usually through the
 `kvm` group. Installing dependencies or setting up KVM access may require an
 administrator; installing and running zaigr itself does not require sudo.
@@ -50,7 +109,8 @@ After either installation method, check your host:
 zaigr misc check
 ```
 
-The check reports whether KVM access, QEMU, and free disk space are ready.
+The check reports whether KVM access, QEMU virtiofs support, host tools, the
+virtiofs sandbox, and free disk space are ready.
 
 ## Examples to get you started
 
@@ -401,6 +461,29 @@ zaigr global projects kill my-project
 ```
 
 Replace `my-project` with the name or ID you chose.
+
+## Building from source
+
+`make build` builds the guest kernel and root filesystem, compiles virtiofsd
+1.13.2 as a static musl executable, then embeds all three artifacts in the Go
+binary. It needs Go 1.24, Rust 1.82.0 with the `x86_64-unknown-linux-musl` target installed,
+`x86_64-linux-musl-gcc`, `gperf`, `pkg-config`, `make`, `binutils`, `git`,
+`curl`, `tar`, and Linux headers. The daemon build script downloads pinned
+libcap-ng 0.8.5 and libseccomp 2.6.0 sources and builds their static musl
+libraries; host development copies of those libraries are not used. The
+kernel build additionally needs GCC, flex, bison, and bc. The rootfs build
+needs mmdebstrap, fakeroot, zstd, openssl, and e2fsprogs. See
+[`vm_prep/build-virtiofsd.sh`](vm_prep/build-virtiofsd.sh) for exact source
+revisions, checksums, and validation.
+
+The virtiofs integrity acceptance test additionally needs host `gcc`,
+`libsqlite3-dev` (headers and static archive), and Python test dependencies.
+
+An older project image may require `zaigr project rebuild` after upgrading
+the bundled guest runtime. A customized global base image may require
+`zaigr global base-image reset` and reapplying its setups. The CLI reports
+the appropriate action when it finds a runtime mismatch. Host workspace
+and agent-state files remain in their existing directories.
 
 ## More help
 

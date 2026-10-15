@@ -61,7 +61,9 @@ def test_install_standalone_as_regular_user_and_run_vm(container_factory, image)
     expected_digest = hashlib.sha256(container.dist_artifact.read_bytes()).hexdigest()
     assert user('sha256sum "$HOME/.local/bin/zaigr"').split()[0] == expected_digest
     user("test ! -e /usr/bin/zaigr")
-    user("zaigr misc check", timeout=30)
+    host_check = user("zaigr misc check", timeout=30)
+    assert host_check.startswith("Host: Ubuntu " if "ubuntu:" in image else "Host: Debian GNU/Linux ")
+    assert "5/5 checks passed" in host_check
 
     user("printf 'standalone installation works\\n' > installation-input.txt")
     user("zaigr project vm start", input="y\n", timeout=180)

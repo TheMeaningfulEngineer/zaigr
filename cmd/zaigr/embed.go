@@ -15,6 +15,12 @@ var embeddedRootfs []byte
 //go:embed vm_data/base-rootfs.version
 var embeddedRootfsVersion string
 
+//go:embed vm_data/virtiofsd
+var embeddedVirtiofsd []byte
+
+//go:embed vm_data/virtiofsd.version
+var embeddedVirtiofsdVersion string
+
 // embeddedVersion extracts a version string from embedded binary data
 // by searching for a prefix and returning the following 7 characters.
 func embeddedVersion(data []byte, prefix string) string {

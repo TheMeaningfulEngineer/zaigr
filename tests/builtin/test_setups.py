@@ -447,13 +447,13 @@ kas shell /tmp/kas-smoke.yml -c 'bitbake zlib-native -n'
     output = run(f"{vm} podman run --rm zaigr-podman-build-test", timeout=600)
     assert output == message
 
-    # Kernel/mmdebstrap image-building tools
+    # zaigr-dev (kernel/mmdebstrap tools + release orchestration + virtiofsd build toolchain)
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
 
     run(
-        f"{zaigr} project setup run kernel-mmdebstrap",
-        timeout=1200,
+        f"{zaigr} project setup run zaigr-dev",
+        timeout=1800,
     )
     output = run(
         [
@@ -644,18 +644,11 @@ kubectl delete pod net-test --wait=true
         timeout=1800,
     )
 
-    # Release tools
+    # Release orchestration tools and rootless container stack
+    # (installed earlier via zaigr-dev; this block verifies them.)
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
-    raw = partial(_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
 
-    stdout, stderr, rc = raw(
-        f"{zaigr} project setup run release-tools",
-        timeout=1200,
-    )
-    assert rc == 0, err_msg(stdout, stderr)
-    assert ":: Setup installation has full network access" not in stdout
-    assert ":: Setup installation has full network access" not in stderr
     status = run(
         f"{zaigr} project status",
         timeout=10,
@@ -867,13 +860,12 @@ done
         "docker",
         "go",
         "k3s",
-        "kernel-mmdebstrap",
         "mistral",
         "nodejs",
         "podman",
         "python",
-        "release-tools",
         "yocto-kas",
+        "zaigr-dev",
     ]:
         assert setup in output
 

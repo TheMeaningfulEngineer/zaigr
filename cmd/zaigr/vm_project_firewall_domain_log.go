@@ -22,7 +22,9 @@ func cmdProjectFirewallDomainLog() error {
 
 	running, stale := detectRunningProjectVM()
 	if stale {
-		_ = store.clearRuntimeState()
+		if err := store.clearRuntimeState(); err != nil {
+			return err
+		}
 		return fmt.Errorf("project VM is not running; start it with 'zaigr project vm start' or 'zaigr shell'")
 	}
 	if running == nil || running.Port == "" {

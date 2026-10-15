@@ -10,10 +10,10 @@ PYTEST_OVERLAP_WORKERS ?= 4
 PYTEST_BUILTIN_WORKERS ?= 2
 TEST_BINARY = $(if $(strip $(ZAIGR_TEST_BINARY)),$(abspath $(ZAIGR_TEST_BINARY)),$(CURDIR)/zaigr)
 
-.PHONY: build lint lint-golang lint-python test-all test-prepare test-cli test-cli-install test-builtin test-versioning test-install test-release test-logged clean base-rootfs base-kernel clean-kernel
+.PHONY: build lint lint-golang lint-python test-all test-prepare test-cli test-cli-install test-builtin test-versioning test-install test-release test-logged clean base-rootfs base-kernel base-virtiofsd clean-kernel
 
 # Build the base image, then compile the Go binary
-build: base-kernel base-rootfs
+build: base-kernel base-rootfs base-virtiofsd
 	go build -ldflags "$(LDFLAGS)" -o zaigr ./cmd/zaigr
 
 # Build the base image rootfs (skips if up to date)
@@ -23,6 +23,9 @@ base-rootfs:
 # Build the base image kernel (skips if up to date)
 base-kernel:
 	vm_prep/build-kernel.sh
+
+base-virtiofsd:
+	vm_prep/build-virtiofsd.sh
 
 lint: lint-golang lint-python
 
@@ -83,3 +86,4 @@ clean:
 	rm -rf release/dist release/RELEASE_NOTES.md
 	rm -f cmd/zaigr/vm_data/base-rootfs.img.zst
 	rm -f cmd/zaigr/vm_data/bzImage
+	rm -f cmd/zaigr/vm_data/virtiofsd

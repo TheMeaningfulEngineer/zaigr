@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -189,6 +191,13 @@ func detectRunningProjectVM() (*runningVMInfo, bool) {
 
 func detectRunningProjectVMInStore(store projectStore) (*runningVMInfo, bool) {
 	sockPath := store.monitorSockPath()
+	if record, err := readVMSupervisorRecord(store); err == nil {
+		if !vmProcessIsLive(record.Supervisor) || !vmProcessIsLive(record.QEMU) {
+			return nil, true
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, true
+	}
 	logDebug("probing project VM monitor socket", "sock", sockPath)
 	conn, err := net.DialTimeout("unix", sockPath, time.Second)
 	if err == nil {
@@ -283,7 +292,9 @@ func prepareProjectForVMStart(ram string, cpu string) (*runningVMInfo, error) {
 	running, stale := detectRunningProjectVM()
 	if stale {
 		store := currentProjectStore()
-		_ = store.clearRuntimeState()
+		if err := store.clearRuntimeState(); err != nil {
+			return nil, err
+		}
 		logWarn("removed stale project VM monitor marker", "runtime_dir", store.runtimeDir())
 		running = nil
 	}
@@ -306,7 +317,7 @@ func prepareProjectForVMStart(ram string, cpu string) (*runningVMInfo, error) {
 	return nil, nil
 }
 
-func startPreparedProjectVM(ram string, cpu string) (string, error) {
+func startPreparedProjectVM(ram string, cpu string) (port string, returnErr error) {
 	store := currentProjectStore()
 	hostLock := &projectMutationLock{}
 	defer hostLock.releaseWithWarning()
@@ -328,21 +339,36 @@ func startPreparedProjectVM(ram string, cpu string) (string, error) {
 		return "", err
 	}
 	logInfo("starting prepared project VM", "ram", ramValue, "cpu", cpuValue)
-	imagePort, err := bootProjectVM(ramValue, cpuValue, grants)
+	imagePort, launch, err := bootProjectVM(ramValue, cpuValue, grants)
 	if err != nil {
 		return "", err
 	}
-	logDebug("waiting for project VM SSH readiness", "port", imagePort, "timeout_sec", 90)
-	if !waitForSSH(imagePort, 90) {
-		return "", fmt.Errorf("VM did not become reachable via SSH within 90s")
+	committed := false
+	defer func() {
+		if !committed {
+			returnErr = errors.Join(returnErr, launch.cancel())
+		}
+	}()
+	logDebug("waiting for project VM guest readiness", "port", imagePort, "timeout_sec", 90)
+	if err := waitForVMGuestReady(launch, 90*time.Second); err != nil {
+		return "", err
 	}
+	startupCtx, cancelStartup := launch.precommitContext()
+	defer cancelStartup()
 	logInfo("project VM is reachable over SSH", "port", imagePort)
-	if err := ensureUserSSHAccess(imagePort); err != nil {
+	if err := ensureUserSSHAccessContext(startupCtx, imagePort); err != nil {
 		return "", err
 	}
-	if err := syncAppliedSetupFirewallToVM(imagePort); err != nil {
+	if err := syncAppliedSetupFirewallToVMContext(startupCtx, imagePort); err != nil {
 		return "", err
 	}
+	if err := startupCtx.Err(); err != nil {
+		return "", fmt.Errorf("VM precommit startup deadline or supervisor exit: %w", err)
+	}
+	if err := launch.commit(); err != nil {
+		return "", err
+	}
+	committed = true
 	if projectImagePathOverrideForNextBoot == "" {
 		if err := activateHostAccess(store, imagePort, grants, hostLock); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: VM started, but saved host-access activation is incomplete: %v; inspect with 'zaigr project host-access show'\n", err)
@@ -385,7 +411,9 @@ func cmdVMShell(ram string, cpu string, preset string, setups []string, root boo
 	}
 	running, stale := detectRunningProjectVM()
 	if stale {
-		_ = currentProjectStore().clearRuntimeState()
+		if err := currentProjectStore().clearRuntimeState(); err != nil {
+			return err
+		}
 		running = nil
 	}
 
@@ -577,20 +605,20 @@ func syncPresetSelection(presetDef *presetDefinition) error {
 	return currentProjectStore().writePresetSelection(presetDef.Name, presetDef.Version)
 }
 
-func bootProjectVM(ram string, cpu string, grants hostAccessGrants) (string, error) {
+func bootProjectVM(ram string, cpu string, grants hostAccessGrants) (string, *vmLaunchHandle, error) {
 	store := currentProjectStore()
 	logDebug("booting project VM", "store", store.Path, "ram", ram, "cpu", cpu)
 	if err := requireKVMAccess(); err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	kernelPath, err := ensureKernel(false)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	if err := os.MkdirAll(store.Path, 0755); err != nil {
-		return "", fmt.Errorf("create store dir: %w", err)
+		return "", nil, fmt.Errorf("create store dir: %w", err)
 	}
 
 	disk := store.disk()
@@ -598,7 +626,7 @@ func bootProjectVM(ram string, cpu string, grants hostAccessGrants) (string, err
 		disk = defaultDiskSize
 	}
 	if err := os.WriteFile(store.configPath(), []byte(fmt.Sprintf("disk=%s\n", disk)), 0644); err != nil {
-		return "", fmt.Errorf("store default disk: %w", err)
+		return "", nil, fmt.Errorf("store default disk: %w", err)
 	}
 
 	imgPath := store.authoritativeImagePath()
@@ -607,18 +635,18 @@ func bootProjectVM(ram string, cpu string, grants hostAccessGrants) (string, err
 			logInfo("using project image override for VM boot", "expected", imgPath, "image", projectImagePathOverrideForNextBoot)
 			imgPath = projectImagePathOverrideForNextBoot
 		} else if !os.IsNotExist(overrideErr) {
-			return "", fmt.Errorf("stat project image override: %w", overrideErr)
+			return "", nil, fmt.Errorf("stat project image override: %w", overrideErr)
 		}
 	}
 	if _, err := os.Stat(imgPath); err != nil {
-		return "", fmt.Errorf("project image cannot be found: %s", filepath.Base(imgPath))
+		return "", nil, fmt.Errorf("project image cannot be found: %s", filepath.Base(imgPath))
 	}
 
 	sshPort := ""
 	for attempt := 0; attempt < 32; attempt++ {
 		ln, err := net.Listen("tcp4", "127.0.0.1:0")
 		if err != nil {
-			return "", fmt.Errorf("allocate SSH port: %w", err)
+			return "", nil, fmt.Errorf("allocate SSH port: %w", err)
 		}
 		port := ln.Addr().(*net.TCPAddr).Port
 		_ = ln.Close()
@@ -628,38 +656,44 @@ func bootProjectVM(ram string, cpu string, grants hostAccessGrants) (string, err
 		}
 	}
 	if sshPort == "" {
-		return "", fmt.Errorf("cannot allocate management port outside saved host-access ports")
+		return "", nil, fmt.Errorf("cannot allocate management port outside saved host-access ports")
 	}
 	logDebug("project VM SSH port is available", "port", sshPort)
-	if err := store.clearRuntimeState(); err != nil {
-		return "", err
-	}
-	if err := store.ensureRuntimeDir(); err != nil {
-		return "", fmt.Errorf("create runtime dir: %w", err)
-	}
 	if err := store.ensureAgentStateDir(); err != nil {
-		return "", err
-	}
-	if err := os.WriteFile(store.sshPortPath(), []byte(sshPort), 0644); err != nil {
-		return "", fmt.Errorf("store runtime ssh port: %w", err)
+		return "", nil, err
 	}
 
 	_, rootPubKey, err := ensureRootSSHKey()
 	if err != nil {
-		return "", fmt.Errorf("ensure root SSH key: %w", err)
+		return "", nil, fmt.Errorf("ensure root SSH key: %w", err)
 	}
 	userKeyPath, userPubKey, err := ensureUserSSHKey()
 	if err != nil {
-		return "", fmt.Errorf("ensure user SSH key: %w", err)
+		return "", nil, fmt.Errorf("ensure user SSH key: %w", err)
 	}
 
 	qemuPath, err := exec.LookPath("qemu-system-x86_64")
 	if err != nil {
-		return "", fmt.Errorf("qemu not found: %w", err)
+		return "", nil, fmt.Errorf("qemu not found: %w", err)
+	}
+	virtiofsdPath, err := ensureVirtiofsdWithWriter(false, io.Discard)
+	if err != nil {
+		return "", nil, fmt.Errorf("extract virtiofsd: %w", err)
+	}
+	workspace, err := os.Getwd()
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve workspace export: %w", err)
+	}
+	launchID, err := newVMLaunchID()
+	if err != nil {
+		return "", nil, err
 	}
 
 	format := "qcow2"
-	args := buildQEMUArgs(imgPath, kernelPath, format, false, ram, cpu, sshPort, rootPubKey, userPubKey, store.hostname(), store.monitorSockPath())
+	socketDir := vmSocketDir(launchID)
+	workspaceSock := filepath.Join(socketDir, "workspace.sock")
+	agentStateSock := filepath.Join(socketDir, "agent-state.sock")
+	args := buildQEMUArgsWithContext(imgPath, kernelPath, format, false, ram, cpu, sshPort, rootPubKey, userPubKey, store.hostname(), store.monitorSockPath(), store.agentStateDir(), workspace, store.serialLogPath(), workspaceSock, agentStateSock)
 	args = append(args, hostAccessQEMUDevices(grants)...)
 	diskSize := store.disk()
 
@@ -668,30 +702,33 @@ func bootProjectVM(ram string, cpu string, grants hostAccessGrants) (string, err
 	fmt.Printf(":: SSH: ssh -i %s -p %s user@localhost\n", userKeyPath, sshPort)
 	logInfo("starting qemu", "kernel", kernelPath, "image", imgPath, "port", sshPort, "monitor_sock", store.monitorSockPath())
 
-	serialLog, err := os.OpenFile(store.serialLogPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	guestUID, guestGID, err := readGuestIdentityFromImage(imgPath)
 	if err != nil {
-		return "", fmt.Errorf("open VM serial log: %w", err)
+		return "", nil, err
 	}
-	defer func() { _ = serialLog.Close() }()
-
-	devNull, err := os.Open(os.DevNull)
+	spec := vmLaunchSpec{
+		Store: store.Path, LogRoot: store.Path, RuntimeDir: store.runtimeDir(),
+		MonitorSock: store.monitorSockPath(),
+		// Virtiofs sockets bind in a short /tmp dir to stay under the kernel's
+		// 108-byte sun_path limit regardless of how deep the store runtime
+		// path is. The store runtime dir carries symlinks pointing at them so
+		// `ls -la <store>/runtime/` keeps showing both sockets for debugging.
+		WorkspaceSock:       workspaceSock,
+		AgentStateSock:      agentStateSock,
+		WorkspaceSockAlias:  store.workspaceVirtiofsSockPath(),
+		AgentStateSockAlias: store.agentStateVirtiofsSockPath(),
+		SocketDir:           socketDir,
+		Workspace:           workspace,
+		AgentState:          store.agentStateDir(), Virtiofsd: virtiofsdPath,
+		SerialLog: store.serialLogPath(), SSHPort: sshPort, Mode: "detached",
+		LaunchID: launchID, GuestUID: guestUID, GuestGID: guestGID,
+		QEMUPath: qemuPath, QEMUArgs: args[1:],
+	}
+	launch, err := launchSupervisedVM(spec)
 	if err != nil {
-		return "", fmt.Errorf("open %s: %w", os.DevNull, err)
+		return "", nil, err
 	}
-	defer func() { _ = devNull.Close() }()
-
-	cmd := exec.Command(qemuPath, args[1:]...)
-	cmd.Stdin = devNull
-	cmd.Stdout = serialLog
-	cmd.Stderr = serialLog
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
-		_ = store.clearRuntimeState()
-		return "", fmt.Errorf("start qemu: %w", err)
-	}
-	logInfo("qemu started", "pid", cmd.Process.Pid, "port", sshPort)
-
-	return sshPort, nil
+	return sshPort, launch, nil
 }
 
 // execProjectSSH connects to the running VM over SSH.
@@ -770,29 +807,7 @@ func projectSSHArgs(port string, root bool) ([]string, error) {
 	return args, nil
 }
 
-func buildQEMUArgs(imagePath, kernelPath, format string, snapshot bool, ram string, cpus string, sshPort string, rootPubKey string, userPubKey string, vmHostname string, monitorSock string) []string {
-	return buildQEMUArgsWithAgentState(
-		imagePath,
-		kernelPath,
-		format,
-		snapshot,
-		ram,
-		cpus,
-		sshPort,
-		rootPubKey,
-		userPubKey,
-		vmHostname,
-		monitorSock,
-		currentProjectStore().agentStateDir(),
-	)
-}
-
-func buildQEMUArgsWithAgentState(imagePath, kernelPath, format string, snapshot bool, ram string, cpus string, sshPort string, rootPubKey string, userPubKey string, vmHostname string, monitorSock string, agentStateDir string) []string {
-	workspace, _ := os.Getwd()
-	return buildQEMUArgsWithContext(imagePath, kernelPath, format, snapshot, ram, cpus, sshPort, rootPubKey, userPubKey, vmHostname, monitorSock, agentStateDir, workspace, currentProjectStore().serialLogPath())
-}
-
-func buildQEMUArgsWithContext(imagePath, kernelPath, format string, snapshot bool, ram string, cpus string, sshPort string, rootPubKey string, userPubKey string, vmHostname string, monitorSock string, agentStateDir string, workspace string, serialLog string) []string {
+func buildQEMUArgsWithContext(imagePath, kernelPath, format string, snapshot bool, ram string, cpus string, sshPort string, rootPubKey string, userPubKey string, vmHostname string, monitorSock string, agentStateDir string, workspace string, serialLog string, workspaceSock string, agentStateSock string) []string {
 	hostLaunchEpoch := time.Now().Unix()
 	appendParts := []string{
 		"console=ttyS0",
@@ -825,15 +840,17 @@ func buildQEMUArgsWithContext(imagePath, kernelPath, format string, snapshot boo
 		"-nographic",
 		"-no-reboot",
 		"-m", ram,
+		"-object", fmt.Sprintf("memory-backend-memfd,id=mem,size=%sM,share=on", ram),
+		"-machine", "memory-backend=mem",
 		"-smp", cpus,
 		"-serial", "file:" + serialLog,
 		"-kernel", kernelPath,
-		"-drive", fmt.Sprintf("id=root,file=%s,format=%s,if=none", imagePath, format),
+		"-drive", fmt.Sprintf("id=root,file=%s,format=%s,if=none", qemuOptionPath(imagePath), format),
 		"-device", "virtio-blk-device,drive=root",
-		"-fsdev", fmt.Sprintf("local,id=workspace_dev,path=%s,security_model=none", workspace),
-		"-device", "virtio-9p-device,fsdev=workspace_dev,mount_tag=workspace",
-		"-fsdev", fmt.Sprintf("local,id=agent_state_dev,path=%s,security_model=none", agentStateDir),
-		"-device", "virtio-9p-device,fsdev=agent_state_dev,mount_tag=zaigr_agent_state",
+		"-chardev", fmt.Sprintf("socket,id=workspace_fs,path=%s,server=off", qemuOptionPath(workspaceSock)),
+		"-device", "vhost-user-fs-device,chardev=workspace_fs,tag=workspace",
+		"-chardev", fmt.Sprintf("socket,id=agent_state_fs,path=%s,server=off", qemuOptionPath(agentStateSock)),
+		"-device", "vhost-user-fs-device,chardev=agent_state_fs,tag=zaigr_agent_state",
 		"-append", strings.Join(appendParts, " "),
 		"-netdev", fmt.Sprintf("user,id=net0,ipv6=off,hostfwd=tcp::%s-:22", sshPort),
 		"-device", "virtio-net-device,netdev=net0",
@@ -843,6 +860,8 @@ func buildQEMUArgsWithContext(imagePath, kernelPath, format string, snapshot boo
 		args = append(args, "-snapshot")
 	}
 	args = append(args, "-accel", "kvm", "-cpu", "host")
-	args = append(args, "-qmp", "unix:"+monitorSock+",server,nowait")
+	args = append(args, "-qmp", "unix:"+qemuOptionPath(monitorSock)+",server,nowait")
 	return args
 }
+
+func qemuOptionPath(path string) string { return strings.ReplaceAll(path, ",", ",,") }

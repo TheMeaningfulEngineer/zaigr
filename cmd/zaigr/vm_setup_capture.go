@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -75,7 +76,9 @@ func startNewSetupCapture(store projectStore, confirmRunningVM bool) error {
 
 	running, stale := detectRunningProjectVM()
 	if stale {
-		_ = store.clearRuntimeState()
+		if err := store.clearRuntimeState(); err != nil {
+			return err
+		}
 		running = nil
 	}
 	if running != nil {
@@ -94,8 +97,15 @@ func startNewSetupCapture(store projectStore, confirmRunningVM bool) error {
 	}
 
 	overlayPath := store.setupCaptureOverlayPath()
-	_ = os.Remove(overlayPath)
-	_ = store.clearSetupCaptureObservedEndpoints()
+	if err := requireNoActiveVMSupervisor(store, "setup capture overlay creation"); err != nil {
+		return err
+	}
+	if err := os.Remove(overlayPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := store.clearSetupCaptureObservedEndpoints(); err != nil {
+		return err
+	}
 	if err := store.prepareSetupCaptureCommands(); err != nil {
 		return err
 	}
@@ -120,8 +130,15 @@ func startNewSetupCapture(store projectStore, confirmRunningVM bool) error {
 
 	port, err := startPreparedProjectVM("", "")
 	if err != nil {
-		_ = store.clearSetupCaptureMetadata()
-		_ = os.Remove(overlayPath)
+		if guardErr := requireNoActiveVMSupervisor(store, "failed setup capture cleanup"); guardErr != nil {
+			return errors.Join(err, guardErr)
+		}
+		if cleanupErr := store.clearSetupCaptureMetadata(); cleanupErr != nil {
+			return errors.Join(err, cleanupErr)
+		}
+		if cleanupErr := os.Remove(overlayPath); cleanupErr != nil && !os.IsNotExist(cleanupErr) {
+			return errors.Join(err, cleanupErr)
+		}
 		return err
 	}
 
@@ -262,7 +279,7 @@ func cmdProjectSetupCaptureReview() error {
 		return err
 	}
 	if running, stale := detectRunningProjectVMWithMetadataInStore(store); stale {
-		_ = store.clearRuntimeState()
+		// Review only reports state; recovery belongs to a mutating command.
 	} else if running != nil {
 		if hasOverlay && running.ImagePath != "" && running.ImagePath != meta.OverlayImagePath {
 			fmt.Fprintf(os.Stderr, ":: Active project VM is not using capture overlay: %s\n", running.ImagePath)
@@ -349,7 +366,9 @@ func cmdProjectSetupCaptureAccept() error {
 	}
 	running, stale := detectRunningProjectVMWithMetadataInStore(store)
 	if stale {
-		_ = store.clearRuntimeState()
+		if err := store.clearRuntimeState(); err != nil {
+			return err
+		}
 	}
 	if hasOverlay && running != nil && running.ImagePath != "" && running.ImagePath != meta.OverlayImagePath {
 		return fmt.Errorf("active project VM is not running the capture overlay (%s); stop or restart the capture shell first", filepath.Base(meta.OverlayImagePath))
@@ -363,7 +382,9 @@ func cmdProjectSetupCaptureAccept() error {
 		}
 	}
 	meta.ObservedFirewall = observed
-	_ = store.writeSetupCaptureMetadata(meta)
+	if err := store.writeSetupCaptureMetadata(meta); err != nil {
+		return err
+	}
 
 	script := buildCaptureSetupScript(meta.Name, observed, commands, meta.StartedAt)
 	if err := writeSetupCaptureSetup(meta.Name, script, observed); err != nil {
@@ -372,6 +393,9 @@ func cmdProjectSetupCaptureAccept() error {
 
 	var promotedImagePath string
 	if hasOverlay {
+		if err := requireNoActiveVMSupervisor(store, "setup capture publication"); err != nil {
+			return err
+		}
 		var err error
 		promotedImagePath, err = acceptSetupCaptureOverlay(meta, script)
 		if err != nil {
@@ -531,7 +555,9 @@ func cmdProjectSetupCaptureDiscard() error {
 func discardSetupCaptureState(store projectStore, meta setupCaptureMetadata, prompt bool) (bool, error) {
 	running, stale := detectRunningProjectVMWithMetadataInStore(store)
 	if stale {
-		_ = store.clearRuntimeState()
+		if err := store.clearRuntimeState(); err != nil {
+			return false, err
+		}
 	}
 	if meta.OverlayImagePath != "" && running != nil && running.ImagePath != "" && running.ImagePath != meta.OverlayImagePath {
 		return false, fmt.Errorf("project VM is running from %s; stop it before discard", filepath.Base(running.ImagePath))
@@ -559,6 +585,9 @@ func discardSetupCaptureState(store projectStore, meta setupCaptureMetadata, pro
 	}
 
 	if meta.OverlayImagePath != "" {
+		if err := requireNoActiveVMSupervisor(store, "setup capture discard"); err != nil {
+			return false, err
+		}
 		if err := os.Remove(meta.OverlayImagePath); err != nil && !os.IsNotExist(err) {
 			return false, fmt.Errorf("remove capture overlay: %w", err)
 		}

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -305,6 +306,45 @@ func cmdGlobalProjectsKill(hashes []string, abrupt bool) error {
 }
 
 func killGlobalProject(store projectStore, abrupt bool, locked bool) (string, error) {
+	record, recordErr := readVMSupervisorRecord(store)
+	if recordErr != nil && !os.IsNotExist(recordErr) {
+		return "", recordErr
+	}
+	if recordErr == nil {
+		sessions, err := store.readActiveShellSessions(false)
+		if err != nil && !abrupt {
+			return "", err
+		}
+		if err != nil {
+			warnGlobalProject(store, err)
+		}
+		if len(sessions) > 0 && !confirmGlobalProjectKillWithShells(store, sessions) {
+			return "skipped", nil
+		}
+		if !abrupt && record.Mode == "detached" && record.RuntimeDir == store.runtimeDir() {
+			result, err := stopProjectVMInStore(store, false)
+			if err != nil {
+				return "", err
+			}
+			if result.State == projectVMStopStateStopped || result.State == projectVMStopStateStale {
+				return "stopped", nil
+			}
+		}
+		if abrupt {
+			if err := signalVerifiedVMProcess(record.QEMU, syscall.SIGKILL); err != nil {
+				return "", err
+			}
+		}
+		if err := stopAndWaitForVMSupervisor(store); err != nil {
+			return "", err
+		}
+		if locked {
+			if err := store.clearRuntimeState(); err != nil {
+				return "", err
+			}
+		}
+		return "stopped", nil
+	}
 	processes, err := openQemuProcessesForSocket(store.monitorSockPath())
 	if err != nil {
 		return "", err

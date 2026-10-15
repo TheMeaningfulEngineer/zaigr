@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -58,6 +59,9 @@ func cleanProjectToCurrentBase() error {
 		}
 		if err := stagedStore.writeFirewallIPs(firewallIPs); err != nil {
 			return fmt.Errorf("preserve project firewall IP permissions: %w", err)
+		}
+		if err := preserveVirtiofsSandbox(store, stagedStore); err != nil {
+			return err
 		}
 		if err := preserveHostAccessGrants(store, stagedStore); err != nil {
 			return err
@@ -517,6 +521,9 @@ func removeFileIfExists(path string) error {
 }
 
 func publishProjectReplacement(store projectStore, candidate string, metadataPaths []string, updateMetadata func() error) error {
+	if err := requireNoActiveVMSupervisor(store, "project image publication"); err != nil {
+		return err
+	}
 	snapshots, err := snapshotProjectFiles(metadataPaths)
 	if err != nil {
 		return err
@@ -602,6 +609,12 @@ func publishProjectReplacement(store projectStore, candidate string, metadataPat
 }
 
 func publishLegacyCleanStore(store projectStore, stagedStore string) error {
+	if err := requireNoActiveVMSupervisor(store, "legacy project replacement"); err != nil {
+		return err
+	}
+	if err := requireNoActiveVMSupervisor(projectStore{Path: stagedStore}, "legacy project replacement"); err != nil {
+		return err
+	}
 	// Claims scan both the current store and its backup. Serialize the rename
 	// with those scans so an enumeration cannot miss both names.
 	ownership := &projectMutationLock{}
@@ -904,7 +917,7 @@ func legacySetupName(filename string) string {
 	return name
 }
 
-func rebuildLegacyProjectStore(store projectStore, definitions []setupDefinition) (*appliedSetup, error) {
+func rebuildLegacyProjectStore(store projectStore, definitions []setupDefinition) (failed *appliedSetup, returnErr error) {
 	disk, _ := resolveDisk("")
 	ram := store.ram()
 	cpus := store.cpus()
@@ -925,7 +938,21 @@ func rebuildLegacyProjectStore(store projectStore, definitions []setupDefinition
 	if err != nil {
 		return nil, fmt.Errorf("create legacy rebuild staging directory: %w", err)
 	}
-	defer func() { _ = os.RemoveAll(stagingDir) }()
+	defer func() {
+		stagedStore := projectStore{Path: filepath.Join(stagingDir, "store")}
+		if _, err := os.Stat(stagedStore.Path); os.IsNotExist(err) {
+			returnErr = errors.Join(returnErr, os.RemoveAll(stagingDir))
+			return
+		} else if err != nil {
+			returnErr = errors.Join(returnErr, err)
+			return
+		}
+		if err := requireNoActiveVMSupervisor(stagedStore, "legacy rebuild staging cleanup"); err != nil {
+			returnErr = errors.Join(returnErr, err)
+			return
+		}
+		returnErr = errors.Join(returnErr, os.RemoveAll(stagingDir))
+	}()
 	stagedStore := projectStore{Hash: store.Hash, Path: filepath.Join(stagingDir, "store")}
 	if err := os.MkdirAll(stagedStore.Path, 0755); err != nil {
 		return nil, fmt.Errorf("stage rebuilt project store: %w", err)
@@ -939,6 +966,9 @@ func rebuildLegacyProjectStore(store projectStore, definitions []setupDefinition
 	}
 	if err := stagedStore.writeFirewallIPs(firewallIPs); err != nil {
 		return nil, fmt.Errorf("preserve project firewall IP permissions: %w", err)
+	}
+	if err := preserveVirtiofsSandbox(store, stagedStore); err != nil {
+		return nil, err
 	}
 	if err := preserveHostAccessGrants(store, stagedStore); err != nil {
 		return nil, err
@@ -956,11 +986,46 @@ func rebuildLegacyProjectStore(store projectStore, definitions []setupDefinition
 	if err != nil {
 		return failedSetup, err
 	}
+	if err := preserveVirtiofsSandbox(store, stagedStore); err != nil {
+		return nil, err
+	}
+	if err := copyLegacyVMLogs(store, stagedStore); err != nil {
+		return nil, fmt.Errorf("preserve legacy rebuild VM logs: %w", err)
+	}
 	if err := publishLegacyCleanStore(store, stagedStore.Path); err != nil {
 		return nil, fmt.Errorf("publish rebuilt legacy project store: %w", err)
 	}
 	fmt.Println(":: Replaced incompatible legacy project store with rebuilt current-format state")
 	return nil, nil
+}
+
+func copyLegacyVMLogs(source, destination projectStore) error {
+	for _, name := range []string{"vm-supervisor.log", "vm-qemu.log", "virtiofsd-workspace.log", "virtiofsd-agent-state.log", "vm-serial.log"} {
+		input, err := os.Open(filepath.Join(source.Path, name))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		output, err := os.CreateTemp(destination.Path, ".vm-log-*")
+		if err != nil {
+			_ = input.Close()
+			return err
+		}
+		path := output.Name()
+		_, copyErr := io.Copy(output, input)
+		copyErr = errors.Join(copyErr, output.Sync(), output.Close(), input.Close())
+		if copyErr != nil {
+			_ = os.Remove(path)
+			return copyErr
+		}
+		if err := os.Rename(path, filepath.Join(destination.Path, name)); err != nil {
+			_ = os.Remove(path)
+			return err
+		}
+	}
+	return syncDirectory(destination.Path)
 }
 
 func preserveLegacyAgentState(sourceStore projectStore, stagedStore projectStore) error {
@@ -1094,11 +1159,24 @@ func printRebuildVersionChanges(records []appliedSetup, definitions []setupDefin
 	}
 }
 
-func buildRebuildCandidate(store projectStore, sourceStore projectStore, definitions []setupDefinition) (*appliedSetup, error) {
+func buildRebuildCandidate(store projectStore, sourceStore projectStore, definitions []setupDefinition) (failed *appliedSetup, returnErr error) {
+	if err := requireNoActiveVMSupervisor(store, "project rebuild candidate creation"); err != nil {
+		return nil, err
+	}
 	disk, _ := resolveDisk("")
 	candidate := filepath.Join(store.Path, projectImageFileName+".rebuild-wip")
-	_ = os.Remove(candidate)
-	defer func() { _ = os.Remove(candidate) }()
+	if err := os.Remove(candidate); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	defer func() {
+		if err := requireNoActiveVMSupervisor(store, "project rebuild candidate cleanup"); err != nil {
+			returnErr = errors.Join(returnErr, err)
+			return
+		}
+		if err := os.Remove(candidate); err != nil && !os.IsNotExist(err) {
+			returnErr = errors.Join(returnErr, err)
+		}
+	}()
 	selection, err := createProjectOverlayFromCurrent(candidate, disk, store.ram(), store.cpus())
 	if err != nil {
 		return nil, fmt.Errorf("create rebuild overlay: %w", err)
@@ -1108,7 +1186,13 @@ func buildRebuildCandidate(store projectStore, sourceStore projectStore, definit
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = os.RemoveAll(stagingDir) }()
+	defer func() {
+		if err := requireNoActiveVMSupervisor(store, "project rebuild staging cleanup"); err != nil {
+			returnErr = errors.Join(returnErr, err)
+			return
+		}
+		returnErr = errors.Join(returnErr, os.RemoveAll(stagingDir))
+	}()
 	agentStateDir := filepath.Join(stagingDir, "agent-state")
 	if err := copyRebuildAgentState(sourceStore.agentStateDir(), agentStateDir); err != nil {
 		return nil, err
@@ -1135,7 +1219,11 @@ func buildRebuildCandidate(store projectStore, sourceStore projectStore, definit
 		if err != nil {
 			return nil, err
 		}
-		if err := applyStepsViaSSHWithAgentState(candidate, scripts, ram, cpus, port, true, agentStateDir); err != nil {
+		workspace, err := os.Getwd()
+		if err != nil {
+			return nil, err
+		}
+		if err := applyStepsViaSSHInContext(candidate, scripts, ram, cpus, port, true, agentStateDir, workspace, store, sourceStore.Path); err != nil {
 			if isGuestSetupExecutionError(err) {
 				step := guestSetupExecutionStep(err)
 				for index, path := range scripts {

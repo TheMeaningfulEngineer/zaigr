@@ -27,6 +27,7 @@ func newMiscCommand(rootCmd *cobra.Command) *cobra.Command {
 	cmd.AddCommand(newFullVersionCommand())
 	cmd.AddCommand(newTestHelpersCommand())
 	cmd.AddCommand(newCheckCommand())
+	cmd.AddCommand(newAppArmorProfileCommand())
 	cmd.AddCommand(newAutocompleteCommand(rootCmd))
 	return cmd
 }

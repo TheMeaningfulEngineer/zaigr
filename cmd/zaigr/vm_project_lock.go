@@ -272,6 +272,9 @@ func recoverStaleDirectSetupStaging(store projectStore) error {
 		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 			continue
 		}
+		if err := requireNoActiveVMSupervisor(store, "direct setup staging recovery"); err != nil {
+			return err
+		}
 		if err := os.RemoveAll(path); err != nil {
 			return fmt.Errorf("remove stale setup staging directory %s: %w", name, err)
 		}
@@ -297,6 +300,13 @@ func recoverStaleSetupCaptureOverlay(store projectStore) error {
 		return err
 	}
 	overlayPath := store.setupCaptureOverlayPath()
+	if _, err := os.Lstat(overlayPath); err == nil {
+		if err := requireNoActiveVMSupervisor(store, "setup capture overlay recovery"); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	if err := os.Remove(overlayPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove unreferenced capture overlay: %w", err)
 	}

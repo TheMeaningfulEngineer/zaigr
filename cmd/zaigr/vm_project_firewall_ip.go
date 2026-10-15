@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -43,7 +44,9 @@ func cmdProjectFirewallIPChange(rawAddress string, allow bool) error {
 	if !allow && !found {
 		running, stale := detectRunningProjectVMWithMetadata()
 		if stale {
-			_ = store.clearRuntimeState()
+			if err := store.clearRuntimeState(); err != nil {
+				return err
+			}
 			running = nil
 		}
 		if running != nil {
@@ -69,7 +72,9 @@ func cmdProjectFirewallIPChange(rawAddress string, allow bool) error {
 	if allow && found {
 		running, stale := detectRunningProjectVMWithMetadata()
 		if stale {
-			_ = store.clearRuntimeState()
+			if err := store.clearRuntimeState(); err != nil {
+				return err
+			}
 			running = nil
 		}
 		if running != nil {
@@ -113,7 +118,9 @@ func cmdProjectFirewallIPChange(rawAddress string, allow bool) error {
 
 	running, stale := detectRunningProjectVMWithMetadata()
 	if stale {
-		_ = store.clearRuntimeState()
+		if err := store.clearRuntimeState(); err != nil {
+			return err
+		}
 		running = nil
 	}
 	if running == nil {
@@ -167,6 +174,13 @@ func printProjectFirewallIPs(addresses []string, running bool) {
 }
 
 func syncProjectFirewallIPsToVM(port string, addresses []string, revoked []string) error {
+	return syncProjectFirewallIPsToVMContext(context.Background(), port, addresses, revoked)
+}
+
+func syncProjectFirewallIPsToVMContext(ctx context.Context, port string, addresses []string, revoked []string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	store := currentProjectStore()
 	applied, _, err := store.appliedFirewallIPs()
 	if err != nil {
@@ -219,7 +233,7 @@ func syncProjectFirewallIPsToVM(port string, addresses []string, revoked []strin
 	for _, arg := range args {
 		quoted = append(quoted, singleQuotedArg(arg))
 	}
-	if err := sshRunControlScript(port, rootKeyPath, "exec "+strings.Join(quoted, " ")+"\n"); err != nil {
+	if err := sshRunControlScriptContext(ctx, port, rootKeyPath, "exec "+strings.Join(quoted, " ")+"\n"); err != nil {
 		return fmt.Errorf("sync exact IPv4 permissions to VM: %w", err)
 	}
 	if err := store.writeAppliedFirewallIPs(addresses); err != nil {
@@ -231,7 +245,10 @@ func syncProjectFirewallIPsToVM(port string, addresses []string, revoked []strin
 	return nil
 }
 
-func syncSavedProjectFirewallIPsToVM(port string) error {
+func syncSavedProjectFirewallIPsToVMContext(ctx context.Context, port string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	store := currentProjectStore()
 	held, err := acquireProjectFileLock(store, ".firewall-ips", "project firewall startup sync", true)
 	if err != nil {
@@ -243,7 +260,7 @@ func syncSavedProjectFirewallIPsToVM(port string) error {
 	if err != nil {
 		return err
 	}
-	return syncProjectFirewallIPsToVM(port, addresses, nil)
+	return syncProjectFirewallIPsToVMContext(ctx, port, addresses, nil)
 }
 
 // reconcileSavedProjectFirewallIPsToVM blocks ordinary guest entry until a

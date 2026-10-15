@@ -143,6 +143,9 @@ def _cmd_candidate(repo: Path, args: argparse.Namespace) -> int:
         command_display = "Build base rootfs"
         _run_command(logger, repo, ["vm_prep/build-base-rootfs.sh"], plan=command_display)
 
+        command_display = "Build virtiofsd"
+        _run_command(logger, repo, ["vm_prep/build-virtiofsd.sh"], plan=command_display)
+
         command_display = "Build zaigr binary"
         ldflags = (
             f"-X main.version={version} "
@@ -1290,7 +1293,7 @@ def _require_release_tools() -> None:
     missing = [name for name in ("git-cliff", "nfpm") if shutil.which(name) is None]
     if missing:
         raise RuntimeError(
-            f"missing release tool(s): {', '.join(missing)}; run the release-tools setup"
+            f"missing release tool(s): {', '.join(missing)}; run the zaigr-dev setup"
         )
 
 

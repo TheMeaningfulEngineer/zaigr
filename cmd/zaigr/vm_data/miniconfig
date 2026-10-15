@@ -1,5 +1,5 @@
 # zaigr minimal kernel config for fast QEMU microvm boot
-# Target: boot to shell as fast as possible, with 9p workspace sharing
+# Target: boot to shell as fast as possible, with virtiofs sharing
 
 # 64-bit
 CONFIG_64BIT=y
@@ -48,16 +48,10 @@ CONFIG_BLK_DEV=y
 CONFIG_VIRTIO_BLK=y
 CONFIG_VIRTIO_NET=y
 
-# 9P filesystem (host directory sharing)
+# Network stack and virtiofs host directory sharing
 CONFIG_NET=y
-CONFIG_NET_9P=y
-CONFIG_NET_9P_VIRTIO=y
 CONFIG_NETWORK_FILESYSTEMS=y
-CONFIG_9P_FS=y
-CONFIG_9P_FS_POSIX_ACL=y
-# 9P cache support (needed for mmap MAP_SHARED on 9p mounts)
-CONFIG_FSCACHE=y
-CONFIG_9P_FSCACHE=y
+CONFIG_VIRTIO_FS=y
 
 # Crypto (needed by ext4)
 CONFIG_CRYPTO=y

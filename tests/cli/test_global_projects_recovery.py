@@ -314,7 +314,10 @@ def test_global_projects_abrupt_kill_finds_vm_without_monitor(project, tmp_path,
             command, cwd=project.cwd, env=project.env, timeout=10
         )
         assert rc != 0, err_msg(stdout, stderr)
-        assert "project VM is running" in stdout + stderr
+        assert (
+            "project VM is running" in stdout + stderr
+            or "VM operation in progress" in stdout + stderr
+        )
         assert store.is_dir()
 
     status = run(f"{zaigr} global projects list", cwd=tmp_path, timeout=5)

@@ -331,6 +331,7 @@ func newProjectVMShowConfigCommand() *cobra.Command {
 }
 
 func newProjectVMSetConfigCommand() *cobra.Command {
+	var sandbox string
 	var ram string
 	var cpu string
 	cmd := &cobra.Command{
@@ -343,11 +344,12 @@ For a new project, run 'zaigr project vm start' to initialize it, then
 'zaigr project vm stop' before using this command.`,
 		Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			return cmdProjectSetVMConfig(ram, cpu)
+			return cmdProjectSetVMConfig(ram, cpu, sandbox)
 		},
 	}
 	cmd.Flags().StringVar(&ram, "ram", "", "Set default RAM in MB")
 	cmd.Flags().StringVar(&cpu, "cpu", "", "Set default CPU count")
+	cmd.Flags().StringVar(&sandbox, "virtiofs-sandbox", "", "Filesystem isolation: namespace (default) or none (unsafe)")
 	return cmd
 }
 

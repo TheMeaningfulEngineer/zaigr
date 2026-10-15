@@ -56,3 +56,4 @@ coverage.out
 *.swp
 *.swo
 .DS_Store
+/cmd/zaigr/vm_data/virtiofsd

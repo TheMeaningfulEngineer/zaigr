@@ -70,7 +70,9 @@ func cmdSetupRun(names []string, ram string, cpu string, force bool) error {
 	}
 	_, stale := detectRunningProjectVM()
 	if stale {
-		_ = store.clearRuntimeState()
+		if err := store.clearRuntimeState(); err != nil {
+			return err
+		}
 		logWarn("removed stale project VM marker during project setup run", "runtime_dir", store.runtimeDir())
 	}
 	if err = resolveProjectImageForCommand(); err != nil {
@@ -92,7 +94,9 @@ func cmdSetupRun(names []string, ram string, cpu string, force bool) error {
 
 	running, stale := detectRunningProjectVM()
 	if stale {
-		_ = store.clearRuntimeState()
+		if err := store.clearRuntimeState(); err != nil {
+			return err
+		}
 		running = nil
 	}
 	if running != nil {
@@ -756,7 +760,11 @@ func requireProject(ctx string) (string, error) {
 		logInfo("project is not initialized", "context", ctx, "store", storePath)
 		return "", fmt.Errorf("%s requires a project. Run 'zaigr shell' to initialize it", ctx)
 	}
-	if ctx != "project clean" && ctx != "project rebuild" && ctx != "project delete" {
+	// The four `project {clean,rebuild,delete,vm stop}` commands must work on
+	// legacy stores (so a user can tear down or discard an incompatible store
+	// without rebuilding first). Also used by test fixture teardown, which
+	// doesn't know whether the store was intentionally left in legacy state.
+	if ctx != "project clean" && ctx != "project rebuild" && ctx != "project delete" && ctx != "project vm stop" {
 		if err := store.requireCurrentImageFormat(ctx); err != nil {
 			return "", err
 		}

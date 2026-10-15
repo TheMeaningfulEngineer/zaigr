@@ -1,0 +1,138 @@
+#!/bin/bash
+set -euo pipefail
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export DEBIAN_FRONTEND=noninteractive
+
+# One-stop setup for developing on zaigr itself.
+#
+# This covers:
+#   - Kernel/rootfs build toolchain (previously `kernel-mmdebstrap`).
+#   - Release orchestration tools, podman/rootless stack, Python test deps
+#     (previously `release-tools`).
+#   - virtiofsd build toolchain: Rust/musl, native libcap-ng/libseccomp
+#     headers, libsqlite3-dev for the virtiofs integrity test probe.
+#
+# Replaces the separate `kernel-mmdebstrap` and `release-tools` setups.
+
+echo ":: Installing zaigr-dev packages ..."
+apt-get update -qq
+apt-get install -y --no-install-recommends \
+    bc \
+    bison \
+    build-essential \
+    ca-certificates \
+    cpio \
+    crun \
+    curl \
+    fakeroot \
+    file \
+    flex \
+    fuse-overlayfs \
+    git \
+    gperf \
+    libcap-ng-dev \
+    libelf-dev \
+    libseccomp-dev \
+    libsqlite3-dev \
+    libssl-dev \
+    mmdebstrap \
+    musl-tools \
+    passt \
+    pkg-config \
+    podman \
+    python3 \
+    python3-pexpect \
+    python3-pytest \
+    python3-pytest-timeout \
+    python3-pytest-xdist \
+    python3-pyzstd \
+    qemu-system-x86 \
+    qemu-utils \
+    rpm \
+    rsync \
+    slirp4netns \
+    uidmap \
+    zstd
+
+echo ":: Configuring rootless container storage ..."
+sed -i '/^user:/d' /etc/subuid /etc/subgid
+echo 'user:100000:131072' >> /etc/subuid
+echo 'user:100000:131072' >> /etc/subgid
+
+mkdir -p /etc/containers/containers.conf.d /etc/containers/registries.conf.d
+cat > /etc/containers/containers.conf.d/zaigr.conf <<'EOF'
+[engine]
+cgroup_manager = "cgroupfs"
+events_logger = "file"
+EOF
+
+cat > /etc/containers/registries.conf <<'EOF'
+unqualified-search-registries = ["docker.io"]
+short-name-mode = "disabled"
+EOF
+rm -f /etc/containers/registries.conf.d/shortnames.conf
+rm -f /etc/containers/short-name-aliases.conf
+
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' EXIT
+
+install_tarball_binary() {
+    name="$1"
+    url="$2"
+    extract_dir="$tmpdir/$name"
+    mkdir -p "$extract_dir"
+    curl -4 -fsSL "$url" | tar -xz -C "$extract_dir"
+    binary="$(find "$extract_dir" -type f -name "$name" -perm -u+x | head -n 1)"
+    if [ -z "$binary" ]; then
+        echo ":: Could not find $name in release archive" >&2
+        exit 1
+    fi
+    install -m 0755 "$binary" "/usr/local/bin/$name"
+}
+
+echo ":: Installing git-cliff ..."
+git_cliff_version="${GIT_CLIFF_VERSION:-2.12.0}"
+install_tarball_binary \
+    git-cliff \
+    "https://github.com/orhun/git-cliff/releases/download/v${git_cliff_version}/git-cliff-${git_cliff_version}-x86_64-unknown-linux-gnu.tar.gz"
+
+echo ":: Installing nfpm ..."
+nfpm_version="${NFPM_VERSION:-2.46.1}"
+install_tarball_binary \
+    nfpm \
+    "https://github.com/goreleaser/nfpm/releases/download/v${nfpm_version}/nfpm_${nfpm_version}_Linux_x86_64.tar.gz"
+
+echo ":: Installing Rust toolchain (shared under /usr/local) ..."
+export RUSTUP_HOME=/usr/local/rustup
+export CARGO_HOME=/usr/local/cargo
+rust_version="${RUST_VERSION:-1.82.0}"
+
+if [ ! -x "$CARGO_HOME/bin/cargo" ]; then
+    curl -4 --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+        | sh -s -- -y \
+            --default-toolchain "$rust_version" \
+            --profile minimal \
+            --no-modify-path
+fi
+
+for tool in rustc cargo rustup rustdoc; do
+    ln -sf "$CARGO_HOME/bin/$tool" "/usr/local/bin/$tool"
+done
+
+echo ":: Adding x86_64-unknown-linux-musl target ..."
+"$CARGO_HOME/bin/rustup" target add x86_64-unknown-linux-musl
+
+# /etc/environment is read by PAM for every login (interactive, non-interactive
+# ssh, and system services), so plain `rustc`/`cargo` work from any shell.
+if ! grep -q '^RUSTUP_HOME=' /etc/environment 2>/dev/null; then
+    printf 'RUSTUP_HOME=/usr/local/rustup\n' >> /etc/environment
+fi
+cat > /etc/profile.d/zaigr-rust.sh <<'EOF'
+export RUSTUP_HOME=/usr/local/rustup
+EOF
+chmod 0644 /etc/profile.d/zaigr-rust.sh
+
+echo ":: zaigr-dev setup complete"
+"$CARGO_HOME/bin/rustc" --version
+"$CARGO_HOME/bin/cargo" --version

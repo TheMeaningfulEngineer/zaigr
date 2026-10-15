@@ -1,0 +1,96 @@
+#!/bin/bash
+# Internal control-channel helper. Observation never opens a device or socket.
+set -euo pipefail
+export LC_ALL=C
+readonly aliases=/var/lib/zaigr/host-access-aliases
+
+fatal() { printf 'host-access: %s\n' "$*" >&2; exit 1; }
+
+cleanup_aliases() {
+    [[ -f "$aliases" ]] || return 0
+    local path target invalid=0
+    while IFS=$'\t' read -r path target; do
+        if [[ "$path" != /* || "$target" != /dev/ttyS[12] ]]; then
+            printf 'host-access: invalid alias journal entry\n' >&2
+            invalid=1
+            continue
+        fi
+        if [[ -L "$path" && "$(readlink -- "$path")" == "$target" ]]; then
+            rm -- "$path"
+        fi
+    done < "$aliases"
+    [[ $invalid == 0 ]] || return 1
+    rm -- "$aliases"
+}
+
+case "${1:-}" in
+version) printf 'host-access-v1\n';;
+cleanup) cleanup_aliases;;
+attach)
+    [[ $# == 3 ]] || fatal "invalid attach arguments"
+    path=$2 target=$3
+    [[ "$path" == /* && "$target" == /dev/ttyS[12] && "$path" != *$'\t'* && "$path" != *$'\n'* ]] || fatal "invalid device path"
+    [[ -c "$target" ]] || fatal "UART is absent; rebuild this project with the current base image"
+    [[ ! -e "$path" && ! -L "$path" ]] || fatal "guest path already exists: $path"
+    mkdir -p -- "$(dirname -- "$path")" "$(dirname -- "$aliases")"
+    # Journal before publishing the alias so crash recovery removes it, too.
+    printf '%s\t%s\n' "$path" "$target" >> "$aliases"
+    chmod 600 "$aliases"
+    chown user:user "$target"
+    chmod 660 "$target"
+    ln -s -- "$target" "$path"
+    ;;
+observe)
+    shift
+    sockets=$(ss -H -lnt4 && ss -H -lnt6 -e) || fatal "cannot inspect guest TCP listeners"
+    # One stat invocation takes a snapshot without opening any target device.
+    # Vanished descriptors are normal; all other collection failures are unknown.
+    snapshot=$(stat -L --printf='%F\t%t:%T\n' /proc/[0-9]*/fd/* 2>&1) || {
+        while IFS= read -r line; do
+            case "$line" in
+            *$'\t'*) ;; # successful stat output
+            "stat: cannot statx '/proc/"*"': No such file or directory") ;;
+            *) fatal "cannot inspect guest process descriptors: $line";;
+            esac
+        done <<< "$snapshot"
+    }
+    printf 'host-access-v1\n'
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+        port)
+            [[ $# -ge 2 ]] || fatal "missing port"
+            port=$2 state=available
+            while read -r _ _ _ local_address _ details; do
+                [[ "${local_address##*:}" == "$port" ]] || continue
+                case "${local_address%:*}" in
+                0.0.0.0|10.0.2.15) state=attached; break;;
+                '*'|'[::]')
+                    if [[ "$details" == *'v6only:0'* ]]; then state=attached; break; fi;;
+                127.*) state=loopback;;
+                esac
+            done <<< "$sockets"
+            printf 'port\t%s\t%s\n' "$port" "$state"
+            shift 2
+            ;;
+        device)
+            [[ $# -ge 3 ]] || fatal "missing device"
+            path=$2 target=$3 state=available
+            if [[ ! -c "$path" || "$(stat -Lc '%t:%T' -- "$path")" != "$(stat -Lc '%t:%T' -- "$target")" ]]; then
+                state=unavailable
+            else
+                identity=$(stat -Lc '%t:%T' -- "$target")
+                while IFS=$'\t' read -r kind actual; do
+                    if [[ "$kind" == 'character special file' && "$identity" == "$actual" ]]; then
+                        state=attached; break
+                    fi
+                done <<< "$snapshot"
+            fi
+            printf 'device\t%s\t%s\n' "$target" "$state"
+            shift 3
+            ;;
+        *) fatal "invalid observation request";;
+        esac
+    done
+    ;;
+*) fatal "invalid control operation";;
+esac

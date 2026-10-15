@@ -1,12 +1,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -257,8 +259,20 @@ func (store projectStore) runtimeDir() string {
 	return filepath.Join(store.Path, "runtime")
 }
 
-func (store projectStore) ensureRuntimeDir() error {
-	return os.MkdirAll(store.runtimeDir(), 0755)
+func (store projectStore) workspaceVirtiofsSockPath() string {
+	return filepath.Join(store.runtimeDir(), "virtiofsd-workspace.sock")
+}
+
+func (store projectStore) agentStateVirtiofsSockPath() string {
+	return filepath.Join(store.runtimeDir(), "virtiofsd-agent-state.sock")
+}
+
+func (store projectStore) vmSupervisorPath() string {
+	return filepath.Join(store.Path, "vm-supervisor.json")
+}
+
+func (store projectStore) vmSupervisorLockPath() string {
+	return filepath.Join(store.Path, "vm-supervisor.lock")
 }
 
 func (store projectStore) agentStateDir() string {
@@ -277,6 +291,28 @@ func (store projectStore) ensureAgentStateDir() error {
 }
 
 func (store projectStore) clearRuntimeState() error {
+	// Keep probes side-effect free for fresh/legacy stores, but inspect the
+	// ownership record even if the lock pathname has been removed.
+	lock, err := os.OpenFile(store.vmSupervisorLockPath(), os.O_RDWR, 0600)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("open VM lifetime lock: %w", err)
+	}
+	if lock != nil {
+		defer func() { _ = lock.Close() }()
+		if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			return fmt.Errorf("VM operation in progress")
+		}
+	}
+	if record, err := readVMSupervisorRecord(store); err == nil {
+		if err := validateStaleVMRecord(store, record); err != nil {
+			return fmt.Errorf("VM operation in progress: %w", err)
+		}
+		if err := removeVMSocketDir(record.SocketDir, record.LaunchID); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	if err := os.RemoveAll(store.runtimeDir()); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove runtime state: %w", err)
 	}

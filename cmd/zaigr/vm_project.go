@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,6 +38,11 @@ func cmdProjectShowVMConfig() error {
 	}
 	fmt.Printf("cpu=%s\n", cpu)
 	fmt.Printf("ram=%sMB\n", ram)
+	sandbox, err := store.virtiofsSandbox()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("virtiofs-sandbox=%s\n", sandbox)
 	return nil
 }
 
@@ -74,7 +81,7 @@ func cmdProjectStartVM(ram string, cpu string) error {
 	return nil
 }
 
-func cmdProjectSetVMConfig(ram string, cpu string) error {
+func cmdProjectSetVMConfig(ram string, cpu string, sandbox string) error {
 	lock, err := lockCurrentProject("project vm set-config")
 	if err != nil {
 		return err
@@ -84,12 +91,18 @@ func cmdProjectSetVMConfig(ram string, cpu string) error {
 		return err
 	}
 	store := currentProjectStore()
-	if ram == "" && cpu == "" {
-		return fmt.Errorf("provide --ram and/or --cpu")
+	if ram == "" && cpu == "" && sandbox == "" {
+		return fmt.Errorf("provide --ram, --cpu and/or --virtiofs-sandbox")
 	}
+	if sandbox != "" && sandbox != "namespace" && sandbox != "none" {
+		return fmt.Errorf("--virtiofs-sandbox must be namespace or none")
+	}
+
 	running, stale := detectRunningProjectVM()
 	if stale {
-		_ = store.clearRuntimeState()
+		if err := store.clearRuntimeState(); err != nil {
+			return err
+		}
 		running = nil
 	}
 	if running != nil {
@@ -111,6 +124,15 @@ func cmdProjectSetVMConfig(ram string, cpu string) error {
 		}
 		if err := os.WriteFile(store.cpusPath(), []byte(fmt.Sprintf("%s\n", cpu)), 0644); err != nil {
 			return fmt.Errorf("store default cpus: %w", err)
+		}
+	}
+
+	if sandbox != "" {
+		if sandbox == "none" {
+			fmt.Fprintln(os.Stderr, unsafeVirtiofsWarning)
+		}
+		if err := store.writeVirtiofsSandbox(sandbox); err != nil {
+			return err
 		}
 	}
 
@@ -136,7 +158,9 @@ func cmdProjectVMExec(commandArgs []string, root bool) error {
 
 	running, stale := detectRunningProjectVM()
 	if stale {
-		_ = currentProjectStore().clearRuntimeState()
+		if err := currentProjectStore().clearRuntimeState(); err != nil {
+			return err
+		}
 		running = nil
 	}
 	if running == nil {
@@ -295,7 +319,9 @@ func cmdProjectFirewallShow() error {
 
 	running, stale := detectRunningProjectVMWithMetadata()
 	if stale {
-		_ = currentProjectStore().clearRuntimeState()
+		if err := currentProjectStore().clearRuntimeState(); err != nil {
+			return err
+		}
 		running = nil
 	}
 
@@ -332,7 +358,9 @@ func cmdProjectClean() error {
 		}
 	}
 	if stale {
-		_ = currentProjectStore().clearRuntimeState()
+		if err := currentProjectStore().clearRuntimeState(); err != nil {
+			return err
+		}
 		running = nil
 	}
 	if running != nil {
@@ -368,7 +396,9 @@ func cmdProjectRebuild(force bool) error {
 		}
 	}
 	if stale {
-		_ = currentProjectStore().clearRuntimeState()
+		if err := currentProjectStore().clearRuntimeState(); err != nil {
+			return err
+		}
 		running = nil
 	}
 	if running != nil {
@@ -428,7 +458,9 @@ func cmdProjectDelete(force bool) error {
 		}
 	}
 	if stale {
-		_ = currentProjectStore().clearRuntimeState()
+		if err := currentProjectStore().clearRuntimeState(); err != nil {
+			return err
+		}
 		running = nil
 	}
 	if running != nil {
@@ -515,8 +547,13 @@ func stopProjectVMInStore(store projectStore, abrupt bool) (projectVMStopResult,
 		if running != nil {
 			return projectVMStopResult{}, fmt.Errorf("project VM is running but no matching qemu process was found")
 		}
+		if err := stopAndWaitForVMSupervisor(store); err != nil {
+			return projectVMStopResult{}, err
+		}
 		if stale {
-			_ = store.clearRuntimeState()
+			if err := store.clearRuntimeState(); err != nil {
+				return projectVMStopResult{}, err
+			}
 			return projectVMStopResult{State: projectVMStopStateStale}, nil
 		}
 		return projectVMStopResult{State: projectVMStopStateOff}, nil
@@ -550,7 +587,12 @@ func stopProjectVMInStore(store projectStore, abrupt bool) (projectVMStopResult,
 		}
 	}
 
-	_ = store.clearRuntimeState()
+	if err := stopAndWaitForVMSupervisor(store); err != nil {
+		return projectVMStopResult{}, err
+	}
+	if err := store.clearRuntimeState(); err != nil {
+		return projectVMStopResult{}, err
+	}
 	return projectVMStopResult{State: projectVMStopStateStopped}, nil
 }
 
@@ -593,13 +635,33 @@ func findQemuProcessesForSocket(sockPath string) ([]int, error) {
 			continue
 		}
 		for index := 1; index+1 < len(args); index++ {
-			if args[index] == "-qmp" && strings.SplitN(args[index+1], ",", 2)[0] == "unix:"+sockPath {
+			if args[index] == "-qmp" && qemuSocketPathFromOption(args[index+1]) == sockPath {
 				pids = append(pids, pid)
 				break
 			}
 		}
 	}
 	return pids, nil
+}
+
+func qemuSocketPathFromOption(option string) string {
+	if !strings.HasPrefix(option, "unix:") {
+		return ""
+	}
+	var path strings.Builder
+	for i := len("unix:"); i < len(option); i++ {
+		if option[i] != ',' {
+			path.WriteByte(option[i])
+			continue
+		}
+		if i+1 < len(option) && option[i+1] == ',' {
+			path.WriteByte(',')
+			i++
+			continue
+		}
+		break
+	}
+	return path.String()
 }
 
 // qemuProcessIdentity retains a signal handle and the Linux process start time.
@@ -610,6 +672,9 @@ type qemuProcessIdentity struct {
 
 // Call under the project lock before deleting runtime state or disk images.
 func requireNoRunningProjectQemu(store projectStore, operation string) error {
+	if err := requireNoActiveVMSupervisor(store, operation); err != nil {
+		return err
+	}
 	processes, err := openQemuProcessesForSocket(store.monitorSockPath())
 	if err != nil {
 		return err
@@ -772,7 +837,7 @@ func projectShowFirewallFromVM(port string) error {
 	return projectShowFirewallEntries(active, ordered)
 }
 
-func projectShowFirewallFromTemporaryVM() error {
+func projectShowFirewallFromTemporaryVM() (returnErr error) {
 	if err := requireKVMAccess(); err != nil {
 		return err
 	}
@@ -810,9 +875,23 @@ func projectShowFirewallFromTemporaryVM() error {
 		return err
 	}
 
-	monitorSock := filepath.Join(store.Path, "project-firewall-show-vm.sock")
-	_ = os.Remove(monitorSock)
-	args := buildQEMUArgs(
+	runtimeDir, err := os.MkdirTemp("", "zaigr-inspect-*")
+	if err != nil {
+		return fmt.Errorf("create inspection runtime: %w", err)
+	}
+	defer func() {
+		if returnErr == nil {
+			_ = os.RemoveAll(runtimeDir)
+		}
+	}()
+	monitorSock := filepath.Join(runtimeDir, "vm.sock")
+	workspaceSock := filepath.Join(runtimeDir, "workspace.sock")
+	agentStateSock := filepath.Join(runtimeDir, "state.sock")
+	workspace, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	args := buildQEMUArgsWithContext(
 		imagePath,
 		kernelPath,
 		"qcow2",
@@ -824,36 +903,41 @@ func projectShowFirewallFromTemporaryVM() error {
 		userPubKey,
 		store.hostname(),
 		monitorSock,
+		store.agentStateDir(), workspace, store.serialLogPath(), workspaceSock, agentStateSock,
 	)
+	virtiofsdPath, err := ensureVirtiofsdWithWriter(false, io.Discard)
+	if err != nil {
+		return err
+	}
+	launchID, err := newVMLaunchID()
+	if err != nil {
+		return err
+	}
+	guestUID, guestGID, err := readGuestIdentityFromImage(imagePath)
+	if err != nil {
+		return err
+	}
+	spec := vmLaunchSpec{
+		Store: store.Path, LogRoot: store.Path, RuntimeDir: runtimeDir,
+		MonitorSock: monitorSock, WorkspaceSock: workspaceSock, AgentStateSock: agentStateSock,
+		Workspace: workspace, AgentState: store.agentStateDir(), Virtiofsd: virtiofsdPath,
+		SerialLog: store.serialLogPath(), SSHPort: sshPort, Mode: "attached", LaunchID: launchID,
+		GuestUID: guestUID, GuestGID: guestGID, QEMUPath: qemuPath, QEMUArgs: args[1:],
+	}
 
 	fmt.Fprintf(os.Stderr, ":: Project VM is not running; booting temporary VM to read firewall\n")
 	logInfo("starting temporary VM for firewall inspection", "image", imagePath, "port", sshPort, "monitor_sock", monitorSock)
 
-	serialLog, err := os.OpenFile(store.serialLogPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	launch, err := launchSupervisedVM(spec)
 	if err != nil {
-		return fmt.Errorf("open VM serial log: %w", err)
+		return err
 	}
-	defer func() { _ = serialLog.Close() }()
-
-	devNull, err := os.Open(os.DevNull)
-	if err != nil {
-		return fmt.Errorf("open %s: %w", os.DevNull, err)
+	defer func() { qmpQuit(monitorSock); returnErr = errors.Join(returnErr, launch.stop()) }()
+	if err := waitForVMGuestReady(launch, 60*time.Second); err != nil {
+		return err
 	}
-	defer func() { _ = devNull.Close() }()
-
-	cmd := exec.Command(qemuPath, args[1:]...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
-	cmd.Stdin = devNull
-	cmd.Stdout = serialLog
-	cmd.Stderr = serialLog
-	if err := cmd.Start(); err != nil {
-		_ = os.Remove(monitorSock)
-		return fmt.Errorf("start temporary qemu: %w", err)
-	}
-	defer stopTemporaryQEMU(cmd, monitorSock)
-
-	if !waitForSSH(sshPort, 60) {
-		return fmt.Errorf("temporary VM did not become reachable via SSH within 60s")
+	if err := launch.commit(); err != nil {
+		return err
 	}
 
 	active, ordered, err := projectFirewallEntriesFromVM(sshPort)
@@ -863,26 +947,12 @@ func projectShowFirewallFromTemporaryVM() error {
 	return projectShowFirewallEntries(active, ordered)
 }
 
-func stopTemporaryQEMU(cmd *exec.Cmd, monitorSock string) {
-	qmpQuit(monitorSock)
-	done := make(chan struct{})
-	go func() {
-		_ = cmd.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		<-done
-	}
-	_ = os.Remove(monitorSock)
+func syncAppliedSetupFirewallToVM(port string) error {
+	return syncAppliedSetupFirewallToVMContext(context.Background(), port)
 }
 
-func syncAppliedSetupFirewallToVM(port string) error {
-	if err := syncSavedProjectFirewallIPsToVM(port); err != nil {
+func syncAppliedSetupFirewallToVMContext(ctx context.Context, port string) error {
+	if err := syncSavedProjectFirewallIPsToVMContext(ctx, port); err != nil {
 		return err
 	}
 	groups, err := loadAppliedSetupFirewallGroups()
@@ -933,10 +1003,12 @@ func syncAppliedSetupFirewallToVM(port string) error {
 	if err != nil {
 		return err
 	}
-	if err := sshRunControlScript(port, rootKeyPath, firewallSyncCommands(syncGroups, staleGlobalEntries)); err != nil {
+	if err := sshRunControlScriptContext(ctx, port, rootKeyPath, firewallSyncCommands(syncGroups, staleGlobalEntries)); err != nil {
 		return fmt.Errorf("sync applied setup firewall to VM: %w", err)
 	}
-	if !waitForStableSSH(port, 30, 3) {
+	stableCtx, stableCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer stableCancel()
+	if !waitForStableSSHContext(stableCtx, port, 3) {
 		return fmt.Errorf("VM did not become stably reachable via SSH after syncing applied setup firewall")
 	}
 	if err := store.writeAppliedFirewallSyncMarker(digest); err != nil {

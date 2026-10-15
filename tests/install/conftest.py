@@ -96,7 +96,7 @@ def container_factory():
     _require_prerequisites()
     containers = []
 
-    def _factory(image, standalone=False):
+    def _factory(image, standalone=False, namespace_capable=True):
         runtime_args = []
         if standalone:
             artifact = Path(
@@ -119,6 +119,12 @@ def container_factory():
                 "--device", "/dev/kvm",
                 "--group-add", "keep-groups",
             ]
+            if namespace_capable:
+                runtime_args.extend([
+                    "--security-opt", "unmask=ALL",
+                    "--cap-add", "SYS_ADMIN",
+                    "--cap-add", "MKNOD",
+                ])
             mount = f"{artifact}:/dist/zaigr:ro"
             package_version, package_build = "", ""
         else:

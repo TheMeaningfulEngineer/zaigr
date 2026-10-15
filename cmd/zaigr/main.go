@@ -46,6 +46,12 @@ func newRootCommand() *cobra.Command {
 	rootCmd.SetOut(os.Stdout)
 	rootCmd.SetErr(os.Stderr)
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		projectSandboxContext = false
+		for scope := cmd; scope.Parent() != nil; scope = scope.Parent() {
+			if scope.Name() == "project" || scope.Name() == "shell" || (scope.Name() == "projects" && scope.Parent().Name() == "global") {
+				projectSandboxContext = true
+			}
+		}
 		return configureLogging(logLevel, verboseCount, cmd.Flags().Changed("log-level"))
 	}
 	rootCmd.Version = version
@@ -57,6 +63,7 @@ func newRootCommand() *cobra.Command {
 	rootCmd.AddCommand(newProjectCommand())
 	rootCmd.AddCommand(newGlobalCommand())
 	rootCmd.AddCommand(newMiscCommand(rootCmd))
+	rootCmd.AddCommand(newVMSupervisorCommand())
 
 	return rootCmd
 }

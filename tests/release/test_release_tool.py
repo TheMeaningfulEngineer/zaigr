@@ -57,7 +57,7 @@ def _fake_script(path, body):
     return path
 
 
-def _write_fake_candidate_primitives(repo, tmp_path, go_body):
+def _write_fake_candidate_primitives(repo, tmp_path, go_body, virtiofsd_body=None):
     build_kernel = _fake_script(
         repo / "vm_prep" / "build-kernel.sh",
         "printf 'build-kernel\\n' >> \"$PWD/release/state/commands.log\"\n",
@@ -66,7 +66,11 @@ def _write_fake_candidate_primitives(repo, tmp_path, go_body):
         repo / "vm_prep" / "build-base-rootfs.sh",
         "printf 'build-base-rootfs\\n' >> \"$PWD/release/state/commands.log\"\n",
     )
-    out, err, rc = run(["git", "add", build_kernel, build_rootfs], cwd=repo, timeout=10)
+    build_virtiofsd = _fake_script(
+        repo / "vm_prep" / "build-virtiofsd.sh",
+        virtiofsd_body or "printf 'build-virtiofsd\\n' >> \"$PWD/release/state/commands.log\"\n",
+    )
+    out, err, rc = run(["git", "add", build_kernel, build_rootfs, build_virtiofsd], cwd=repo, timeout=10)
     assert rc == 0, err_msg(out, err)
     out, err, rc = run(["git", "commit", "-m", "test: fake release primitives"], cwd=repo, timeout=10)
     assert rc == 0, err_msg(out, err)
@@ -471,6 +475,36 @@ exit 42
     assert f"{repo}$ go build" in transcript
     assert "candidate command started" in transcript
     assert "git-cliff --config release/cliff.toml --tag v1.0.0 --output release/RELEASE_NOTES.md" not in transcript
+
+
+def test_candidate_stops_on_virtiofsd_build_failure_and_keeps_transcript(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _write_fake_candidate_primitives(
+        repo,
+        tmp_path,
+        "printf 'go %s\\n' \"$*\" >> \"$PWD/release/state/commands.log\"\n",
+        virtiofsd_body="printf 'build-virtiofsd\\n' >> \"$PWD/release/state/commands.log\"\nprintf 'daemon build failed\\n' >&2\nexit 33\n",
+    )
+
+    out, err, rc = run(
+        [RELEASE, "candidate", "1.0.0"],
+        cwd=repo,
+        env=_release_env(tmp_path),
+        input="y\n",
+        timeout=10,
+    )
+
+    assert rc != 0
+    assert "command failed with exit code 33" in out + err
+    candidate = repo / "release/state/candidates/1.0.0-1"
+    release = json.loads((candidate / "release.json").read_text(encoding="utf-8"))
+    assert release["status"] == "failed"
+    assert release["failure"]["command_display"] == "Build virtiofsd"
+    transcript = candidate / "transcripts/candidate.log"
+    assert Path(release["failure"]["transcript_path"]) == transcript
+    assert "daemon build failed" in transcript.read_text(encoding="utf-8")
+    assert "go build" not in (repo / "release/state/commands.log").read_text(encoding="utf-8")
 
 
 def test_candidate_after_failed_candidate_reports_failure_and_creates_next_build(tmp_path):
@@ -1217,6 +1251,7 @@ chmod +x zaigr
     assert ":: Checking release tools" in err
     assert ":: Build base kernel" in err
     assert ":: Build base rootfs" in err
+    assert ":: Build virtiofsd" in err
     assert ":: Build zaigr binary" in err
     assert ":: Generate release notes" in err
     assert ":: Build Debian package" in err
@@ -1230,7 +1265,11 @@ chmod +x zaigr
     transcript = (candidate / "transcripts" / "candidate.log").read_text(encoding="utf-8")
     assert ":: Checking release tools" in transcript
     assert f"{repo}$ vm_prep/build-kernel.sh" in transcript
+    assert f"{repo}$ vm_prep/build-virtiofsd.sh" in transcript
     assert f"{repo}$ go build" in transcript
+    assert transcript.index("vm_prep/build-virtiofsd.sh") < transcript.index("$ go build")
+    commands = (repo / "release/state/commands.log").read_text(encoding="utf-8")
+    assert commands.index("build-virtiofsd") < commands.index("go build")
     assert "-X main.version=1.0.0" in transcript
     assert "git-cliff --config release/cliff.toml --tag v1.0.0 --output release/RELEASE_NOTES.md" in transcript
     assert ":: Writing checksums" in transcript

@@ -88,7 +88,7 @@ def test_project_vm_start_creates_project_store_and_first_image(project):
     assert len(_project_images(project)) == 1
 
     stdout = run(f"{zaigr} project vm show-config")
-    assert stdout.strip().splitlines() == ["cpu=1", "ram=512MB"]
+    assert stdout.strip().splitlines() == ["cpu=1", "ram=512MB", "virtiofs-sandbox=namespace"]
 
 
 def test_project_vm_start_waits_for_minimal_systemd_runtime(project):
@@ -1297,7 +1297,7 @@ printf 'setup-run-resources-ok\\n'
     assert "setup-run-resources-ok" in stdout
 
     shown = run(f"{zaigr} project vm show-config")
-    assert shown.strip().splitlines() == ["cpu=2", "ram=768MB"]
+    assert shown.strip().splitlines() == ["cpu=2", "ram=768MB", "virtiofs-sandbox=namespace"]
 
     run(f"{zaigr} project vm start", timeout=120)
     boot_cpu = run(f"{zaigr} project vm exec -- nproc")
@@ -2514,14 +2514,13 @@ def test_zaigr_dev_preset_depends_on_every_builtin_setup(project, tmp_path):
         "docker",
         "go",
         "k3s",
-        "kernel-mmdebstrap",
         "mistral",
         "nodejs",
         "opencode",
         "podman",
         "python",
-        "release-tools",
         "yocto-kas",
+        "zaigr-dev",
     ]:
         assert f"  {setup}\n" in preset_show
 
@@ -2723,7 +2722,7 @@ def test_project_vm_start_starts_vm_without_shell_attach(project):
         f"{project.zaigr_bin} project vm show-config",
         timeout=10,
     )
-    assert shown.strip().splitlines() == ["cpu=1", "ram=512MB"]
+    assert shown.strip().splitlines() == ["cpu=1", "ram=512MB", "virtiofs-sandbox=namespace"]
 
 
 def test_project_vm_set_config_updates_defaults(project):
@@ -2754,7 +2753,7 @@ def test_project_vm_set_config_updates_defaults(project):
         f"{zaigr} project vm show-config",
         timeout=10,
     )
-    assert shown.strip().splitlines() == ["cpu=2", "ram=768MB"]
+    assert shown.strip().splitlines() == ["cpu=2", "ram=768MB", "virtiofs-sandbox=namespace"]
 
 
 def test_running_vm_rejects_resource_overrides(project):

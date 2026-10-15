@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
@@ -151,6 +152,58 @@ func ensureKernelWithWriter(noCache bool, out io.Writer) (string, error) {
 	if err := os.WriteFile(path, embeddedKernel, 0644); err != nil {
 		return "", err
 	}
+	return path, nil
+}
+
+func virtiofsdVersion() string { return strings.TrimSpace(embeddedVirtiofsdVersion) }
+
+func ensureVirtiofsdWithWriter(noCache bool, out io.Writer) (string, error) {
+	digest := sha256.Sum256(embeddedVirtiofsd)
+	path := filepath.Join(zaigDir(), fmt.Sprintf("virtiofsd-%s-%x", virtiofsdVersion(), digest))
+	if err := os.MkdirAll(zaigDir(), 0755); err != nil {
+		return "", fmt.Errorf("create virtiofsd cache: %w", err)
+	}
+	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return "", fmt.Errorf("open virtiofsd extraction lock: %w", err)
+	}
+	defer func() { _ = lock.Close() }()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return "", fmt.Errorf("lock virtiofsd extraction: %w", err)
+	}
+	if !noCache {
+		if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() && info.Mode().Perm() == 0755 {
+			if cached, err := os.ReadFile(path); err == nil && sha256.Sum256(cached) == digest {
+				_, _ = fmt.Fprintf(out, ":: Virtiofsd cached at %s\n", path)
+				return path, nil
+			}
+		}
+	}
+	tmp, err := os.CreateTemp(zaigDir(), ".virtiofsd-*")
+	if err != nil {
+		return "", fmt.Errorf("create temporary virtiofsd: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+	if _, err = tmp.Write(embeddedVirtiofsd); err != nil {
+		_ = tmp.Close()
+		return "", fmt.Errorf("write virtiofsd: %w", err)
+	}
+	if err = tmp.Chmod(0755); err != nil {
+		_ = tmp.Close()
+		return "", fmt.Errorf("chmod virtiofsd: %w", err)
+	}
+	if err = tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return "", fmt.Errorf("sync virtiofsd: %w", err)
+	}
+	if err = tmp.Close(); err != nil {
+		return "", fmt.Errorf("close virtiofsd: %w", err)
+	}
+	if err = os.Rename(tmpPath, path); err != nil {
+		return "", fmt.Errorf("publish virtiofsd: %w", err)
+	}
+	_, _ = fmt.Fprintf(out, ":: Virtiofsd extracted to %s\n", path)
 	return path, nil
 }
 

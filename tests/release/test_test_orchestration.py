@@ -130,7 +130,7 @@ def test_all_builds_once_then_uses_that_binary_for_vm_suites(gate_repo):
     env["EXPECT_OVERLAP"] = "1"
     prep = repo / "vm_prep"
     prep.mkdir()
-    for script in ("build-kernel.sh", "build-base-rootfs.sh"):
+    for script in ("build-kernel.sh", "build-base-rootfs.sh", "build-virtiofsd.sh"):
         path = prep / script
         path.write_text("#!/bin/sh\nexit 0\n")
         path.chmod(0o755)

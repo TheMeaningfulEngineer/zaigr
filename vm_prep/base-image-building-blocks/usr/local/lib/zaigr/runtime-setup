@@ -95,10 +95,10 @@ log "clock set from host epoch"
 
 log "mounting workspace and agent state"
 mkdir -p /home/user/workspace
-ensure_mount /home/user/workspace -t 9p -o trans=virtio,version=9p2000.L,cache=mmap workspace
+ensure_mount /home/user/workspace -t virtiofs workspace
 
 mkdir -p /home/user/.zaigr-agent-state
-ensure_mount /home/user/.zaigr-agent-state -t 9p -o trans=virtio,version=9p2000.L,cache=mmap zaigr_agent_state
+ensure_mount /home/user/.zaigr-agent-state -t virtiofs zaigr_agent_state
 chmod 700 /home/user/.zaigr-agent-state || true
 
 log "configuring QEMU user networking"

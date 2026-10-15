@@ -58,3 +58,41 @@ an active stream; this finding concerns domain removal specifically.
 **Workaround:** If access must stop immediately, stop the VM with
 `zaigr project vm stop`. Do not treat a successful removal or the domain's absence
 from the firewall list as confirmation that requests are already blocked.
+
+## Stale runtime socket after rapid stop/start cycles
+
+Observed in version `0.2.1` during automated chaos testing on 2026-10-13.
+
+After three consecutive `project vm start` / `project vm stop` cycles on the
+same project, one stale file remained under the project's runtime directory
+(`~/.zaigr/projects/<hash>/runtime/`). The specific artifact was not
+identified in the sample (likely the QMP monitor socket or SSH-port marker).
+The behavior was not deterministic across all three cycles.
+
+The next `project vm start` after the leak succeeded, but
+`detectRunningProjectVM` has a stale-socket recovery path specifically for
+this condition — the leak itself is latent and only observable by inspecting
+the runtime directory between cycles.
+
+**Workaround:** none required for correctness; subsequent starts recover.
+If `project status` reports an unexpected state after rapid cycling, run
+`project vm stop` once more before the next start.
+
+## Project rebuild does not block or discard a pending setup capture
+
+Observed in version `0.2.1` during automated chaos testing on 2026-10-13.
+This finding has not been reproduced manually and benefits from
+confirmation.
+
+Reported behavior: when a setup capture is pending (started with
+`project setup capture start` but not yet accepted or discarded) and
+`project rebuild` runs, the rebuild proceeds without warning and the
+pending capture state is cleared.
+
+Expected behavior: the capture lifecycle should either block the rebuild
+until it is explicitly accepted or discarded, or the rebuild should warn
+that the pending capture will be lost before clearing it.
+
+**Workaround:** before running `project rebuild`, explicitly run
+`project setup capture accept` or `project setup capture discard` so that
+captured commands are either saved or intentionally dropped.
