@@ -2,8 +2,8 @@
 
 import json
 import re
+import shlex
 import time
-from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
 import pexpect
@@ -18,7 +18,9 @@ def _checked_run(cmd, **kwargs):
     return stdout
 
 
-@pytest.mark.timeout(1800)
+# This lifecycle has three independent setup workflows capped at 1200 seconds
+# each; leave bounded overhead for session persistence and interactive checks.
+@pytest.mark.timeout(4200)
 def test_opencode_installs_launches_and_preserves_sessions(project, setup_factory):
     checked = partial(_checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
@@ -74,13 +76,37 @@ def test_opencode_installs_launches_and_preserves_sessions(project, setup_factor
             assert len(re.findall(r"\b401\b", response)) == 2, response
 
         # Concurrent API writers share the same database with the two TUIs.
-        with ThreadPoolExecutor(max_workers=2) as workers:
-            writes = [workers.submit(
-                checked,
-                f"{zaigr} project vm exec -- {opencode_env} opencode api --standalone "
-                f"session.create --data '{{\"title\":\"Zaigr persistence test {index}\"}}'",
-            ) for index in range(2)]
-            session_ids = [json.loads(write.result())["data"]["id"] for write in writes]
+        api_commands = [
+            f"{opencode_env} opencode api --standalone session.create --data "
+            f"'{{\"title\":\"Zaigr persistence test {index}\"}}'"
+            for index in range(2)
+        ]
+        # Start both guest API requests through one project command to avoid
+        # competing project firewall reconciliation.
+        result_paths = [
+            "/tmp/zaigr-opencode-session-create-0.json",
+            "/tmp/zaigr-opencode-session-create-1.json",
+        ]
+        checked(
+            f"{zaigr} project vm exec -- rm -f {' '.join(result_paths)}"
+        )
+        concurrent_writes = "\n".join([
+            "set -eu",
+            f"{api_commands[0]} > {result_paths[0]} &", "pid0=$!",
+            f"{api_commands[1]} > {result_paths[1]} &", "pid1=$!",
+            "status0=0", 'wait "$pid0" || status0=$?',
+            "status1=0", 'wait "$pid1" || status1=$?',
+            'test "$status0" -eq 0',
+            'test "$status1" -eq 0',
+        ])
+        checked(
+            f"{zaigr} project vm exec -- bash -lc {shlex.quote(concurrent_writes)}"
+        )
+        session_ids = []
+        for result_path in result_paths:
+            result = checked(f"{zaigr} project vm exec -- cat {result_path}")
+            session_ids.append(json.loads(result)["data"]["id"])
+        checked(f"{zaigr} project vm exec -- rm -f {' '.join(result_paths)}")
         assert len(set(session_ids)) == 2
         shell.send("/exit")
         shell.expect("Exit the app")
@@ -125,9 +151,12 @@ def test_opencode_installs_launches_and_preserves_sessions(project, setup_factor
     )
     checked(f"{zaigr} project vm stop", timeout=60)
     checked(f"{zaigr} project vm start", timeout=120)
+    # --standalone starts a fresh server per invocation; persistence checks
+    # need room for cold startup under host contention.
     sessions = checked(
         f"{zaigr} project vm exec -- {opencode_env} "
-        "opencode session list --standalone --format json"
+        "opencode session list --standalone --format json",
+        timeout=120,
     )
     assert all(session_id in sessions for session_id in session_ids)
     assert "Zaigr persistence test" in sessions
@@ -151,7 +180,8 @@ def test_opencode_installs_launches_and_preserves_sessions(project, setup_factor
     checked(f"{zaigr} project vm start", timeout=120)
     sessions = checked(
         f"{zaigr} project vm exec -- {opencode_env} "
-        "opencode session list --standalone --format json"
+        "opencode session list --standalone --format json",
+        timeout=120,
     )
     assert all(session_id in sessions for session_id in session_ids)
     assert json.loads(checked(
@@ -193,7 +223,8 @@ def test_opencode_installs_launches_and_preserves_sessions(project, setup_factor
     assert config.with_suffix(".jsonc").read_text() == user_config
     sessions = checked(
         f"{zaigr} project vm exec -- {opencode_env} "
-        "opencode session list --standalone --format json"
+        "opencode session list --standalone --format json",
+        timeout=120,
     )
     assert all(session_id in sessions for session_id in session_ids)
     assert json.loads(checked(

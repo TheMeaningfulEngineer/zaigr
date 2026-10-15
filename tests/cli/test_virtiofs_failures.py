@@ -222,6 +222,11 @@ def test_daemon_startup_failure_cleans_started_children(project, test_root, fail
     zaigr = project.zaigr_bin
     run([zaigr, "project", "vm", "start"], input="y\n", timeout=180)
     run([zaigr, "project", "vm", "stop"], timeout=60)
+    if failure.startswith("workspace-"):
+        # Namespace selection revalidates and restores the daemon cache after
+        # the guest identity probe. The unsafe-mode test path skips that
+        # extraction so this injected daemon failure reaches child startup.
+        run([zaigr, "project", "vm", "set-config", "--virtiofs-sandbox", "none"])
     caches = [p for p in (project.home / ".zaigr").glob("virtiofsd-*") if p.is_file() and not p.name.endswith(".lock")]
     assert len(caches) == 1, caches
     cache = caches[0]
