@@ -24,7 +24,7 @@ type globalBaseManifest struct {
 	RuntimeVersion string              `json:"runtime_version"`
 	Revision       string              `json:"revision"`
 	SourceImage    string              `json:"source_image"`
-	UserUID        int                 `json:"user_uid,omitempty"`
+	UserUID        int                 `json:"user_uid,omitempty"` // Retained for backward compatibility only.
 	Applied        []appliedSetup      `json:"applied_setups,omitempty"`
 	Firewall       []string            `json:"firewall_entries,omitempty"`
 	SetupFirewall  map[string][]string `json:"setup_firewall,omitempty"`
@@ -150,10 +150,9 @@ func readGlobalBaseManifest() (globalBaseManifest, bool, error) {
 		return globalBaseManifest{}, false, fmt.Errorf("invalid global base image path in manifest; run 'zaigr global base-image reset' to recover")
 	}
 	if manifest.RuntimeVersion != baseRootfsVersion() {
-		// This is a disposable preparation of the bundled factory image, not
-		// a user customization. Select the new factory runtime and let first
-		// use prepare it again. Keep the old revision for pinned projects.
-		if manifest.UserUID != 0 && len(manifest.Applied) == 0 {
+		// This factory-derived base has no recorded setups. Select the current
+		// factory runtime and keep the old revision available to pinned projects.
+		if len(manifest.Applied) == 0 {
 			return globalBaseManifest{}, false, nil
 		}
 		return manifest, true, fmt.Errorf("custom global base image runtime %s is incompatible with bundled runtime %s; run 'zaigr global base-image reset' and reapply setups", manifest.RuntimeVersion, baseRootfsVersion())
@@ -175,7 +174,7 @@ func pathWithin(root, path string) bool {
 }
 
 func resolveCurrentBaseSelection(disk, ram, cpu string) (baseImageSelection, error) {
-	manifest, customized, err := ensureHostUserBase(ram, cpu)
+	manifest, customized, err := readGlobalBaseManifest()
 	if err != nil {
 		return baseImageSelection{}, err
 	}
@@ -364,7 +363,7 @@ func cmdGlobalBaseImageStatus() error {
 		}
 		return err
 	}
-	if !customized || (manifest.UserUID != 0 && len(manifest.Applied) == 0) {
+	if !customized || len(manifest.Applied) == 0 {
 		fmt.Printf("mode: factory\nruntime: %s\nsetups: (none)\n", baseRootfsVersion())
 		return nil
 	}
@@ -423,7 +422,7 @@ func cmdGlobalBaseImageSetupRun(names []string, ram, cpu string, force bool) err
 	if err := cleanupGlobalBaseStaging(); err != nil {
 		return err
 	}
-	manifest, customized, err := ensureHostUserBaseLocked(ramValue, cpuValue)
+	manifest, customized, err := readGlobalBaseManifest()
 	if err != nil {
 		return err
 	}
@@ -457,7 +456,7 @@ func cmdGlobalBaseImageSetupRun(names []string, ram, cpu string, force bool) err
 	if err := confirmSetupAptCommands(definitions, "global base image setup"); err != nil {
 		return err
 	}
-	return buildAndPublishGlobalBase(manifest, customized, definitions, applied, firewall, ramValue, cpuValue, 0)
+	return buildAndPublishGlobalBase(manifest, customized, definitions, applied, firewall, ramValue, cpuValue)
 }
 
 func cleanupGlobalBaseStaging() error {
@@ -511,7 +510,7 @@ func resolveGlobalBuildResources(ramFlag, cpuFlag string) (string, string, error
 	return ram, cpu, nil
 }
 
-func buildAndPublishGlobalBase(previous globalBaseManifest, customized bool, definitions []setupDefinition, applied []appliedSetup, firewall []string, ram, cpu string, userUID int) (returnErr error) {
+func buildAndPublishGlobalBase(previous globalBaseManifest, customized bool, definitions []setupDefinition, applied []appliedSetup, firewall []string, ram, cpu string) (returnErr error) {
 	setupFirewall := make(map[string][]string, len(previous.SetupFirewall)+len(definitions))
 	for name, entries := range previous.SetupFirewall {
 		setupFirewall[name] = append([]string(nil), entries...)
@@ -585,23 +584,12 @@ func buildAndPublishGlobalBase(previous globalBaseManifest, customized bool, def
 		}
 		scripts = append(scripts, path)
 	}
-	if userUID != 0 {
-		path := filepath.Join(staging, "base-prepare.script")
-		payload := fmt.Sprintf("export ZAIGR_MIGRATE_UID=%d\n", userUID) + migrateUserUIDScript
-		if err := os.WriteFile(path, []byte(payload), 0600); err != nil {
-			return err
-		}
-		scripts = append(scripts, path)
-	}
 	port, err := allocateEphemeralSSHPort()
 	if err != nil {
 		return err
 	}
 	if err := applyStepsViaSSHInContext(working, scripts, ram, cpu, port, true, agentState, workspace, runtimeStore, globalBaseRoot()); err != nil {
 		name := guestSetupExecutionStep(err)
-		if userUID != 0 && name == "base-prepare.script" {
-			return fmt.Errorf("automatic base image preparation failed; global base image was not changed: %w", err)
-		}
 		for i, path := range scripts {
 			if filepath.Base(path) == name {
 				if i >= len(definitions) {
@@ -640,9 +628,6 @@ func buildAndPublishGlobalBase(previous globalBaseManifest, customized bool, def
 	firewall = prospectiveFirewall
 	next := globalBaseManifest{Schema: globalBaseManifestSchema, RuntimeVersion: baseRootfsVersion(), Revision: revision, SourceImage: publishedSource, Applied: applied, Firewall: firewall, SetupFirewall: setupFirewall, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
 	next.UserUID = previous.UserUID
-	if userUID != 0 {
-		next.UserUID = userUID
-	}
 	body, err := json.MarshalIndent(next, "", "  ")
 	if err != nil {
 		return err
@@ -650,9 +635,7 @@ func buildAndPublishGlobalBase(previous globalBaseManifest, customized bool, def
 	if err := writeFileAtomically(globalBaseManifestPath(), append(body, '\n'), 0644); err != nil {
 		return fmt.Errorf("publish global base image selection: %w", err)
 	}
-	if userUID == 0 {
-		fmt.Printf(":: Published customized global base image revision %s\n", revision)
-	}
+	fmt.Printf(":: Published customized global base image revision %s\n", revision)
 	return nil
 }
 

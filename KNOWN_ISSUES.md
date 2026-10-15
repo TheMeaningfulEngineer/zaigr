@@ -1,20 +1,18 @@
 # Known issues
 
-## Host and guest user IDs can differ on shared files
+## Secondary guest accounts and host-side UID inspection are not mapped
 
-The factory guest user has UID `1000`. When the host user has a different UID,
-the guest user can be unable to write to host-owned workspace files, even when
-the host user can access them normally.
+Virtiofs translates ownership on the shared workspace and agent-state mounts
+between the invoking host UID/GID and the selected guest user's UID/GID. The
+guest user can read and write host-owned shared files when the numeric host and
+guest IDs differ. Zaigr reads the guest identity from the selected image; it
+does not rewrite the image or ask for a rebuild to match host IDs.
 
-**Automatic workaround (implemented):** For non-root host accounts, Zaigr
-automatically prepares a factory-derived base image with the guest user's UID
-matched to the host user's UID when needed. A warning explains the extra
-preparation time; no additional command or configuration is required.
-
-Existing projects and legacy custom base images are not silently migrated.
-The workaround gives other host UIDs the same shared-file usability as UID
-`1000`; it does not provide independent guest root or service-user ownership
-mapping on shared host files.
+The translation covers the selected guest user and guest root. A service or
+secondary guest account still has no corresponding host identity on shared
+mounts. Host tools that inspect guest-disk files outside virtiofs, such as
+recovery tools that read a qcow2 image directly, also see the image's baked-in
+numeric IDs rather than a translated host identity.
 
 ## Removing a domain may not block access immediately
 
@@ -33,6 +31,29 @@ an active stream; this finding concerns domain removal specifically.
 **Workaround:** If access must stop immediately, stop the VM with
 `zaigr project vm stop`. Do not treat a successful removal or the domain's absence
 from the firewall list as confirmation that requests are already blocked.
+
+## Exact-IP permission removal allowed a request
+
+Intermittently observed in candidate `0.2.1-5` on 2026-10-15 by
+`test_live_mutations_and_vm_reuse_never_restore_removed_permissions`.
+During a full CLI run, removal of an exact-IP permission reported success and
+the project firewall status no longer listed the IP, but a subsequent fresh
+guest HTTP request to that IP succeeded and returned the test endpoint token.
+This happened once. Ten focused diagnostic repeats, a 100-turn stress run, and
+the restored three-turn test passed; those passes do not prove the issue is
+fixed. The root cause is unknown. No connection between this event and the
+separate domain-removal behavior above has been established, and no relationship
+to the UID cleanup has been established.
+
+Evidence: `/var/tmp/zaigr-uid-cleanup-evidence/repair/cli.log` and
+`cli.xml`; follow-up results are in `cli-remaining.log` and `cli-remaining.xml`,
+and focused records are in `cli-ip-chaos-diagnostic-1..10.log/xml`,
+`cli-ip-chaos-100turn-logs-redirected.log/xml`, and
+`cli-ip-chaos-final-3turn.log/xml`.
+
+**Workaround:** Stop the project VM if access must be cut immediately. This
+workaround does not assert that a later restart guarantees correct enforcement;
+verify firewall behavior before relying on access removal.
 
 ## Stale runtime socket after rapid stop/start cycles
 
