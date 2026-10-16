@@ -1,0 +1,37 @@
+#!/bin/bash
+set -euo pipefail
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export DEBIAN_FRONTEND=noninteractive
+
+# Pin the immutable official release object from the vendor's linux_amd64
+# manifest (SHA-512 fetched 2026-10-16):
+# https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_amd64.json
+# Update the release and digest together; do not follow latest. The
+# bucket-specific GCS URL is the documented virtual-hosted form.
+release="${ANTIGRAVITY_CLI_RELEASE:-1.4.0-5281842794987520}"
+expected_sha512="${ANTIGRAVITY_CLI_SHA512:-6c4b298c2a69b6bd0f58567031cc56d8097a32be54c4b633aa80ad395871b389618ab3860d4ba0a12599831b8226b51b03e258ee2ec7fae105a45b8e0fce2188}"
+version="${release%%-*}"
+
+echo ":: Installing Antigravity CLI ${version} (${release}) ..."
+apt-get update -qq
+apt-get install -y --no-install-recommends ca-certificates curl tar
+
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' EXIT
+archive="$tmpdir/agy.tar.gz"
+url="https://antigravity-public.storage.googleapis.com/antigravity-cli/${release}/linux-x64/cli_linux_x64.tar.gz"
+
+curl --fail --show-error --silent --location \
+  --connect-timeout 10 --max-time 600 \
+  "$url" -o "$archive"
+printf '%s  %s\n' "$expected_sha512" "$archive" | sha512sum --check
+tar -xzf "$archive" -C "$tmpdir" antigravity
+
+installed_version="$("$tmpdir/antigravity" --version)"
+if [[ "$installed_version" != "$version" ]]; then
+  echo "Downloaded Antigravity CLI reports ${installed_version}; expected ${version}" >&2
+  exit 1
+fi
+install -m 0755 "$tmpdir/antigravity" /usr/local/bin/agy
+echo ":: Installed Antigravity CLI ${installed_version}"

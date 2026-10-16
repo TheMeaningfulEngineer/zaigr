@@ -2509,6 +2509,7 @@ def test_zaigr_dev_preset_depends_on_every_builtin_setup(project, tmp_path):
     assert "name: zaigr-dev" in preset_show
     assert "setup dependencies:" in preset_show
     for setup in [
+        "antigravity",
         "claude",
         "codex",
         "docker",

@@ -158,6 +158,15 @@ Use `/connect` and `/models` inside OpenCode to choose your provider and model.
 See the [OpenCode guide](docs/opencode.md) for European hosting options, saved
 state, and updates.
 
+Or, for Google's Antigravity CLI:
+
+```sh
+zaigr shell --preset antigravity
+```
+
+The preset keeps Antigravity's private state on the project's agent-state share
+and automatically approves tool requests inside the VM.
+
 The first run initializes this directory as a
 [project](docs/terminology.md#project) for the following examples.
 

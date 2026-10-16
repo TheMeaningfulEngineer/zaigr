@@ -1,0 +1,17 @@
+#!/bin/bash
+set -eu
+
+AGENT_STATE="/home/user/.zaigr-agent-state"
+if ! mountpoint -q "$AGENT_STATE"; then
+	echo "agent state mount not available: $AGENT_STATE" >&2
+	exit 1
+fi
+
+export HOME="$AGENT_STATE/antigravity"
+export XDG_CONFIG_HOME="$HOME/.config"
+export XDG_CACHE_HOME="$HOME/.cache"
+export XDG_DATA_HOME="$HOME/.local/share"
+export XDG_STATE_HOME="$HOME/.local/state"
+mkdir -p "$HOME"
+
+exec agy --dangerously-skip-permissions "$@"

@@ -137,3 +137,36 @@ def test_mistral_preset_installs_vibe_and_launches(project):
     assert "mistral" in output
     assert not (project.cwd / ".vibe").exists()
     assert mistral_state.is_dir()
+
+
+@pytest.mark.timeout(1200)
+def test_antigravity_preset_installs_agy_and_launches(project):
+    """The builtin `antigravity` preset installs and launches Google's CLI."""
+    run = partial(_checked_run, cwd=project.cwd, env=project.env)
+    zaigr = project.zaigr_bin
+    antigravity_state = project.store_dir / "agent-state" / "antigravity"
+    shell = spawn_interactive(
+        f"{zaigr} shell --preset antigravity --ram 2048 --cpu 2",
+        cwd=project.cwd,
+        env=project.env,
+        timeout=1200,
+    )
+    try:
+        shell.expect(r"Initialize project and continue\? \[y/N\]")
+        shell.sendline("y")
+        shell.expect_exact("Antigravity CLI", timeout=1200)
+        shell.expect_exact("Select login method:", timeout=1200)
+    finally:
+        shell.close(force=True)
+
+    status = run(f"{zaigr} project status", timeout=10)
+    assert "applied (1):" in status
+    assert "antigravity" in status
+
+    applied = run(f"{zaigr} project setup list --applied", timeout=10)
+    assert "applied (1):" in applied
+    assert "antigravity" in applied
+    assert "1.4.0" in run(f"{zaigr} project vm exec -- agy --version", timeout=10)
+    assert antigravity_state.is_dir()
+    assert (antigravity_state / ".gemini").is_dir()
+    assert not (project.cwd / ".gemini").exists()
