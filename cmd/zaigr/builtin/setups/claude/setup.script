@@ -4,9 +4,55 @@ set -euo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export DEBIAN_FRONTEND=noninteractive
 
+apt_get() {
+    apt-get -o Acquire::Retries=2 \
+        -o Acquire::http::Timeout=20 \
+        -o Acquire::https::Timeout=20 "$@"
+}
+
+node_major="${ZAIGR_NODE_MAJOR:-24}"
+
+apt_get update -qq
+apt_get install -y --no-install-recommends ca-certificates curl gpg
+
+install -m 0755 -d /etc/apt/keyrings
+key_tmp="$(mktemp /etc/apt/keyrings/.nodesource.XXXXXX)"
+trap 'rm -f "$key_tmp"' EXIT
+curl -fsSL --connect-timeout 5 --max-time 30 \
+    https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+    | gpg --batch --yes --dearmor -o "$key_tmp"
+chmod 0644 "$key_tmp"
+mv "$key_tmp" /etc/apt/keyrings/nodesource.gpg
+
+cat > /etc/apt/sources.list.d/nodesource.sources <<EOF
+Types: deb
+URIs: https://deb.nodesource.com/node_${node_major}.x
+Suites: nodistro
+Components: main
+Signed-By: /etc/apt/keyrings/nodesource.gpg
+EOF
+
+cat > /etc/apt/preferences.d/nodesource <<EOF
+Package: nodejs
+Pin: origin deb.nodesource.com
+Pin-Priority: 600
+EOF
+
+apt_get update -qq --error-on=any
+
 echo ":: Installing Claude Code ..."
-apt-get update -qq
-apt-get install -y --no-install-recommends nodejs npm python3-yaml
+apt_get install -y --no-install-recommends nodejs python3-yaml
+installed_major="$(node --version | sed -E 's/^v([0-9]+)\..*/\1/')"
+if [ "$installed_major" != "$node_major" ]; then
+    echo "Installed Node major ${installed_major}; expected ${node_major}" >&2
+    echo "Hint: if a higher Node major is already installed, remove it before rerunning" >&2
+    exit 1
+fi
+installed_version="$(dpkg-query -W -f='${Version}' nodejs)"
+if ! printf '%s\n' "$installed_version" | grep -q nodesource; then
+    echo "Installed nodejs ${installed_version} is not the NodeSource package" >&2
+    exit 1
+fi
 
 claude_version="${CLAUDE_CODE_VERSION:-2.1.140}"
-npm install -g "@anthropic-ai/claude-code@${claude_version}"
+npm install -g --prefix /usr/local "@anthropic-ai/claude-code@${claude_version}"
