@@ -54,6 +54,6 @@ echo ":: Installing kas ..."
 export PIPX_HOME=/opt/pipx
 export PIPX_BIN_DIR=/usr/local/bin
 export PIP_NO_CACHE_DIR=1
-pipx install "kas==${KAS_VERSION:-5.3}"
+pipx install --force kas
 
 kas --version

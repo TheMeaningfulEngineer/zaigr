@@ -124,8 +124,7 @@ EOF
 
 /usr/local/lib/zaigr/k3s-internal-network
 
-helm_version="${HELM_VERSION:-v3.20.2}"
-go_version="${GO_VERSION:-1.25.11}"
+go_version="${GO_VERSION:-1.27.2}"
 mkdir -p /mnt
 helm_tmp="$(mktemp -d /mnt/zaigr-helm.XXXXXX)"
 cleanup_helm_tmp() {
@@ -146,7 +145,7 @@ env \
     GOTMPDIR="${helm_tmp}/gotmp" \
     GOTOOLCHAIN=local \
     GOPROXY=https://proxy.golang.org,direct \
-    go install "helm.sh/helm/v3/cmd/helm@${helm_version}"
+    go install helm.sh/helm/v3/cmd/helm@latest
 helm version --short
 cleanup_helm_tmp
 trap - EXIT

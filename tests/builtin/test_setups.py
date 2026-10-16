@@ -272,7 +272,7 @@ def test_all_builtin_setups_coexist(project):
         f"{zaigr} project vm exec -- kas --version",
         timeout=10,
     )
-    assert "kas 5.3" in output
+    assert "kas " in output
 
     yocto_tools_script = """
 set -eu

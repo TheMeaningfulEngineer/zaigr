@@ -130,7 +130,7 @@ def test_opencode_installs_launches_and_preserves_sessions(project, setup_factor
 
     applied = checked(f"{zaigr} project setup list --applied")
     assert "opencode" in applied
-    assert "opencode v2.0.26" in checked(
+    assert "opencode v" in checked(
         f"{zaigr} project vm exec -- opencode --version"
     )
     assert (state / "data/opencode/opencode.db").is_file()

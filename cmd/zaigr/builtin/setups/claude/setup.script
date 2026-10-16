@@ -54,5 +54,4 @@ if ! printf '%s\n' "$installed_version" | grep -q nodesource; then
     exit 1
 fi
 
-claude_version="${CLAUDE_CODE_VERSION:-2.1.140}"
-npm install -g --prefix /usr/local "@anthropic-ai/claude-code@${claude_version}"
+npm install -g --prefix /usr/local @anthropic-ai/claude-code
