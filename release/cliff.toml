@@ -33,15 +33,11 @@ filter_commits = false
 sort_commits = "oldest"
 
 commit_parsers = [
-  { message = "^feat", group = "Added" },
-  { message = "^fix", group = "Fixed" },
-  { message = "^perf", group = "Changed" },
-  { message = "^refactor", group = "Changed" },
-  { message = "^docs", group = "Changed" },
-  { message = "^test", group = "Changed" },
-  { message = "^build", group = "Changed" },
-  { message = "^ci", group = "Changed" },
-  { message = "^chore", group = "Changed" },
-  { message = "^revert", group = "Changed" },
+  { message = '^feat(\([^)]*\))?!?:', group = "Added" },
+  { message = '^fix(\([^)]*\))?!?:', group = "Fixed" },
+  { message = '^(change|perf)(\([^)]*\))?!?:', group = "Changed" },
+  # Use change: for maintenance that deserves a user-facing release note.
+  { message = '^(refactor|docs|test|build|ci|chore)(\([^)]*\))?:', skip = true },
+  { message = '^revert(\([^)]*\))?!?:', group = "Changed" },
   { message = "^.*", group = "Changed" },
 ]

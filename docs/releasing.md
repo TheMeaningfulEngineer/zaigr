@@ -26,6 +26,34 @@ clones without that history), the format is `<commit>-dev-<worktree-hash>`.
 Without usable Git metadata, `make build` falls back to `dev-unknown`.
 An explicit `VERSION=...` override and release candidate versions are unchanged.
 
+## Release notes
+
+Release notes are generated from commit subjects using `release/cliff.toml`.
+Write subjects as concise descriptions of the final behavior:
+
+- `feat:` adds an entry under Added.
+- `fix:` adds an entry under Fixed.
+- `change:` or `perf:` adds an entry under Changed.
+- Routine `refactor:`, `docs:`, `test:`, `build:`, `ci:`, and `chore:` commits
+  are omitted. Use `change:` when that work deserves a release note.
+
+Scopes are supported, for example `fix(setups): ...`. Subjects marked with `!`
+are retained even for otherwise omitted commit types. Other subjects appear
+under Changed.
+
+Keep related corrections together so the notes describe the completed change
+rather than intermediate regressions. For example:
+
+```text
+fix: stop overwriting setup customizations when starting a VM or opening a shell
+```
+
+Preview the unreleased notes without creating a candidate or replacing its files:
+
+```sh
+git-cliff --config release/cliff.toml --unreleased
+```
+
 ## Build and verify
 
 On the host, enter the development VM (adjust resources for your machine):
