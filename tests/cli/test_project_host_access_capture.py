@@ -49,7 +49,9 @@ def test_capture_and_reusable_setup_isolate_host_grants(serial_projects, host_de
         # This observes the active capture session; vm exec intentionally
         # refuses to run while capture is active.
         capture.sendline(f"if test -c {shlex.quote(str(alias))}; then printf 'device-present\\n'; else printf 'device-absent\\n'; fi")
-        capture.expect_exact("\rdevice-present\r\n" if attached else "\rdevice-absent\r\n")
+        # Readline can precede command output with CR or CRLF.
+        expected_device = "device-present" if attached else "device-absent"
+        capture.expect(r"[\r\n]" + expected_device + r"\r?\n")
         capture.expect(r"root@[^:]+:.*# ")
         if not attached:
             with pytest.raises(ConnectionRefusedError):
