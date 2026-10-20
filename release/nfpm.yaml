@@ -22,21 +22,30 @@ overrides:
   deb:
     depends:
       - coreutils
+      - conntrack
       - e2fsprogs
       - openssh-client
       - qemu-system-x86
       - qemu-utils
+      - slirp4netns
+      - util-linux
   rpm:
     depends:
       - coreutils
+      - conntrack-tools
       - e2fsprogs
       - openssh-clients
       - qemu-img
       - qemu-system-x86-core
+      - slirp4netns
+      - util-linux
   archlinux:
     depends:
       - coreutils
+      - conntrack-tools
       - e2fsprogs
       - openssh
       - qemu-img
       - qemu-system-x86
+      - slirp4netns
+      - util-linux

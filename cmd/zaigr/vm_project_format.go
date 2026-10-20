@@ -412,6 +412,12 @@ func compactToDirectProjectOverlay(sourcePath, outputPath string) error {
 }
 
 func applySetupDirectlyToRunningVM(port string, def setupDefinition, payload []byte) error {
+	return withMaintenanceNetworkSessionForSetups(currentProjectStore(), port, "setup execution", []setupDefinition{def}, func(namespace string) error {
+		return applySetupDirectlyToRunningVMInNamespace(port, def, payload, namespace)
+	})
+}
+
+func applySetupDirectlyToRunningVMInNamespace(port string, def setupDefinition, payload []byte, namespace string) error {
 	rootKeyPath, _, err := ensureRootSSHKey()
 	if err != nil {
 		return fmt.Errorf("prepare root SSH key: %w", err)
@@ -420,19 +426,13 @@ func applySetupDirectlyToRunningVM(port string, def setupDefinition, payload []b
 	intent := directSetupExecutionIntent{Name: def.Name, Version: def.Version, ProjectLocal: def.ProjectLocal}
 	executionStarted := false
 	executionDeadline := time.Now().Add(setupExecutionTimeout)
-	run := func() error {
-		started, runErr := sshRunSetupScriptUntil(port, rootKeyPath, "set -e\n"+string(payload), executionDeadline, &intent)
-		executionStarted = started
-		persisted, intentErr := store.setupExecutionIntentPersisted(intent)
-		if persisted {
-			executionStarted = true
-		}
-		if intentErr != nil {
-			return errors.Join(runErr, intentErr)
-		}
-		return runErr
+	started, runErr := sshRunSetupScriptInNamespaceUntil(port, rootKeyPath, namespace, "set -e\n"+string(payload), executionDeadline, &intent)
+	executionStarted = started
+	persisted, intentErr := store.setupExecutionIntentPersisted(intent)
+	if persisted {
+		executionStarted = true
 	}
-	err = withTemporaryRootAllowAllFirewallRule(port, rootKeyPath, run)
+	err = errors.Join(runErr, intentErr)
 	if err == nil {
 		err = sshSync(port, rootKeyPath)
 	}

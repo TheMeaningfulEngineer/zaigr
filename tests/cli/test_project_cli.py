@@ -63,9 +63,13 @@ def _section_lines(text, heading, next_heading):
 
 def _section_contains(text, heading, next_heading, expected):
     try:
-        return expected in _section_lines(text, heading, next_heading)
+        return expected in [line.rstrip(".") for line in _section_lines(text, heading, next_heading)]
     except ValueError:
         return False
+
+
+def _section_domain_lines(text, heading, next_heading):
+    return [line.rstrip(".") for line in _section_lines(text, heading, next_heading)]
 
 
 def _assert_active_capture_refusal(stdout, stderr, rc, command):
@@ -88,7 +92,12 @@ def test_project_vm_start_creates_project_store_and_first_image(project):
     assert len(_project_images(project)) == 1
 
     stdout = run(f"{zaigr} project vm show-config")
-    assert stdout.strip().splitlines() == ["cpu=1", "ram=512MB", "virtiofs-sandbox=namespace"]
+    assert stdout.strip().splitlines() == [
+        "cpu=1",
+        "ram=512MB",
+        "virtiofs-sandbox=namespace",
+        "network-policy=host-enforced",
+    ]
 
 
 def test_project_vm_start_waits_for_minimal_systemd_runtime(project):
@@ -101,7 +110,6 @@ def test_project_vm_start_waits_for_minimal_systemd_runtime(project):
     pid1 = run(f"{zaigr} project vm exec -- ps -p 1 -o comm=", timeout=20)
     assert pid1.strip() == "systemd"
 
-    run(f"{zaigr} project vm exec -- pgrep -x opensnitchd", timeout=20)
     run(f"{zaigr} project vm exec -- mountpoint -q /home/user/workspace", timeout=20)
     run(
         f"{zaigr} project vm exec -- mountpoint -q /home/user/.zaigr-agent-state",
@@ -276,7 +284,7 @@ def test_setup_firewall_is_shown_and_allows_host_access(project, setup_factory):
         timeout=10,
     )
 
-    assert "# project setups" in stdout
+    assert "# Project setup permissions" in stdout
     assert "deb.debian.org" in stdout
 
     run(f"{zaigr} project vm start", timeout=120)
@@ -287,73 +295,25 @@ def test_setup_firewall_is_shown_and_allows_host_access(project, setup_factory):
     )
 
 
-@pytest.mark.timeout(300)
-def test_project_firewall_show_uses_temporary_vm_and_reads_vm_allowed_file(project):
-    """`project firewall show` reads the VM allowlist, not host-side cache metadata."""
-    run = partial(_run, cwd=project.cwd, env=project.env)
+@pytest.mark.timeout(240)
+def test_project_firewall_show_uses_host_managed_domain_policy(project):
+    """Project firewall domains are managed and shown on the host while stopped."""
+    run = partial(_checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
+    domain = "manual-project-entry.example"
 
-    started, stderr, rc = run(
-        f"{zaigr} project vm start",
-        input="y\n",
-        timeout=180,
-    )
-    assert rc == 0, err_msg(started, stderr)
+    run(f"{zaigr} project vm start", input="y\n", timeout=180)
+    run(f"{zaigr} project vm stop", timeout=30)
+    run(f"{zaigr} project firewall domain allow {domain}", timeout=10)
+    firewall = run(f"{zaigr} project firewall show", timeout=10)
+    assert domain in firewall
+    assert "project" in firewall.lower()
 
-    append, stderr, rc = run(
-        [
-            zaigr,
-            "project",
-            "vm",
-            "exec",
-            "--root",
-            "--",
-            "tee",
-            "-a",
-            "/etc/opensnitchd/lists/domains/allowed.txt",
-        ],
-        input="y\nmanual-vm-entry.example\n",
-        timeout=30,
-    )
-    assert rc == 0, err_msg(append, stderr)
-    assert ROOT_EXEC_CONFIRM_TEXT in stderr
-    assert "manual-vm-entry.example" in append
-
-    sync, stderr, rc = run(
-        f"{zaigr} project vm exec --root -- sync",
-        input="y\n",
-        timeout=30,
-    )
-    assert rc == 0, err_msg(sync, stderr)
-    assert ROOT_EXEC_CONFIRM_TEXT in stderr
-
-    stopped, stderr, rc = run(
-        f"{zaigr} project vm stop",
-        timeout=30,
-    )
-    assert rc == 0, err_msg(stopped, stderr)
-
-    # No public workflow creates a stale host cache; seed one to verify VM state wins.
-    # Seed stale host cache metadata directly; the public behavior under test is
-    # that `project firewall show` ignores it and reads the stopped VM image.
-    (project.store_dir / "firewall").write_text("cache-only-entry.example\n", encoding="utf-8")
-
-    firewall, stderr, rc = run(
-        f"{zaigr} project firewall show",
-        timeout=180,
-    )
-
-    assert rc == 0, err_msg(firewall, stderr)
-    assert "booting temporary VM to read firewall" in stderr
-    assert "Start project VM and show firewall? [y/N]" not in stderr
-    assert "manual-vm-entry.example" in firewall
-    assert "cache-only-entry.example" not in firewall
-    status_after, stderr, rc = run(
-        f"{zaigr} project status",
-        timeout=10,
-    )
-    assert rc == 0, err_msg(status_after, stderr)
-    assert "status: not running" in status_after
+    run(f"{zaigr} project firewall domain remove {domain}", timeout=10)
+    firewall_after_remove = run(f"{zaigr} project firewall show", timeout=10)
+    assert domain not in firewall_after_remove
+    status = run(f"{zaigr} project status", timeout=10)
+    assert "status: not running" in status
 
 
 @pytest.mark.timeout(240)
@@ -393,150 +353,54 @@ def test_project_firewall_domain_log_requires_running_vm(project):
 
 
 @pytest.mark.timeout(360)
-def test_zaigr_inside_firewall_remove_blocks_removed_domain(project):
-    """`zaigr-inside firewall remove` removes allow entries and blocks new access."""
+def test_project_firewall_domain_allow_remove_controls_vm_access(project):
+    """Host project domain grants control DNS resolution and outbound access."""
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
-    test_domain = "deb.debian.org"
-    cname_domain = "debian.map.fastlydns.net"
-    test_url = "http://deb.debian.org"
-    blocked_curl_status = "28"
+    test_domain = "pypi.org"
+    test_url = f"https://{test_domain}"
 
-    run(
-        f"{zaigr} project vm start",
-        input="y\n",
-        timeout=180,
+    run(f"{zaigr} project vm start", input="y\n", timeout=180)
+    run(f"{zaigr} project firewall domain allow {test_domain}", timeout=30)
+
+    resolved = run(
+        f"{zaigr} project vm exec -- getent ahostsv4 {test_domain}",
+        timeout=30,
     )
+    assert resolved.strip(), resolved
     run(
-        [
-            zaigr,
-            "project",
-            "vm",
-            "exec",
-            "--",
-            "sh",
-            "-lc",
-            "command -v curl && command -v getent",
-        ],
-        timeout=20,
-    )
-    run(
-        [zaigr, "project", "vm", "exec", "--", "getent", "ahosts", test_domain],
-        timeout=20,
-    )
-    run(
-        f"{zaigr} project vm exec -- curl -4 -fsS -o /dev/null "
+        f"{zaigr} project vm exec -- curl --noproxy '*' -4 -fsS -o /dev/null "
         f"--connect-timeout 3 --max-time 8 {test_url}",
-        timeout=20,
-    )
-    opensnitch_pid_before = run(
-        f"{zaigr} project vm exec -- pgrep -x opensnitchd",
-        timeout=20,
-    ).strip()
-
-    allow_before = run(
-        [zaigr, "project", "vm", "exec", "--root", "--", "zaigr-inside", "firewall", "list"],
-        input="y\n",
         timeout=30,
     )
-    assert test_domain in allow_before.splitlines()
-    assert cname_domain in allow_before.splitlines()
 
+    run(f"{zaigr} project firewall domain remove {test_domain}", timeout=30)
+    firewall = run(f"{zaigr} project firewall show", timeout=10)
+    assert test_domain not in firewall
+    unresolved, stderr, rc = _run(
+        f"{zaigr} project vm exec -- getent ahostsv4 {test_domain}",
+        cwd=project.cwd,
+        env=project.env,
+        timeout=30,
+    )
+    assert rc != 0, err_msg(unresolved, stderr)
+
+    run(f"{zaigr} project firewall domain allow {test_domain}", timeout=30)
+    resolved_again = run(
+        f"{zaigr} project vm exec -- getent ahostsv4 {test_domain}",
+        timeout=30,
+    )
+    assert resolved_again.strip(), resolved_again
     run(
-        [
-            zaigr,
-            "project",
-            "vm",
-            "exec",
-            "--root",
-            "--",
-            "zaigr-inside",
-            "firewall",
-            "remove",
-            test_domain,
-            cname_domain,
-        ],
-        input="y\n",
+        f"{zaigr} project vm exec -- curl --noproxy '*' -4 -fsS -o /dev/null "
+        f"--connect-timeout 3 --max-time 8 {test_url}",
         timeout=30,
     )
-
-    allow_after_remove = run(
-        [zaigr, "project", "vm", "exec", "--root", "--", "zaigr-inside", "firewall", "list"],
-        input="y\n",
-        timeout=30,
-    )
-    assert test_domain not in allow_after_remove.splitlines()
-    assert cname_domain not in allow_after_remove.splitlines()
-
-    rc = None
-    for _ in range(12):
-        removed, stderr, rc = _run(
-            f"{zaigr} project vm exec -- curl -4 -fsS -o /dev/null "
-            f"--connect-timeout 3 --max-time 8 {test_url}",
-            cwd=project.cwd,
-            env=project.env,
-            timeout=20,
-        )
-        if rc == int(blocked_curl_status):
-            break
-        time.sleep(1)
-    assert rc == int(blocked_curl_status), err_msg(removed, stderr)
-    opensnitch_pid_after_remove = run(
-        f"{zaigr} project vm exec -- pgrep -x opensnitchd",
-        timeout=20,
-    ).strip()
-    assert opensnitch_pid_after_remove == opensnitch_pid_before
-
-    run(
-        [
-            zaigr,
-            "project",
-            "vm",
-            "exec",
-            "--root",
-            "--",
-            "zaigr-inside",
-            "firewall",
-            "allow",
-            test_domain,
-            cname_domain,
-        ],
-        input="y\n",
-        timeout=30,
-    )
-
-    allow_after_restore = run(
-        [zaigr, "project", "vm", "exec", "--root", "--", "zaigr-inside", "firewall", "list"],
-        input="y\n",
-        timeout=30,
-    )
-    assert test_domain in allow_after_restore.splitlines()
-    assert cname_domain in allow_after_restore.splitlines()
-
-    # Rule reload is asynchronous for restoration as well as removal.
-    # Retry only the blocked-connection result, not unrelated curl errors.
-    for _ in range(12):
-        restored, stderr, rc = _run(
-            f"{zaigr} project vm exec -- curl -4 -fsS -o /dev/null "
-            f"--connect-timeout 3 --max-time 8 {test_url}",
-            cwd=project.cwd,
-            env=project.env,
-            timeout=20,
-        )
-        if rc != int(blocked_curl_status):
-            break
-        time.sleep(1)
-    assert rc == 0, err_msg(restored, stderr)
-    opensnitch_pid_after_restore = run(
-        f"{zaigr} project vm exec -- pgrep -x opensnitchd",
-        timeout=20,
-    ).strip()
-    assert opensnitch_pid_after_restore == opensnitch_pid_before
 
 
 @pytest.mark.timeout(300)
-def test_running_setup_firewall_applies_without_restarting_opensnitch(project, setup_factory):
-    """A running setup activates its domain list without restarting OpenSnitch."""
+def test_running_setup_firewall_applies_to_host_network(project, setup_factory):
+    """A running setup grants its declared domain to host-enforced VM networking."""
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
     setup_factory(
@@ -546,26 +410,15 @@ def test_running_setup_firewall_applies_without_restarting_opensnitch(project, s
     )
 
     run(f"{zaigr} project vm start", input="y\n", timeout=180)
-    opensnitch_pid_before = run(
-        f"{zaigr} project vm exec -- pgrep -x opensnitchd",
-        timeout=20,
-    ).strip()
-
     run(
         f"{zaigr} project setup run live-firewall-update",
         timeout=180,
     )
     run(
-        f"{zaigr} project vm exec -- curl -4 -fsS -o /dev/null "
+        f"{zaigr} project vm exec -- curl --noproxy '*' -4 -fsS -o /dev/null "
         "--connect-timeout 3 --max-time 8 https://pypi.org",
-        timeout=20,
+        timeout=30,
     )
-
-    opensnitch_pid_after = run(
-        f"{zaigr} project vm exec -- pgrep -x opensnitchd",
-        timeout=20,
-    ).strip()
-    assert opensnitch_pid_after == opensnitch_pid_before
 
 
 def test_project_vm_help_exposes_nested_commands(project, tmp_path):
@@ -1131,54 +984,41 @@ def test_flat_setup_layout_is_not_accepted(project):
     assert "setup not found" in combined
 
 
-def test_shell_reuses_running_project_and_skips_redundant_firewall_sync(project, setup_factory):
-    """A second shell attach on a running VM should not re-sync applied firewall state."""
-    run = partial(_checked_run, cwd=project.cwd, env=project.env)
+def test_shell_reuses_running_project_with_host_firewall_policy(project, setup_factory):
+    """Repeated shell attaches keep declared host firewall access working."""
     setup_factory(
         setup_name="shell-sync-stability",
         script_content="true",
-        firewall=["example.org"],
+        firewall=["pypi.org"],
     )
 
+    run = partial(_checked_run, cwd=project.cwd, env=project.env)
     run(
         f"{project.zaigr_bin} project setup run shell-sync-stability",
         input="y\n",
         timeout=120,
     )
 
-    first_shell = spawn_interactive(
-        f"{project.zaigr_bin} shell",
-        cwd=project.cwd,
-        env=project.env,
-        timeout=120,
-    )
-    first_shell.expect(USER_PROMPT, timeout=120)
-    first_shell.sendline(
-        "stat -c '%Y' /etc/opensnitchd/lists/domains/allowed.txt | "
-        "xargs printf 'FW_MTIME=%s\\n'"
-    )
-    first_shell.expect(r"FW_MTIME=(\d+)")
-    first_mtime = int(first_shell.match.group(1))
-    first_shell.sendline("exit")
-    first_shell.expect(r"\Z")
-
-    second_shell = spawn_interactive(
-        f"{project.zaigr_bin} shell",
-        cwd=project.cwd,
-        env=project.env,
-        timeout=120,
-    )
-    second_shell.expect(USER_PROMPT, timeout=120)
-    second_shell.sendline(
-        "stat -c '%Y' /etc/opensnitchd/lists/domains/allowed.txt | "
-        "xargs printf 'FW_MTIME=%s\\n'"
-    )
-    second_shell.expect(r"FW_MTIME=(\d+)")
-    second_mtime = int(second_shell.match.group(1))
-    second_shell.sendline("exit")
-    second_shell.expect(r"\Z")
-
-    assert second_mtime == first_mtime
+    for _ in range(2):
+        shell = spawn_interactive(
+            f"{project.zaigr_bin} shell",
+            cwd=project.cwd,
+            env=project.env,
+            timeout=120,
+        )
+        try:
+            shell.expect(USER_PROMPT, timeout=120)
+            shell.sendline(
+                "curl --noproxy '*' -4 -fsS -o /dev/null "
+                "-w '%{http_code}\\n' --connect-timeout 3 --max-time 8 https://pypi.org"
+            )
+            # Bash's bracketed-paste mode can be disabled between the prompt
+            # and curl's status line, so terminal control bytes may precede it.
+            shell.expect(r"(?m)(?:\x1b\[\?2004l)?\r?200\r?$", timeout=30)
+            shell.sendline("exit")
+            shell.expect(pexpect.EOF, timeout=30)
+        finally:
+            shell.close(force=True)
 
 
 @pytest.mark.timeout(360)
@@ -1297,7 +1137,12 @@ printf 'setup-run-resources-ok\\n'
     assert "setup-run-resources-ok" in stdout
 
     shown = run(f"{zaigr} project vm show-config")
-    assert shown.strip().splitlines() == ["cpu=2", "ram=768MB", "virtiofs-sandbox=namespace"]
+    assert shown.strip().splitlines() == [
+        "cpu=2",
+        "ram=768MB",
+        "virtiofs-sandbox=namespace",
+        "network-policy=host-enforced",
+    ]
 
     run(f"{zaigr} project vm start", timeout=120)
     boot_cpu = run(f"{zaigr} project vm exec -- nproc")
@@ -1378,7 +1223,6 @@ def test_setup_install_uses_full_network_by_default(project, setup_factory):
     setup_factory(
         setup_name="firewall-active",
         script_content="""
-pgrep -x opensnitchd >/dev/null
 curl -4 -fsS --connect-timeout 5 --max-time 10 https://github.com >/dev/null
 printf 'setup-full-network\\n'
 """,
@@ -1750,13 +1594,13 @@ def test_project_setup_capture_records_endpoints_and_discard_clears_capture(
             time.sleep(1)
         assert rc == 0, err_msg(review, stderr)
         assert "setup capture:" in review
-        assert "deb.debian.org" in _section_lines(
+        assert "deb.debian.org" in _section_domain_lines(
             review,
             "observed endpoints (live):",
             "proposed setup.firewall:",
         )
         assert "proposed setup.firewall:" in review
-        assert "deb.debian.org" in _section_lines(
+        assert "deb.debian.org" in _section_domain_lines(
             review,
             "proposed setup.firewall:",
             "proposed setup.script:",
@@ -2018,7 +1862,7 @@ def test_project_setup_capture_accept_creates_local_setup(project):
                 break
             time.sleep(1)
         assert rc == 0, err_msg(review, stderr)
-        assert "deb.debian.org" in _section_lines(
+        assert "deb.debian.org" in _section_domain_lines(
             review,
             "proposed setup.firewall:",
             "proposed setup.script:",
@@ -2117,12 +1961,12 @@ def test_project_setup_capture_can_attach_to_running_vm(project):
             time.sleep(1)
         assert rc == 0, err_msg(review, stderr)
         assert "mode: running VM" in review
-        assert "deb.debian.org" in _section_lines(
+        assert "deb.debian.org" in _section_domain_lines(
             review,
             "observed endpoints (live):",
             "proposed setup.firewall:",
         )
-        assert "deb.debian.org" in _section_lines(
+        assert "deb.debian.org" in _section_domain_lines(
             review,
             "proposed setup.firewall:",
             "proposed setup.script:",
@@ -2151,12 +1995,15 @@ def test_project_setup_capture_can_attach_to_running_vm(project):
 
 
 @pytest.mark.timeout(360)
-def test_project_setup_capture_firewall_allowance_does_not_leak_to_parallel_shell(project):
-    """Setup capture firewall allowance is scoped to the capture session."""
+def test_project_setup_capture_keeps_other_vm_processes_restricted(
+    project, host_network_endpoints
+):
+    """Setup capture retains its network access without widening the ordinary shell."""
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
     test_domain = "pypi.org"
     test_url = "https://pypi.org"
+    host_url = f"http://10.0.2.2:{host_network_endpoints['tcp_port']}/"
     normal_curl = f"curl -4 -sS --connect-timeout 3 --max-time 8 {test_url}"
     capture_curl = f"curl -4 -sS --connect-timeout 5 --max-time 15 {test_url}"
     normal_curl_status = [
@@ -2184,10 +2031,6 @@ def test_project_setup_capture_firewall_allowance_does_not_leak_to_parallel_shel
         ],
         timeout=20,
     )
-    run(
-        [zaigr, "project", "vm", "exec", "--", "getent", "ahosts", test_domain],
-        timeout=20,
-    )
     normal_before_status = "0"
     for _ in range(12):
         normal_before_status = run(normal_curl_status, timeout=20).strip()
@@ -2203,6 +2046,7 @@ def test_project_setup_capture_firewall_allowance_does_not_leak_to_parallel_shel
         timeout=30,
     )
     capture = None
+    capture_active = False
     try:
         normal_shell.expect(USER_PROMPT, timeout=60)
         capture = spawn_interactive(
@@ -2214,6 +2058,8 @@ def test_project_setup_capture_firewall_allowance_does_not_leak_to_parallel_shel
         capture.expect(r"A project VM is already running\.", timeout=60)
         capture.expect(r"Continue\? \[y/N\]")
         capture.sendline("y")
+        capture_active = True
+        capture.expect(r"WARNING: Setup capture .*broad IPv4 TCP/UDP access.*", timeout=60)
         capture.expect(ROOT_PROMPT, timeout=60)
         capture.sendline(
             f"{capture_curl} >/dev/null; "
@@ -2226,7 +2072,6 @@ def test_project_setup_capture_firewall_allowance_does_not_leak_to_parallel_shel
             "in the temporary capture firewall allowance"
         )
         capture.expect(ROOT_PROMPT)
-
         for _ in range(10):
             review, stderr, rc = _run(
                 f"{zaigr} project setup capture review",
@@ -2244,16 +2089,18 @@ def test_project_setup_capture_firewall_allowance_does_not_leak_to_parallel_shel
             time.sleep(1)
         assert rc == 0, err_msg(review, stderr)
         assert "mode: running VM" in review
-        assert test_domain in _section_lines(
+        observed_domains = _section_lines(
             review,
             "observed endpoints (live):",
             "proposed setup.firewall:",
         )
-        assert test_domain in _section_lines(
+        assert any(domain.rstrip(".") == test_domain for domain in observed_domains), observed_domains
+        proposed_domains = _section_lines(
             review,
             "proposed setup.firewall:",
             "proposed setup.script:",
         )
+        assert any(domain.rstrip(".") == test_domain for domain in proposed_domains), proposed_domains
         assert capture_curl in review
         assert "# Returned 0" in review
 
@@ -2262,25 +2109,38 @@ def test_project_setup_capture_firewall_allowance_does_not_leak_to_parallel_shel
             "printf 'NORMAL_DURING_STATUS=%s\\n' \"$?\""
         )
         normal_shell.expect(r"NORMAL_DURING_STATUS=([0-9]+)", timeout=20)
-        assert normal_shell.match.group(1) != "0"
+        assert normal_shell.match.group(1) != "0", (
+            "setup capture must keep the ordinary shell on its restricted network policy"
+        )
         normal_shell.expect(USER_PROMPT)
+        normal_shell.sendline(
+            f"if curl --noproxy '*' -4fsS --connect-timeout 2 --max-time 4 {host_url}; "
+            "then printf 'PROBE_RESULT=ALLOWED\\n'; "
+            "else printf 'PROBE_RESULT=DENIED\\n'; fi"
+        )
+        normal_shell.expect(USER_PROMPT)
+        assert re.search(r"(?m)^PROBE_RESULT=DENIED\r?$", normal_shell.before), normal_shell.before
+        assert host_network_endpoints["token"] not in normal_shell.before
 
         capture.sendline("exit")
         capture.expect(r"\Z")
 
         normal_shell.sendline(
-            f"{normal_curl} >/dev/null; "
-            "printf 'NORMAL_AFTER_STATUS=%s\\n' \"$?\""
+            f"if curl --noproxy '*' -4fsS --connect-timeout 2 --max-time 4 {host_url}; "
+            "then printf 'PROBE_RESULT=ALLOWED\\n'; "
+            "else printf 'PROBE_RESULT=DENIED\\n'; fi"
         )
-        normal_shell.expect(r"NORMAL_AFTER_STATUS=([0-9]+)", timeout=20)
-        assert normal_shell.match.group(1) != "0"
         normal_shell.expect(USER_PROMPT)
-
+        assert re.search(r"(?m)^PROBE_RESULT=DENIED\r?$", normal_shell.before), normal_shell.before
         discard = run(
             f"{zaigr} project setup capture discard",
             timeout=20,
         )
+        capture_active = False
         assert "discarded setup capture" in discard.lower()
+        assert "active sessions: 0" in run(
+            [zaigr, "project", "firewall", "show"], timeout=10
+        ).lower()
     finally:
         if capture is not None and capture.isalive():
             capture.sendline("exit")
@@ -2288,6 +2148,13 @@ def test_project_setup_capture_firewall_allowance_does_not_leak_to_parallel_shel
         if normal_shell.isalive():
             normal_shell.sendline("exit")
             normal_shell.expect(r"\Z")
+        if capture_active:
+            _run(
+                [zaigr, "project", "setup", "capture", "discard"],
+                cwd=project.cwd,
+                env=project.env,
+                timeout=20,
+            )
 
 
 def test_global_setup_commands_work_without_project_metadata(project, tmp_path):
@@ -2445,7 +2312,7 @@ def test_global_firewall_allowlist_applies_to_project_starts(project, setup_fact
         "curl -4 -fsS -o /dev/null --connect-timeout 3 --max-time 8 https://github.com",
         timeout=20,
     )
-    assert rc == 28, err_msg(github, stderr)
+    assert rc == 6, err_msg(github, stderr)
     pypi, stderr, rc = run(
         f"{zaigr} project vm exec -- "
         "curl -4 -fsS -o /dev/null --connect-timeout 3 --max-time 8 https://pypi.org",
@@ -2723,7 +2590,12 @@ def test_project_vm_start_starts_vm_without_shell_attach(project):
         f"{project.zaigr_bin} project vm show-config",
         timeout=10,
     )
-    assert shown.strip().splitlines() == ["cpu=1", "ram=512MB", "virtiofs-sandbox=namespace"]
+    assert shown.strip().splitlines() == [
+        "cpu=1",
+        "ram=512MB",
+        "virtiofs-sandbox=namespace",
+        "network-policy=host-enforced",
+    ]
 
 
 def test_project_vm_set_config_updates_defaults(project):
@@ -2754,7 +2626,12 @@ def test_project_vm_set_config_updates_defaults(project):
         f"{zaigr} project vm show-config",
         timeout=10,
     )
-    assert shown.strip().splitlines() == ["cpu=2", "ram=768MB", "virtiofs-sandbox=namespace"]
+    assert shown.strip().splitlines() == [
+        "cpu=2",
+        "ram=768MB",
+        "virtiofs-sandbox=namespace",
+        "network-policy=host-enforced",
+    ]
 
 
 def test_running_vm_rejects_resource_overrides(project):

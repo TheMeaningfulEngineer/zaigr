@@ -171,6 +171,10 @@ func lockCurrentProjectAllowCapture(operation string) (*projectMutationLock, err
 	return acquireProjectOperationLock(currentProjectStore(), operation, false, true)
 }
 
+func lockCurrentProjectFirewallPolicy(operation string) (*projectMutationLock, error) {
+	return acquireProjectOperationLock(currentProjectStore(), operation, false, true)
+}
+
 func lockCurrentProjectExclusive(operation string) (*projectMutationLock, error) {
 	return acquireExclusiveProjectMutationLock(currentProjectStore(), operation, false)
 }

@@ -100,27 +100,11 @@ def test_firewall_version_removal_respects_other_setup_owners(
     )
     run(f"{zaigr} project vm stop", cwd=shared.cwd, timeout=60)
 
-    before_failure = global_run(f"{zaigr} global base-image status", timeout=10)
-    # The installer really removes a utility needed by the following reconciliation.
+    # Removing one setup owner's hostname must leave destinations still owned by
+    # another setup in the shared image, while the new image blocks the removed
+    # destination. Keep this workflow observable through the actual services.
     setup_factory(
-        "network-sharer",
-        "rm /usr/bin/mv\nprintf 'RECONCILIATION_FAILURE_READY\\n'",
-        firewall=["github.com"],
-    )
-    stdout, stderr, rc = _run(
-        f"{zaigr} global base-image setup run network-sharer",
-        cwd=tmp_path,
-        env=shared.env,
-        timeout=180,
-    )
-    assert rc != 0, err_msg(stdout, stderr)
-    assert "RECONCILIATION_FAILURE_READY" in stdout
-    assert "reconcile global base image firewall" in stdout + stderr
-    assert "panic" not in stdout + stderr
-    assert global_run(f"{zaigr} global base-image status", timeout=10) == before_failure
-    setup_factory(
-        "network-sharer",
-        "printf 'sharer-v2\\n' > /etc/network-sharer",
+        "network-sharer", "printf 'sharer-v2\\n' > /etc/network-sharer",
         firewall=["github.com"],
     )
     global_run(f"{zaigr} global base-image setup run network-sharer", timeout=180)
@@ -136,7 +120,8 @@ def test_firewall_version_removal_respects_other_setup_owners(
         env=removed.env,
         timeout=20,
     )
-    assert rc != 0, err_msg(stdout, stderr)
+    assert rc == 6, err_msg(stdout, stderr)
+    assert "could not resolve host" in stderr.lower(), stderr
     assert (
         run(
             f"{zaigr} project vm exec -- cat /etc/network-owner /etc/network-sharer",

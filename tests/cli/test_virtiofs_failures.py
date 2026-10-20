@@ -6,6 +6,7 @@ import shutil
 import signal
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
 import pexpect
@@ -212,21 +213,11 @@ def test_ssh_readiness_failure_cleans_live_qemu_and_both_daemons(project, test_r
 
 
 @pytest.mark.timeout(300)
-@pytest.mark.parametrize("failure,expected", [
-    ("workspace-exit", "workspace"),
-    ("workspace-no-socket", "workspace"),
-    ("agent-state-exit", "agent-state"),
-])
-def test_daemon_startup_failure_cleans_started_children(project, test_root, failure, expected):
+def test_daemon_startup_failure_cleans_started_children(project, test_root):
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
     run([zaigr, "project", "vm", "start"], input="y\n", timeout=180)
     run([zaigr, "project", "vm", "stop"], timeout=60)
-    if failure.startswith("workspace-"):
-        # Namespace selection revalidates and restores the daemon cache after
-        # the guest identity probe. The unsafe-mode test path skips that
-        # extraction so this injected daemon failure reaches child startup.
-        run([zaigr, "project", "vm", "set-config", "--virtiofs-sandbox", "none"])
     caches = [p for p in (project.home / ".zaigr").glob("virtiofsd-*") if p.is_file() and not p.name.endswith(".lock")]
     assert len(caches) == 1, caches
     cache = caches[0]
@@ -260,22 +251,15 @@ def test_daemon_startup_failure_cleans_started_children(project, test_root, fail
         while time.monotonic() < deadline and not marker.exists():
             time.sleep(0.05)
         assert marker.exists(), launch.transcript.tail(3000)
-        if failure == "agent-state-exit":
-            state.rename(saved_state)
-            state.write_text("test-only invalid shared directory\n")
-        else:
-            injected = "time.sleep(0.5)\nsys.exit(42)\n" if failure == "workspace-exit" else "time.sleep(40)\n"
-            cache.write_text("#!/usr/bin/python3\nimport sys, time\n" + injected, encoding="utf-8")
+        state.rename(saved_state)
+        state.write_text("test-only invalid shared directory\n")
         release.touch()
         launch.expect(pexpect.EOF, timeout=70)
         launch.close()
         assert launch.exitstatus != 0, launch.transcript.tail(4000)
         diagnostic = launch.transcript.tail(5000).lower()
-        assert expected in diagnostic, diagnostic
-        if failure == "workspace-no-socket":
-            assert "socket deadline exceeded" in diagnostic, diagnostic
-        else:
-            assert "exited" in diagnostic or "start agent-state virtiofsd" in diagnostic, diagnostic
+        assert "pin agent-state export" in diagnostic, diagnostic
+        assert "not a directory" in diagnostic, diagnostic
         record_path = project.store_dir / "vm-supervisor.json"
         assert not record_path.exists(), record_path.read_text() if record_path.exists() else record_path
         for name in ("virtiofsd-workspace.sock", "virtiofsd-agent-state.sock", "vm.sock"):
@@ -291,6 +275,36 @@ def test_daemon_startup_failure_cleans_started_children(project, test_root, fail
             saved_state.rename(state)
     run([zaigr, "project", "vm", "start"], timeout=180)
     assert run([zaigr, "project", "vm", "exec", "--", "findmnt", "-n", "-o", "FSTYPE", "/home/user/workspace"], timeout=20).strip() == "virtiofs"
+
+
+@pytest.mark.timeout(60)
+def test_legacy_unsafe_virtiofs_setting_is_refused_before_vm_start(project):
+    """A saved legacy none setting cannot start a VM without the required sandbox."""
+    zaigr = project.zaigr_bin
+    run = partial(_checked_run, cwd=project.cwd, env=project.env)
+    run([zaigr, "project", "vm", "start"], input="y\n", timeout=180)
+    run([zaigr, "project", "vm", "stop"], timeout=60)
+    setting = project.store_dir / "virtiofs-sandbox"
+    setting.parent.mkdir(parents=True, exist_ok=True)
+    setting.write_text("none\n", encoding="utf-8")
+    stdout, stderr, code = _run(
+        [zaigr, "project", "vm", "start"],
+        cwd=project.cwd,
+        env=project.env,
+        input="y\n",
+        timeout=30,
+    )
+    diagnostic = stdout + stderr
+    assert code != 0, diagnostic
+    assert "saved project setting is virtiofs-sandbox=none" in diagnostic
+    assert "host-enforced VM networking requires the namespace file-sharing sandbox" in diagnostic
+    assert "misc check" in diagnostic
+    assert "Initialize project and continue?" not in diagnostic
+    assert not (project.store_dir / "vm-supervisor.json").exists()
+    assert not (project.store_dir / "runtime" / "vm.sock").exists()
+    assert "virtiofs-sandbox=none" in _checked_run(
+        [zaigr, "project", "vm", "show-config"], cwd=project.cwd, env=project.env
+    )
 
 
 @pytest.mark.timeout(300)
@@ -343,32 +357,24 @@ def test_simultaneous_starts_of_one_project_keep_one_owner(project):
 
 
 @pytest.mark.timeout(300)
-def test_two_concurrent_stopped_vm_inspections_keep_one_temporary_owner(project):
+def test_concurrent_firewall_inspections_do_not_start_a_stopped_vm(project):
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
     run([zaigr, "project", "vm", "start"], input="y\n", timeout=180)
     run([zaigr, "project", "vm", "stop"], timeout=60)
     record_path = project.store_dir / "vm-supervisor.json"
-    first = spawn_interactive(f"{zaigr} project firewall show", cwd=project.cwd, env=project.env, timeout=180)
-    try:
-        deadline = time.monotonic() + 60
-        while time.monotonic() < deadline and not record_path.exists():
-            time.sleep(0.05)
-        assert record_path.exists(), first.transcript.tail(3000)
-        launch_id = json.loads(record_path.read_text())["launch_id"]
-        stdout, stderr, code = _run([zaigr, "project", "firewall", "show"], cwd=project.cwd, env=project.env, timeout=20)
-        assert code != 0, (stdout, stderr)
-        assert "vm operation in progress" in (stdout + stderr).lower(), (stdout, stderr)
-        assert json.loads(record_path.read_text())["launch_id"] == launch_id
-        first.expect(pexpect.EOF, timeout=180)
-        first.close()
-        assert first.exitstatus == 0, first.transcript.tail(4000)
-        assert not record_path.exists()
-        run([zaigr, "project", "vm", "start"], timeout=180)
-        assert run([zaigr, "project", "vm", "exec", "--", "findmnt", "-n", "-o", "FSTYPE", "/home/user/workspace"], timeout=20).strip() == "virtiofs"
-    finally:
-        if first.isalive():
-            first.terminate(force=True)
+    assert not record_path.exists()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(
+            lambda _: _run([zaigr, "project", "firewall", "show"], cwd=project.cwd, env=project.env, timeout=20),
+            range(2),
+        ))
+    for stdout, stderr, code in results:
+        assert code == 0, err_msg(stdout, stderr)
+    assert results[0][0] == results[1][0]
+    assert not record_path.exists()
+    status = run([zaigr, "project", "status"])
+    assert "status: not running" in status.lower(), status
 
 
 @pytest.mark.timeout(180)

@@ -1,0 +1,360 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"zaigr/cmd/zaigr/hostnet"
+)
+
+const maintenanceNetworkWarning = "WARNING: --full-network gives this root shell and its child processes broad IPv4 TCP/UDP access, including private network destinations. Other VM processes stay on their ordinary network policy. Access ends when the host session expires or shell exits."
+
+func maintenanceOperationWarning(operation string) string {
+	switch operation {
+	case "project setup run", "setup execution":
+		return "WARNING: Setup execution runs root setup scripts with broad IPv4 TCP/UDP access in a private network namespace. Other VM processes keep their ordinary network policy. Access ends when setup finishes or the host session expires."
+	case "project setup capture":
+		return "WARNING: Setup capture runs its root shell with broad IPv4 TCP/UDP access in a private network namespace. Other VM processes keep their ordinary network policy. Access ends when capture finishes or the host session expires."
+	default:
+		return maintenanceNetworkWarning
+	}
+}
+
+func withFullNetworkLeaseForRuntime(runtimeDir, launchID, operation, warning string, run func() error) error {
+	leaseID, err := newVMLaunchID()
+	if err != nil {
+		return fmt.Errorf("create temporary full-network lease: %w", err)
+	}
+	fmt.Fprintln(os.Stderr, warning)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ownerDeadline := time.Now().Add(fullNetworkOwnerTTL)
+	_, err = hostNetworkControlWithLease(ctx, runtimeDir, launchID, "full-network-acquire", hostnet.Forward{}, leaseID, ownerDeadline)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("acquire temporary full-network lease: %w", err)
+	}
+	launchStoppedByWorkflow := false
+	stopRenewal := make(chan struct{})
+	renewalDone := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopRenewal:
+				renewalDone <- nil
+				return
+			case <-ticker.C:
+				renewCtx, renewCancel := context.WithTimeout(context.Background(), 4*time.Second)
+				renewDeadline := time.Now().Add(fullNetworkOwnerTTL)
+				_, renewErr := hostNetworkControlWithLease(renewCtx, runtimeDir, launchID, "full-network-renew", hostnet.Forward{}, leaseID, renewDeadline)
+				renewCancel()
+				if renewErr != nil {
+					fmt.Fprintf(os.Stderr, "warning: temporary full-network lease renewal failed; host access will expire within %s: %v\n", fullNetworkOwnerTTL, renewErr)
+					renewalDone <- renewErr
+					return
+				}
+			}
+		}
+	}()
+	runErr := run()
+	close(stopRenewal)
+	renewErr := <-renewalDone
+	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_, releaseErr := hostNetworkControlWithLease(releaseCtx, runtimeDir, launchID, "full-network-release", hostnet.Forward{}, leaseID, time.Time{})
+	releaseCancel()
+	if releaseErr != nil && waitFullNetworkLeaseLaunchStopped(runtimeDir, launchID, 12*time.Second) {
+		// A capture accept can deliberately stop the VM whose interactive
+		// capture shell owns this lease. In that case the namespace and its
+		// firewall state are already gone, so the lease is revoked. Only treat
+		// the missing control endpoint as success after proving this launch is
+		// no longer represented by its supervisor record/runtime directory.
+		releaseErr = nil
+		launchStoppedByWorkflow = true
+	}
+	if releaseErr != nil {
+		return fmt.Errorf("release temporary full-network lease: %w", releaseErr)
+	}
+	if runErr != nil {
+		return runErr
+	}
+	if !launchStoppedByWorkflow && operation == "project setup capture" {
+		launchStoppedByWorkflow = waitFullNetworkLeaseLaunchStopped(runtimeDir, launchID, 100*time.Millisecond)
+	}
+	if launchStoppedByWorkflow {
+		// The only nil-returning capture callback for a stopped launch is the
+		// capture shell's verified accept/discard path. Its supervisor teardown
+		// also makes a concurrent renewal failure moot.
+		return nil
+	}
+	if renewErr != nil {
+		return fmt.Errorf("temporary full-network lease renewal failed; the host firewall expired the lease")
+	}
+	return nil
+}
+
+func waitFullNetworkLeaseLaunchStopped(runtimeDir, launchID string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if fullNetworkLeaseLaunchStopped(runtimeDir, launchID) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func fullNetworkLeaseLaunchStopped(runtimeDir, launchID string) bool {
+	if !filepath.IsAbs(runtimeDir) || launchID == "" {
+		return false
+	}
+	store := projectStore{Path: filepath.Dir(filepath.Clean(runtimeDir)), Hash: filepath.Base(filepath.Dir(filepath.Clean(runtimeDir)))}
+	if store.runtimeDir() != filepath.Clean(runtimeDir) {
+		return false
+	}
+	record, err := readVMSupervisorRecord(store)
+	if errors.Is(err, os.ErrNotExist) {
+		_, statErr := os.Stat(runtimeDir)
+		return errors.Is(statErr, os.ErrNotExist)
+	}
+	if err != nil {
+		return false
+	}
+	// A different launch owns the canonical runtime path now. Launch IDs are
+	// unique, and starting it requires the previous supervisor to have stopped.
+	return record.LaunchID != launchID
+}
+
+// withMaintenanceNetworkSession keeps broad routing behind a session-specific
+// SSH point-to-point tunnel. The VM's ordinary guest interface and firewall
+// grants are never changed by this operation.
+func withMaintenanceNetworkSession(store projectStore, port, operation string, run func(string) error) (retErr error) {
+	if err := ensureMaintenanceNetworkProjectSafe(store); err != nil {
+		return err
+	}
+	host, record, err := runningHostNetworkRecord(store)
+	if err != nil {
+		return err
+	}
+	if !host {
+		return fmt.Errorf("%s requires a running VM with host-enforced networking; restart the project VM", operation)
+	}
+	keyPath, _, err := ensureRootSSHKey()
+	if err != nil {
+		return fmt.Errorf("prepare root SSH key for maintenance network: %w", err)
+	}
+	if err := ensureRootMaintenanceTunnel(port, keyPath); err != nil {
+		return fmt.Errorf("enable root-only SSH packet tunnel: %w", err)
+	}
+	sessionID, err := newVMLaunchID()
+	if err != nil {
+		return fmt.Errorf("create maintenance session identity: %w", err)
+	}
+	deadline := time.Now().Add(fullNetworkOwnerTTL)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	response, err := hostNetworkControlRequestWithReply(ctx, store.runtimeDir(), record.LaunchID, hostNetworkControlRequest{Operation: "maintenance-start", SessionID: sessionID, KeyPath: keyPath}, deadline)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("start authenticated maintenance tunnel: %w", err)
+	}
+	if response.MaintenanceSession == nil {
+		_ = stopMaintenanceControl(store.runtimeDir(), record.LaunchID, sessionID)
+		return errors.New("host network returned no maintenance tunnel details")
+	}
+	session := *response.MaintenanceSession
+	name := "zaigr-maint-" + sessionID
+	cleanupNamespace := func() error {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		command := "ip netns del " + singleQuotedArg(name) + " 2>/dev/null || true; rm -rf -- " + singleQuotedArg("/etc/netns/"+name)
+		return sshRunCommandWithExitStatusContext(cleanupCtx, port, keyPath, "root", command)
+	}
+	stopRenewal := make(chan struct{})
+	renewalDone := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopRenewal:
+				renewalDone <- nil
+				return
+			case <-ticker.C:
+				renewCtx, renewCancel := context.WithTimeout(context.Background(), 4*time.Second)
+				_, renewErr := hostNetworkControlRequestWithReply(renewCtx, store.runtimeDir(), record.LaunchID, hostNetworkControlRequest{Operation: "maintenance-renew", SessionID: sessionID}, time.Now().Add(fullNetworkOwnerTTL))
+				renewCancel()
+				if renewErr != nil {
+					fmt.Fprintf(os.Stderr, "warning: maintenance network renewal failed; network access expires within %s: %v\n", fullNetworkOwnerTTL, renewErr)
+					renewalDone <- renewErr
+					return
+				}
+			}
+		}
+	}()
+	defer func() {
+		close(stopRenewal)
+		renewErr := <-renewalDone
+		stoppedLaunch := operation == "project setup capture" && waitFullNetworkLeaseLaunchStopped(store.runtimeDir(), record.LaunchID, 100*time.Millisecond)
+		if retErr == nil && renewErr != nil && !stoppedLaunch {
+			retErr = errors.New("maintenance network session renewal failed; host firewall expired the session")
+		}
+		if stoppedLaunch {
+			return
+		}
+		stopErr := stopMaintenanceControl(store.runtimeDir(), record.LaunchID, sessionID)
+		if stopErr != nil && operation == "project setup capture" && waitFullNetworkLeaseLaunchStopped(store.runtimeDir(), record.LaunchID, 12*time.Second) {
+			// Accept/discard can tear down the VM before its maintenance session
+			// control request is served. Only that proven launch teardown makes
+			// the missing endpoint equivalent to successful revocation.
+			return
+		}
+		retErr = errors.Join(retErr, stopErr, cleanupNamespace())
+	}()
+	if err := prepareMaintenanceNamespace(port, keyPath, name, session); err != nil {
+		return fmt.Errorf("prepare isolated maintenance namespace: %w", err)
+	}
+	fmt.Fprintln(os.Stderr, maintenanceOperationWarning(operation))
+	retErr = run(name)
+	return retErr
+}
+
+func withMaintenanceNetworkSessionForSetups(store projectStore, port, operation string, definitions []setupDefinition, run func(string) error) error {
+	if names := rootEquivalentSetupNames(definitions); len(names) > 0 {
+		return fmt.Errorf("cannot attach setup execution with maintenance network access while installing root-equivalent runtime setup(s): %s; use a clean dedicated image without these runtimes or exact host firewall grants", strings.Join(names, ", "))
+	}
+	return withMaintenanceNetworkSession(store, port, operation, run)
+}
+
+func ensureMaintenanceNetworkProjectSafe(store projectStore) error {
+	records, err := store.readAppliedSetups()
+	if err != nil {
+		return fmt.Errorf("cannot verify setup history before maintenance network access: %w", err)
+	}
+	if names := rootEquivalentAppliedSetupNames(records); len(names) > 0 {
+		return fmt.Errorf("maintenance network access is unavailable because this project image contains root-equivalent runtime setup(s): %s; stopping their daemons or deleting setup metadata does not restore isolation. Use a clean project image without these runtimes or exact host firewall grants", strings.Join(names, ", "))
+	}
+	failed, err := store.hasSetupFailureMarker()
+	if err != nil {
+		return fmt.Errorf("cannot verify setup failure history before maintenance network access: %w", err)
+	}
+	if failed {
+		return errors.New("maintenance network access is unavailable because a setup failed or was interrupted; it may have left partial image changes that are absent from setup records. Stop the VM and run `zaigr project rebuild` to replace the image from recorded setups, or run `zaigr project clean` to discard all setup changes. Rebuild may require `--force` if you intend to discard unrecorded root changes. If recovery cannot establish a trusted image, use a clean project image")
+	}
+	if _, pending, err := store.readSetupExecutionIntent(); err != nil {
+		return fmt.Errorf("cannot verify setup execution state before maintenance network access: %w", err)
+	} else if pending {
+		return errors.New("maintenance network access is unavailable because an interrupted setup execution is unresolved; recover or replace the project image before opening a maintenance session")
+	}
+	if _, err := os.Stat(store.appliedSetupsPath()); errors.Is(err, os.ErrNotExist) {
+		pin, hasPin, pinErr := store.readBackingPin()
+		if pinErr != nil {
+			return fmt.Errorf("cannot verify project base-image provenance before maintenance network access: %w", pinErr)
+		}
+		if hasPin && pin.Kind == "custom" {
+			manifest, customized, manifestErr := readGlobalBaseManifest()
+			if manifestErr != nil {
+				return fmt.Errorf("cannot verify pinned custom base-image setup history before maintenance network access: %w", manifestErr)
+			}
+			if customized && manifest.Revision == pin.Revision {
+				if names := rootEquivalentAppliedSetupNames(manifest.Applied); len(names) > 0 {
+					return fmt.Errorf("maintenance network access is unavailable because the pinned custom base image contains root-equivalent runtime setup(s): %s; use a clean project image without these runtimes or exact host firewall grants", strings.Join(names, ", "))
+				}
+			} else {
+				return errors.New("maintenance network access is unavailable because the custom base image has no verifiable applied-setup history; create a clean project image with recorded setup provenance")
+			}
+		}
+	} else if err != nil {
+		return fmt.Errorf("cannot verify applied setup history before maintenance network access: %w", err)
+	}
+	return nil
+}
+
+func rootEquivalentAppliedSetupNames(records []appliedSetup) []string {
+	seen := make(map[string]struct{})
+	var names []string
+	for _, record := range records {
+		name := strings.ToLower(strings.TrimSpace(record.Name))
+		if name != "docker" && name != "k3s" {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	return names
+}
+
+func rootEquivalentSetupNames(definitions []setupDefinition) []string {
+	records := make([]appliedSetup, 0, len(definitions))
+	for _, definition := range definitions {
+		records = append(records, appliedSetup{Name: definition.Name})
+	}
+	return rootEquivalentAppliedSetupNames(records)
+}
+
+func stopMaintenanceControl(runtimeDir, launchID, sessionID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := hostNetworkControlRequestWithReply(ctx, runtimeDir, launchID, hostNetworkControlRequest{Operation: "maintenance-stop", SessionID: sessionID}, time.Time{})
+	if err != nil {
+		return fmt.Errorf("stop maintenance network session: %w", err)
+	}
+	return nil
+}
+
+func prepareMaintenanceNamespace(port, keyPath, name string, session hostnet.MaintenanceSession) error {
+	if !validHostPolicyScopeID(strings.TrimPrefix(name, "zaigr-maint-")) {
+		return errors.New("invalid maintenance namespace name")
+	}
+	iface := fmt.Sprintf("tun%d", session.TunnelIndex)
+	command := "set -eu\n" +
+		"install -d -o root -g root -m 0700 /run/netns\n" +
+		"chmod 0700 /run/netns\n" +
+		"created=1\n" +
+		"cleanup() { if [ \"$created\" = 1 ]; then ip netns del " + singleQuotedArg(name) + " >/dev/null 2>&1 || true; fi; rm -rf -- " + singleQuotedArg("/etc/netns/"+name) + "; }\n" +
+		"trap cleanup EXIT\n" +
+		"ip netns add " + singleQuotedArg(name) + "\n" +
+		"for attempt in $(seq 1 50); do ip link show dev " + singleQuotedArg(iface) + " >/dev/null 2>&1 && break; sleep 0.1; done\n" +
+		"ip link show dev " + singleQuotedArg(iface) + " >/dev/null\n" +
+		"ip link set dev " + singleQuotedArg(iface) + " netns " + singleQuotedArg(name) + "\n" +
+		"ip -n " + singleQuotedArg(name) + " link set lo up\n" +
+		"ip -n " + singleQuotedArg(name) + " addr add " + session.GuestAddress.String() + "/32 peer " + session.HostAddress.String() + "/32 dev " + singleQuotedArg(iface) + "\n" +
+		"ip -n " + singleQuotedArg(name) + " link set dev " + singleQuotedArg(iface) + " up\n" +
+		"ip -n " + singleQuotedArg(name) + " route replace default dev " + singleQuotedArg(iface) + "\n" +
+		"install -d -o root -g root -m 0700 " + singleQuotedArg("/etc/netns/"+name) + "\n" +
+		"printf 'nameserver 10.0.2.3\\noptions timeout:1 attempts:1\\n' > " + singleQuotedArg("/etc/netns/"+name+"/resolv.conf") + "\n" +
+		"trap - EXIT\n"
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	return sshRunCommandWithExitStatusContext(ctx, port, keyPath, "root", command)
+}
+
+func ensureRootMaintenanceTunnel(port, keyPath string) error {
+	script := "set -eu\n" +
+		"config=/etc/ssh/sshd_config\n" +
+		"tunnel=/etc/ssh/zaigr-maintenance-tunnel.conf\n" +
+		"include='Include /etc/ssh/zaigr-maintenance-tunnel.conf'\n" +
+		"test ! -L \"$config\" -a -f \"$config\"\n" +
+		"if test -L \"$tunnel\"; then exit 1; fi\n" +
+		"tmp=\"$(mktemp /etc/ssh/.zaigr-maintenance-tunnel.XXXXXX)\"\n" +
+		"trap 'rm -f \"$tmp\"' EXIT\n" +
+		"printf '%s\\n' 'Match User root' '  PermitTunnel point-to-point' > \"$tmp\"\n" +
+		"chown root:root \"$tmp\"; chmod 0644 \"$tmp\"\n" +
+		"mv -fT -- \"$tmp\" \"$tunnel\"\n" +
+		"grep -Fqx -- \"$include\" \"$config\" || printf '%s\\n' \"$include\" >> \"$config\"\n" +
+		"sshd -t\n" +
+		"systemctl reload ssh\n"
+	command := "flock -x /run/lock/zaigr-maintenance-sshd-config.lock sh -eu -c " + singleQuotedArg(script)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	return sshRunCommandWithExitStatusContext(ctx, port, keyPath, "root", command)
+}

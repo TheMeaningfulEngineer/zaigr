@@ -1,17 +1,38 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
+	"zaigr/cmd/zaigr/hostnet"
 )
 
 var firewallDomainPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
+
+func acquireGlobalFirewallMutationLock(operation string) (*projectMutationLock, error) {
+	dir, err := projectLocksDir()
+	if err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(filepath.Join(dir, "global-firewall.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("open global firewall lock: %w", err)
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("cannot run %s: another global firewall mutation is running", operation)
+	}
+	return &projectMutationLock{held: []heldProjectLock{{file: file}}}, nil
+}
 
 func newGlobalFirewallCommand() *cobra.Command {
 	cmd := &cobra.Command{
@@ -75,6 +96,11 @@ func cmdGlobalFirewallList() error {
 }
 
 func cmdGlobalFirewallAllow(rawDomains []string) error {
+	lock, err := acquireGlobalFirewallMutationLock("global firewall allow")
+	if err != nil {
+		return err
+	}
+	defer lock.release()
 	domains, err := normalizeFirewallDomains(rawDomains)
 	if err != nil {
 		return err
@@ -96,10 +122,18 @@ func cmdGlobalFirewallAllow(rawDomains []string) error {
 		currentSet[domain] = struct{}{}
 		fmt.Printf("allowed %s\n", domain)
 	}
-	return writeGlobalFirewallEntries(current)
+	if err := writeGlobalFirewallEntries(current); err != nil {
+		return err
+	}
+	return reconcileGlobalHostFirewallPolicy()
 }
 
 func cmdGlobalFirewallRemove(rawDomains []string) error {
+	lock, err := acquireGlobalFirewallMutationLock("global firewall remove")
+	if err != nil {
+		return err
+	}
+	defer lock.release()
 	domains, err := normalizeFirewallDomains(rawDomains)
 	if err != nil {
 		return err
@@ -134,7 +168,7 @@ func cmdGlobalFirewallRemove(rawDomains []string) error {
 	for _, domain := range domains {
 		fmt.Printf("removed %s\n", domain)
 	}
-	return nil
+	return reconcileGlobalHostFirewallPolicy()
 }
 
 func completeGlobalFirewallEntry(_ *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
@@ -165,14 +199,61 @@ func globalFirewallPath() string {
 }
 
 func globalFirewallEntries() ([]string, error) {
-	return readFirewallListFile(globalFirewallPath(), "global firewall")
+	data, err := readProtectedHostPolicyFile(zaigDir(), "firewall")
+	if err != nil {
+		return nil, err
+	}
+	return parseProtectedFirewallDomains(data, "global firewall")
 }
 
 func writeGlobalFirewallEntries(entries []string) error {
-	if err := os.MkdirAll(zaigDir(), 0755); err != nil {
-		return fmt.Errorf("create %s: %w", zaigDir(), err)
+	normalized, err := normalizeFirewallDomains(entries)
+	if err != nil {
+		return err
 	}
-	return writeFirewallListFile(globalFirewallPath(), entries, "global firewall")
+	var data []byte
+	if len(normalized) > 0 {
+		data = []byte(strings.Join(normalized, "\n") + "\n")
+	}
+	return writeProtectedHostPolicyFile(zaigDir(), "firewall", data)
+}
+
+func reconcileGlobalHostFirewallPolicy() error {
+	stores, err := listProjectStores()
+	if err != nil {
+		return fmt.Errorf("global firewall saved, but project stores could not be enumerated for live reconciliation: %w", err)
+	}
+	var failures []error
+	for _, store := range stores {
+		running, stale := detectRunningProjectVMWithMetadataInStore(store)
+		if stale || running == nil {
+			continue
+		}
+		host, record, err := runningHostNetworkRecord(store)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("project %s host firewall status: %w", store.Hash, err))
+			continue
+		}
+		if !host {
+			continue
+		}
+		lock, err := acquireProjectOperationLock(store, "global firewall policy reconciliation", false, true)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("project %s: %w", store.Hash, err))
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, syncErr := hostNetworkControl(ctx, store.runtimeDir(), record.LaunchID, "policy-reconcile", hostnet.Forward{})
+		cancel()
+		_ = lock.release()
+		if syncErr != nil {
+			failures = append(failures, fmt.Errorf("project %s host firewall: %w", store.Hash, syncErr))
+		}
+	}
+	if len(failures) != 0 {
+		return fmt.Errorf("global firewall policy was saved, but live project policy reconciliation failed: %w", errors.Join(failures...))
+	}
+	return nil
 }
 
 func normalizeFirewallDomains(rawDomains []string) ([]string, error) {

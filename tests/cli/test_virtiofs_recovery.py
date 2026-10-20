@@ -147,6 +147,7 @@ def test_attached_teardown_uncertainty_retains_global_staging(project, setup_fac
         cwd=tmp_path, env=env, timeout=180,
     )
     record = None
+    workspace_path = None
     suspended = False
     try:
         build.expect_exact("TEARDOWN_PROOF_READY", timeout=150)
@@ -171,8 +172,11 @@ def test_attached_teardown_uncertainty_retains_global_staging(project, setup_fac
         assert record_path.exists()
         assert (custom_root / "vm-supervisor.log").exists()
         assert (stage / "working.qcow2").exists()
-        assert (stage / "workspace").is_dir()
-        assert (stage / "agent-state").is_dir()
+        workspace_path = Path((stage / "workspace-path").read_text(encoding="utf-8").strip())
+        assert workspace_path.is_dir()
+        assert workspace_path.name == stage.name
+        assert workspace_path.parent.name == "global-base-workspaces"
+        assert (stage / "runtime-store/agent-state").is_dir()
         assert (current.read_bytes() if current.exists() else None) == original_selection
 
         started = time.monotonic()
@@ -186,8 +190,8 @@ def test_attached_teardown_uncertainty_retains_global_staging(project, setup_fac
         assert stage.exists() and record_path.exists()
         assert (custom_root / "vm-supervisor.log").exists()
         assert (stage / "working.qcow2").exists()
-        assert (stage / "workspace").is_dir()
-        assert (stage / "agent-state").is_dir()
+        assert workspace_path.is_dir()
+        assert (stage / "runtime-store/agent-state").is_dir()
         assert (current.read_bytes() if current.exists() else None) == original_selection
 
         # Removing the lock pathname does not release the supervisor's open
@@ -204,8 +208,8 @@ def test_attached_teardown_uncertainty_retains_global_staging(project, setup_fac
             assert "previous VM supervisor is still live" in stdout + stderr
             assert record_path.exists()
             assert (stage / "working.qcow2").exists()
-            assert (stage / "workspace").is_dir()
-            assert (stage / "agent-state").is_dir()
+            assert workspace_path.is_dir()
+            assert (stage / "runtime-store/agent-state").is_dir()
             assert (current.read_bytes() if current.exists() else None) == original_selection
         finally:
             saved_lock.rename(lock_path)
@@ -219,6 +223,23 @@ def test_attached_teardown_uncertainty_retains_global_staging(project, setup_fac
             build.close(force=True)
         if suspended:
             _wait_clean(record, record_path, timeout=30)
+    moved_cache_env = env.copy()
+    moved_cache_env["XDG_CACHE_HOME"] = str(tmp_path / "changed-cache")
+    stdout, stderr, code = _run(
+        [zaigr, "global", "base-image", "reset"],
+        cwd=tmp_path, env=moved_cache_env, timeout=45,
+    )
+    assert code != 0, err_msg(stdout, stderr)
+    assert "restore the original cache location" in stdout + stderr
+    assert stage.exists() and workspace_path.is_dir()
+
+    stdout, stderr, code = _run(
+        [zaigr, "global", "base-image", "reset"],
+        cwd=tmp_path, env=env, timeout=45,
+    )
+    assert code == 0, err_msg(stdout, stderr)
+    assert not stage.exists()
+    assert not workspace_path.exists()
 
 
 @pytest.mark.timeout(360)

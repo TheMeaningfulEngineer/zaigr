@@ -14,40 +14,6 @@ apt-get install -y --no-install-recommends \
     nftables \
     tar
 
-mkdir -p /etc/opensnitchd/rules
-cat > /etc/opensnitchd/rules/020-zaigr-k3s-pod-cidr.json <<'EOF'
-{
-  "name": "020-zaigr-k3s-pod-cidr",
-  "description": "Allow only k3s cluster-local pod CIDR traffic. External egress remains domain controlled.",
-  "enabled": true,
-  "precedence": true,
-  "action": "allow",
-  "duration": "always",
-  "operator": {
-    "type": "network",
-    "sensitive": false,
-    "operand": "dest.network",
-    "data": "10.42.0.0/16"
-  }
-}
-EOF
-cat > /etc/opensnitchd/rules/020-zaigr-k3s-service-cidr.json <<'EOF'
-{
-  "name": "020-zaigr-k3s-service-cidr",
-  "description": "Allow only k3s cluster-local service CIDR traffic. External egress remains domain controlled.",
-  "enabled": true,
-  "precedence": true,
-  "action": "allow",
-  "duration": "always",
-  "operator": {
-    "type": "network",
-    "sensitive": false,
-    "operand": "dest.network",
-    "data": "10.43.0.0/16"
-  }
-}
-EOF
-
 mkdir -p /etc/zaigr/internal-cidrs.d /usr/local/lib/zaigr
 cat > /etc/zaigr/internal-cidrs.d/k3s.conf <<'EOF'
 pod=10.42.0.0/16
@@ -104,23 +70,6 @@ require_not_gateway_routed "$service_probe" "service"
 log "cluster CIDR fallback routes installed and validated"
 EOF
 chmod 0755 /usr/local/lib/zaigr/k3s-internal-network
-
-cat > /etc/opensnitchd/rules/021-zaigr-k3s-kubelet-localhost.json <<'EOF'
-{
-  "name": "021-zaigr-k3s-kubelet-localhost",
-  "description": "Allow k3s kubelet localhost control traffic only.",
-  "enabled": true,
-  "precedence": true,
-  "action": "allow",
-  "duration": "always",
-  "operator": {
-    "type": "simple",
-    "sensitive": false,
-    "operand": "dest.ip",
-    "data": "127.0.0.1"
-  }
-}
-EOF
 
 /usr/local/lib/zaigr/k3s-internal-network
 

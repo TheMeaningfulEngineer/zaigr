@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,8 +9,10 @@ import (
 	"strconv"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
+	"zaigr/cmd/zaigr/hostnet"
 )
 
 func newProjectHostAccessCommand() *cobra.Command {
@@ -128,6 +131,9 @@ func cmdHostAccessChange(resource, vmPort string, override, allow bool) error {
 			return fmt.Errorf("--vm-port: %w", err)
 		}
 	}
+	if allow && running != nil && strconv.Itoa(host) == running.Port {
+		return fmt.Errorf("host port %d is reserved for VM SSH management", host)
+	}
 	return changeHostAccessPort(store, g, running, hostAccessPort{Host: host, VM: vm}, allow)
 }
 
@@ -155,14 +161,30 @@ func changeHostAccessPort(store projectStore, g hostAccessGrants, running *runni
 			return err
 		}
 	}
+	var runtimeErr error
 	if running != nil {
-		q, err := openHostAccessQMP(store)
-		if err == nil {
-			defer func() { _ = q.conn.Close() }()
-			err = q.applyPort(p, running.Port, !allow)
+		hostBackend, record, backendErr := runningHostNetworkRecord(store)
+		if backendErr != nil {
+			return backendErr
 		}
-		if err != nil {
-			return fmt.Errorf("host port %d remains saved; runtime change failed: %w%s; retry or restart the VM", p.Host, err, hostPortOwnerHint(store, p.Host))
+		if hostBackend {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			op := "forward-add"
+			if !allow {
+				op = "forward-remove"
+			}
+			_, runtimeErr = hostNetworkControl(ctx, store.runtimeDir(), record.LaunchID, op, hostnet.Forward{HostPort: uint16(p.Host), GuestPort: uint16(p.VM), Protocol: "tcp"})
+		} else {
+			q, qerr := openHostAccessQMP(store)
+			if qerr == nil {
+				defer func() { _ = q.conn.Close() }()
+				qerr = q.applyPort(p, running.Port, !allow)
+			}
+			runtimeErr = qerr
+		}
+		if runtimeErr != nil {
+			return fmt.Errorf("host port %d remains saved; runtime change failed: %w%s; retry or restart the VM", p.Host, runtimeErr, hostPortOwnerHint(store, p.Host))
 		}
 	}
 	if !allow {
@@ -344,17 +366,44 @@ func inspectHostAccess(store projectStore, g hostAccessGrants) (map[int]hostAcce
 		}
 		return ports, devices, nil
 	}
-	q, err := openHostAccessQMP(store)
+	hostBackend, record, err := runningHostNetworkRecord(store)
 	if err != nil {
 		return unknown(err)
 	}
-	defer func() { _ = q.conn.Close() }()
-	forwards, err := q.forwards()
-	if err != nil {
-		return unknown(err)
+	var q *hostAccessQMP
+	forwards := make(map[int]int)
+	if hostBackend {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		status, controlErr := hostNetworkControl(ctx, store.runtimeDir(), record.LaunchID, "status", hostnet.Forward{})
+		cancel()
+		if controlErr != nil {
+			return unknown(controlErr)
+		}
+		for _, f := range status.Forwards {
+			if f.Protocol == "tcp" {
+				forwards[int(f.HostPort)] = int(f.GuestPort)
+			}
+		}
+	} else {
+		q, err = openHostAccessQMP(store)
+		if err != nil {
+			return unknown(err)
+		}
+		defer func() { _ = q.conn.Close() }()
+		forwards, err = q.forwards()
+		if err != nil {
+			return unknown(err)
+		}
 	}
 	runtime := hostAccessRuntime{}
 	if len(g.Devices) > 0 {
+		if q == nil {
+			q, err = openHostAccessQMP(store)
+			if err != nil {
+				return unknown(err)
+			}
+			defer func() { _ = q.conn.Close() }()
+		}
 		runtime, err = store.readHostAccessRuntime()
 		if err == nil {
 			err = verifyHostAccessRuntime(q, runtime, g)

@@ -94,8 +94,8 @@ def test_failed_new_setup_version_keeps_old_applied_record_and_partial_changes(
     setup_factory(
         setup_name="direct-failure",
         script_content=(
-            "printf 'partial-v2\\n' > /etc/zaigr-direct-failure-partial\n"
             "if [ \"$(cat /home/user/workspace/direct-failure-mode)\" != succeed ]; then\n"
+            "  printf 'partial-v2\\n' > /etc/zaigr-direct-failure-partial\n"
             "  printf 'v2 failed after writing\\n' >&2\n"
             "  exit 23\n"
             "fi\n"
@@ -140,17 +140,33 @@ def test_failed_new_setup_version_keeps_old_applied_record_and_partial_changes(
     assert not (project.store_dir / "awaiting-commit").exists()
     assert not (project.store_dir / "failed").exists()
 
+    run(f"{zaigr} project vm stop", timeout=60)
     retry_mode.write_text("succeed\n", encoding="utf-8")
     run(
         f"{zaigr} project setup run direct-failure",
         timeout=120,
     )
+    assert (project.store_dir / "setup-failed-once").is_file()
 
     current = run(f"{zaigr} project setup list --applied", timeout=10)
     assert "applied (1):" in current
     assert _setup_entry(current, "direct-failure") != old_entry
     status = run(f"{zaigr} project status", timeout=10)
     assert status.count(FAILURE_NOTE) == 1
+
+    rebuilt = run(f"{zaigr} project rebuild", timeout=240)
+    assert "Rebuilt project image from applied setups" in rebuilt
+    assert not (project.store_dir / "setup-failed-once").exists()
+    run(f"{zaigr} project vm start", timeout=180)
+    run(
+        f"{zaigr} project vm exec -- test ! -e /etc/zaigr-direct-failure-partial",
+        timeout=20,
+    )
+    rebuilt_version = run(
+        f"{zaigr} project vm exec -- cat /etc/zaigr-direct-failure-version",
+        timeout=20,
+    )
+    assert rebuilt_version.strip() == "v2"
 
 
 @pytest.mark.timeout(240)
@@ -363,7 +379,7 @@ def test_rebuild_uses_current_setup_version_and_clean_clears_all_state(
     ).strip() == current_base_version
     status = run(f"{zaigr} project status", timeout=10)
     assert "status: not running" in status
-    assert status.count(FAILURE_NOTE) == 1
+    assert status.count(FAILURE_NOTE) == 0
 
     rebuilt_image = _project_image(project)
     info_text, stderr, rc = _run(
@@ -507,7 +523,11 @@ def test_new_setup_firewall_rules_accumulate_directly_but_rebuild_uses_current_r
         env=project.env,
         timeout=20,
     )
-    assert rc == 28, err_msg(stdout, stderr)
+    # The host DNS broker refuses names removed from the current setup policy
+    # before curl can attempt a TCP connection. A resolve error (6), rather
+    # than a connect timeout (28), is the expected observable denial.
+    assert rc == 6, err_msg(stdout, stderr)
+    assert "could not resolve host" in stderr.lower(), stderr
 
 
 @pytest.mark.timeout(600)
@@ -1320,7 +1340,7 @@ def test_legacy_store_can_be_rebuilt_or_explicitly_cleaned_or_deleted(
     assert not legacy_image.exists()
     assert not awaiting.exists()
     assert (store / "image-format").read_text(encoding="utf-8").strip() == "direct-base-v1"
-    assert (store / "setup-failed-once").read_text(encoding="utf-8") == "1\n"
+    assert not (store / "setup-failed-once").exists()
     assert _tree_snapshot(agent_state) == agent_state_snapshot
 
     _checked_run(

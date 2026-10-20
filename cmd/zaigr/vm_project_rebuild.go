@@ -148,6 +148,7 @@ func rebuildMetadataPaths(store projectStore) []string {
 	return []string{
 		store.configPath(),
 		store.appliedSetupsPath(),
+		store.setupFailureMarkerPath(),
 		store.firewallPath(),
 		store.baseImageVersionPath(),
 		store.projectImageDirtyPath(),
@@ -1297,6 +1298,9 @@ func buildRebuildCandidate(store projectStore, sourceStore projectStore, definit
 			return err
 		}
 		if err := store.writeBackingPin(selection.Pin); err != nil {
+			return err
+		}
+		if err := store.clearSetupFailureMarker(); err != nil {
 			return err
 		}
 		return store.clearProjectImageDirty()

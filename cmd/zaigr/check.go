@@ -2,14 +2,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
+	"zaigr/cmd/zaigr/hostnet"
 )
 
 const (
@@ -30,22 +33,43 @@ func newCheckCommand() *cobra.Command {
 }
 
 type checkResult struct {
-	name   string
-	detail string
-	passed bool
+	name         string
+	detail       string
+	summary      string
+	guidance     string
+	passed       bool
+	missingTools string
 }
 
 func cmdCheck() error {
 	host := detectCheckHost()
 	fmt.Printf("Host: %s (kernel %s)\n", host.name, host.kernel)
-	checks := []checkResult{
+	checks := collectHostPreflight(host)
+
+	passed := printHostChecks(checks)
+	fmt.Printf("\n  %d/%d checks passed\n", passed, len(checks))
+
+	if passed < len(checks) {
+		fmt.Println()
+		printHostPreflightGuidance(checks)
+		printHostPreflightAdvice(host, checks)
+		return exitError(1)
+	}
+	return nil
+}
+
+func collectHostPreflight(host checkHost) []checkResult {
+	return []checkResult{
 		checkKVM(),
 		checkQEMU(),
 		checkHostTools(host),
 		checkVirtiofs(host),
 		checkDiskSpace(),
+		checkHostNetworking(host),
 	}
+}
 
+func printHostChecks(checks []checkResult) int {
 	passed := 0
 	for _, c := range checks {
 		if c.passed {
@@ -60,10 +84,298 @@ func cmdCheck() error {
 		fmt.Println()
 	}
 
-	fmt.Printf("\n  %d/%d checks passed\n", passed, len(checks))
+	return passed
+}
 
-	if passed < len(checks) {
-		return exitError(1)
+func requireHostPreflight(operation string) error {
+	host := detectCheckHost()
+	checks := collectHostPreflight(host)
+	var failed []checkResult
+	for _, check := range checks {
+		if !check.passed {
+			failed = append(failed, check)
+		}
+	}
+	return formatHostPreflightFailure(operation, host, failed)
+}
+
+func formatHostPreflightFailure(operation string, host checkHost, failed []checkResult) error {
+	if len(failed) == 0 {
+		return nil
+	}
+	var details []string
+	missingTools := make(map[string]bool)
+	for _, check := range failed {
+		detail := check.name
+		if check.summary != "" {
+			detail += ": " + check.summary
+		} else if check.detail != "" {
+			detail += ": " + shortPreflightDetail(check.detail)
+		}
+		details = append(details, detail)
+		for _, tool := range strings.Split(check.missingTools, ",") {
+			if tool = strings.TrimSpace(tool); tool != "" {
+				missingTools[tool] = true
+			}
+		}
+	}
+	message := fmt.Sprintf("Host preflight failed before %s.\n%s\nRun 'zaigr misc check' for the full host report.", operation, strings.Join(details, "\n"))
+	guidance := hostPreflightGuidance(failed)
+	if guidance != "" {
+		message += "\n\n" + guidance
+	}
+	packages := hostPreflightPackageGuidance(host, missingTools)
+	if packages != "" {
+		if missingNetworkTool(missingTools) {
+			message += "\n\nHost-enforced networking needs these tools on the host, including when upgrading from the guest firewall."
+		}
+		message += "\n\n" + packages
+	}
+	return errors.New(message)
+}
+
+func shortPreflightDetail(detail string) string {
+	line, _, _ := strings.Cut(detail, "\n")
+	return strings.TrimSpace(line)
+}
+
+func missingNetworkTool(missing map[string]bool) bool {
+	return missing["slirp4netns"] || missing["setpriv"]
+}
+
+func hostPreflightPackageGuidance(host checkHost, missing map[string]bool) string {
+	if len(missing) == 0 {
+		return ""
+	}
+	if !host.family("debian") && !host.family("ubuntu") {
+		return "Missing tool names are listed above; install their providers for " + host.name + "."
+	}
+	packages := map[string]bool{}
+	for tool := range missing {
+		switch tool {
+		case "qemu-system-x86_64":
+			packages["qemu-system-x86"] = true
+		case "qemu-img":
+			packages["qemu-utils"] = true
+		case "ssh", "ssh-keygen":
+			packages["openssh-client"] = true
+		case "debugfs", "e2fsck", "resize2fs", "dumpe2fs":
+			packages["e2fsprogs"] = true
+		case "slirp4netns":
+			packages["slirp4netns"] = true
+		case "setpriv":
+			packages["util-linux"] = true
+		}
+	}
+	var ordered []string
+	for _, name := range []string{"qemu-system-x86", "qemu-utils", "openssh-client", "e2fsprogs", "slirp4netns", "util-linux"} {
+		if packages[name] {
+			ordered = append(ordered, name)
+		}
+	}
+	if len(ordered) == 0 {
+		return ""
+	}
+	message := "Install missing packages: sudo apt install " + strings.Join(ordered, " ")
+	return message
+}
+
+func printHostPreflightAdvice(host checkHost, checks []checkResult) {
+	missing := make(map[string]bool)
+	for _, check := range checks {
+		for _, tool := range strings.Split(check.missingTools, ",") {
+			if tool = strings.TrimSpace(tool); tool != "" {
+				missing[tool] = true
+			}
+		}
+	}
+	if missingNetworkTool(missing) {
+		fmt.Println("Host-enforced networking needs these tools on the host, including when upgrading from the guest firewall.")
+	}
+	if message := hostPreflightPackageGuidance(host, missing); message != "" {
+		fmt.Println(message)
+	}
+}
+
+func hostPreflightGuidance(checks []checkResult) string {
+	seen := make(map[string]bool)
+	var blocks []string
+	for _, check := range checks {
+		if !check.passed && check.guidance != "" && !seen[check.guidance] {
+			seen[check.guidance] = true
+			blocks = append(blocks, check.guidance)
+		}
+	}
+	return strings.Join(blocks, "\n\n")
+}
+
+func printHostPreflightGuidance(checks []checkResult) {
+	if guidance := hostPreflightGuidance(checks); guidance != "" {
+		fmt.Println(guidance)
+	}
+}
+
+func checkHostNetworking(host checkHost) checkResult {
+	var missing []string
+	var details []string
+	var summary []string
+	var guidance string
+	failed := false
+	runtimeCanRun := true
+	for _, tool := range []string{"slirp4netns", "setpriv"} {
+		if _, err := checkHostToolPath(tool); err != nil {
+			failed = true
+			missing = append(missing, tool)
+			details = append(details, fmt.Sprintf("%s: %v", tool, err))
+			if tool != "setpriv" {
+				runtimeCanRun = false
+			}
+		}
+	}
+	if len(missing) > 0 {
+		summary = append(summary, "missing tools: "+strings.Join(missing, ", "))
+	}
+	if st, err := os.Stat("/dev/net/tun"); err != nil || st.Mode()&os.ModeDevice == 0 || st.Mode()&os.ModeCharDevice == 0 {
+		failed = true
+		runtimeCanRun = false
+		summary = append(summary, "/dev/net/tun is missing or not a character device")
+		details = append(details, "/dev/net/tun: missing or not a character device")
+	}
+	if os.Geteuid() == 0 {
+		failed = true
+		runtimeCanRun = false
+		summary = append(summary, "Zaigr must run as an unprivileged account")
+		details = append(details, "host user: zaigr must run as an unprivileged account, not uid 0")
+	}
+	probeStarted := time.Now()
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer probeCancel()
+	probe := exec.CommandContext(probeCtx, "/bin/true")
+	probe.SysProcAttr = hostnet.RootlessUserNamespaceSysProcAttr(true)
+	probe.WaitDelay = time.Second
+	if out, err := probe.CombinedOutput(); err != nil {
+		failed = true
+		runtimeCanRun = false
+		summary = append(summary, "could not create user/network namespaces")
+		detail := strings.TrimSpace(string(out))
+		if detail == "" {
+			detail = err.Error()
+		}
+		pids := map[int]bool{os.Getpid(): true}
+		audit := readProbeKernelAudit(host, virtiofsProbe{started: probeStarted, ended: time.Now(), pids: pids})
+		report := "Zaigr user/network namespace probe:\n  operation: exec /bin/true with clone(CLONE_NEWUSER|CLONE_NEWNET) and single-UID/GID mappings\n  result: " + detail + "\n  " + audit.detail + "\nHost context:\n" + host.context()
+		details = append(details, report)
+		guidance = hostNamespaceGuidance(host)
+	}
+	if tun, err := os.OpenFile("/dev/net/tun", os.O_RDWR, 0); err == nil {
+		_ = tun.Close()
+	} else {
+		failed = true
+		runtimeCanRun = false
+		summary = append(summary, "cannot open /dev/net/tun read/write")
+		details = append(details, "open /dev/net/tun read/write: "+err.Error())
+	}
+	if runtimeCanRun {
+		if err := probeHostNetworkRuntime(); err != nil {
+			failed = true
+			summary = append(summary, "could not start the disposable host network runtime: "+boundedPreflightCause(err))
+			details = append(details, "Disposable host-network namespace probe:\n  operation: Zaigr-created user/network namespace followed by a no-VM TAP/nftables/slirp start/stop\n  result: "+err.Error()+"\n  diagnosis: "+networkRuntimeDiagnosis(host, err))
+		} else if failed {
+			details = append(details, "Disposable host namespace, TAP, nftables controller and slirp4netns start/stop probe passed; setpriv is still required by the DNS frontend.")
+		}
+	}
+	if failed {
+		var report []string
+		if len(missing) > 0 {
+			report = append(report, "Missing tools/devices: "+strings.Join(missing, ", "))
+		}
+		report = append(report, details...)
+		return checkResult{name: "host-enforced networking", detail: strings.Join(report, "\n"), summary: strings.Join(summary, "; "), guidance: guidance, missingTools: strings.Join(missing, ", ")}
+	}
+	return checkResult{name: "host-enforced networking", detail: "disposable host namespace, TAP, nftables controller and slirp4netns start/stop probe passed; this does not verify outbound traffic or every later runtime condition", passed: true}
+}
+
+func boundedPreflightCause(err error) string {
+	if err == nil {
+		return "unknown error"
+	}
+	text := strings.Join(strings.Fields(err.Error()), " ")
+	const maxRunes = 240
+	runes := []rune(text)
+	if len(runes) > maxRunes {
+		const headRunes = 80
+		const tailRunes = maxRunes - headRunes - 3
+		return string(runes[:headRunes]) + "..." + string(runes[len(runes)-tailRunes:])
+	}
+	return text
+}
+
+func networkRuntimeDiagnosis(host checkHost, err error) string {
+	text := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(text, "tun"):
+		return "The disposable runtime failed while preparing TAP. Review /dev/net/tun access, kernel TUN support, and the exact error above; no cause is inferred from namespace settings."
+	case strings.Contains(text, "nft") || strings.Contains(text, "netlink") || strings.Contains(text, "operation not permitted"):
+		return "The namespace probe passed but disposable firewall setup failed. The exact operation/error is above; host kernel nftables support or a host security policy may be involved, but this probe does not identify which. Observed host settings:\n" + host.context()
+	default:
+		return "The namespace probe passed but a later disposable network startup step failed. The exact operation/error is above; review it with the host administrator. Observed host settings:\n" + host.context()
+	}
+}
+
+func checkHostToolPath(name string) (string, error) {
+	if path, err := exec.LookPath(name); err == nil {
+		return path, nil
+	}
+	return "", fmt.Errorf("not found in PATH")
+}
+
+func probeHostNetworkRuntime() (returnErr error) {
+	slirp, err := checkHostToolPath("slirp4netns")
+	if err != nil {
+		return err
+	}
+	if os.Geteuid() == 0 {
+		return errors.New("host-enforced networking must run as an unprivileged account")
+	}
+	dir, err := os.MkdirTemp("/tmp", "zaigr-network-check-")
+	if err != nil {
+		return fmt.Errorf("create private temporary runtime directory: %w", err)
+	}
+	defer func() {
+		if err := os.RemoveAll(dir); err != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("remove disposable network runtime directory: %w", err))
+		}
+	}()
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve zaigr helper executable: %w", err)
+	}
+	launchID, err := newVMLaunchID()
+	if err != nil {
+		return fmt.Errorf("create disposable launch identity: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 17*time.Second)
+	runtime, err := hostnet.Start(ctx, hostnet.Options{
+		LaunchID: launchID, RuntimeDir: filepath.Clean(dir), Executable: executable,
+		SlirpPath: slirp,
+	})
+	defer cancel()
+	if err != nil {
+		logPath := filepath.Join(dir, "network-helper.log")
+		if log, readErr := os.ReadFile(logPath); readErr == nil {
+			if len(log) > 4096 {
+				log = log[len(log)-4096:]
+			}
+			if detail := strings.TrimSpace(string(log)); detail != "" {
+				return fmt.Errorf("%w; network helper log: %s", err, detail)
+			}
+		}
+		return err
+	}
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopCancel()
+	if err := runtime.Stop(stopCtx); err != nil {
+		return fmt.Errorf("stop disposable host-network runtime: %w", err)
 	}
 	return nil
 }
@@ -93,7 +405,7 @@ func requireKVMAccess() error {
 func checkQEMU() checkResult {
 	path, err := exec.LookPath("qemu-system-x86_64")
 	if err != nil {
-		return checkResult{name: "QEMU installed", detail: "qemu-system-x86_64 not found in PATH", passed: false}
+		return checkResult{name: "QEMU installed", detail: "qemu-system-x86_64 not found in PATH", missingTools: "qemu-system-x86_64"}
 	}
 
 	out, err := checkCommandOutput(path, "--version")
@@ -139,11 +451,7 @@ func checkHostTools(host checkHost) checkResult {
 		}
 	}
 	if len(missing) > 0 {
-		advice := "install packages providing these tools for " + host.name
-		if host.family("debian") || host.family("ubuntu") {
-			advice = "install qemu-utils, openssh-client and e2fsprogs"
-		}
-		return checkResult{name: "host tools", detail: "missing host tools: " + strings.Join(missing, ", ") + "; " + advice}
+		return checkResult{name: "host tools", detail: "missing host tools: " + strings.Join(missing, ", "), missingTools: strings.Join(missing, ", ")}
 	}
 	return checkResult{name: "host tools", detail: "qemu-img, ssh, ssh-keygen, debugfs, e2fsck, resize2fs, dumpe2fs", passed: true}
 }

@@ -145,6 +145,43 @@ func applyStepsViaSSHInContextWithIntent(imagePath string, steps []string, ram s
 			_ = os.RemoveAll(runtimeDir)
 		}
 	}()
+	runtimeStore := store
+	var stagedStoreDir string
+	stagedAgentStateSource := agentStateDir
+	defer func() {
+		if stagedStoreDir == "" {
+			return
+		}
+		if guardErr := requireNoActiveVMSupervisor(runtimeStore, "temporary host policy store cleanup"); guardErr != nil {
+			returnErr = errors.Join(returnErr, guardErr)
+			return
+		}
+		if cleanupErr := os.RemoveAll(stagedStoreDir); cleanupErr != nil {
+			returnErr = errors.Join(returnErr, cleanupErr)
+		}
+	}()
+	if agentStateDir != "" && filepath.Clean(agentStateDir) != filepath.Clean(store.agentStateDir()) {
+		stagedStoreDir, err = os.MkdirTemp("", "zaigr-vm-policy-store-*")
+		if err != nil {
+			return fmt.Errorf("create staged host policy store: %w", err)
+		}
+		runtimeStore = projectStore{Hash: "temporary-build", Path: stagedStoreDir}
+		for _, name := range []string{"firewall", "firewall-ips", projectFirewallDomainsFile} {
+			data, readErr := readProtectedHostPolicyFile(store.Path, name)
+			if readErr != nil {
+				return readErr
+			}
+			if len(data) > 0 {
+				if err := writeProtectedHostPolicyFile(stagedStoreDir, name, data); err != nil {
+					return err
+				}
+			}
+		}
+		agentStateDir = runtimeStore.agentStateDir()
+		if err := copyRebuildAgentState(stagedAgentStateSource, agentStateDir); err != nil {
+			return err
+		}
+	}
 	monitorSock := filepath.Join(runtimeDir, "vm.sock")
 	workspaceSock := filepath.Join(runtimeDir, "workspace.sock")
 	agentStateSock := filepath.Join(runtimeDir, "state.sock")
@@ -167,11 +204,11 @@ func applyStepsViaSSHInContextWithIntent(imagePath string, steps []string, ram s
 		return err
 	}
 	spec := vmLaunchSpec{
-		Store: store.Path, LogRoot: logRoot, RuntimeDir: runtimeDir,
+		Store: runtimeStore.Path, LogRoot: logRoot, RuntimeDir: runtimeDir,
 		MonitorSock: monitorSock, WorkspaceSock: workspaceSock, AgentStateSock: agentStateSock,
 		Workspace: workspace, AgentState: agentStateDir, Virtiofsd: virtiofsdPath,
 		SerialLog: serialLog, SSHPort: sshPort, Mode: "attached", LaunchID: launchID,
-		GuestUID: guestUID, GuestGID: guestGID, QEMUPath: qemuPath, QEMUArgs: args[1:],
+		NetworkBackend: vmNetworkBackendHost, GuestUID: guestUID, GuestGID: guestGID, QEMUPath: qemuPath, QEMUArgs: args[1:],
 	}
 
 	fmt.Println(":: Booting image for modification ...")
@@ -266,8 +303,7 @@ func applyStepsViaSSHInContextWithIntent(imagePath string, steps []string, ram s
 	}
 
 	if rootFullNetwork {
-		fmt.Println(":: Setup execution has full network access")
-		if err := withTemporaryRootAllowAllFirewallRule(sshPort, rootKeyPath, runSetupScripts); err != nil {
+		if err := withFullNetworkLeaseForRuntime(runtimeDir, launchID, "setup execution", "WARNING: Setup execution temporarily grants every process in the dedicated image-building VM broad IPv4 TCP/UDP access, including private networks and host data services. This does not grant network access to an ordinary project VM session.", runSetupScripts); err != nil {
 			if executionStarted && !isGuestSetupExecutionError(err) {
 				stepName := ""
 				if len(steps) > 0 {
@@ -395,6 +431,10 @@ func (writer *setupExecutionStartWriter) flush() error {
 }
 
 func sshRunSetupScriptUntil(port string, keyPath string, script string, deadline time.Time, intent *directSetupExecutionIntent) (bool, error) {
+	return sshRunSetupScriptInNamespaceUntil(port, keyPath, "", script, deadline, intent)
+}
+
+func sshRunSetupScriptInNamespaceUntil(port string, keyPath string, namespace string, script string, deadline time.Time, intent *directSetupExecutionIntent) (bool, error) {
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
 		return false, fmt.Errorf("setup execution timed out after %s", setupExecutionTimeout)
@@ -415,13 +455,15 @@ func sshRunSetupScriptUntil(port string, keyPath string, script string, deadline
 	if keyPath != "" {
 		args = append(args, "-i", keyPath)
 	}
-	args = append(
-		args,
-		"-p", port,
-		"root@localhost",
-		"timeout", "--signal=TERM", "--kill-after=10s", strconv.FormatInt(remoteSeconds, 10)+"s",
-		"bash", "-eu",
-	)
+	remote := []string{"timeout", "--signal=TERM", "--kill-after=10s", strconv.FormatInt(remoteSeconds, 10) + "s", "bash", "-eu"}
+	if namespace != "" {
+		if !validHostPolicyScopeID(strings.TrimPrefix(namespace, "zaigr-maint-")) {
+			return false, errors.New("invalid maintenance namespace")
+		}
+		remote = append([]string{"ip", "netns", "exec", namespace}, remote...)
+	}
+	args = append(args, "-p", port, "root@localhost")
+	args = append(args, remote...)
 	cmd := exec.CommandContext(ctx, "ssh", args...)
 	cmd.Stdin = strings.NewReader(script)
 	startWriter := &setupExecutionStartWriter{destination: os.Stdout}
@@ -572,6 +614,15 @@ func ensureUserSSHAccessContext(ctx context.Context, port string) error {
 		"chown root:root \"$config_tmp\"\n" +
 		"chmod 0644 \"$config_tmp\"\n" +
 		"mv -fT -- \"$config_tmp\" /etc/ssh/sshd_config.d/00-zaigr-managed-keys.conf\n" +
+		"tunnel_config=/etc/ssh/zaigr-maintenance-tunnel.conf\n" +
+		"tunnel_tmp=\"$(mktemp /etc/ssh/.zaigr-maintenance-tunnel.XXXXXX)\"\n" +
+		"printf '%s\\n' 'Match User root' '  PermitTunnel point-to-point' > \"$tunnel_tmp\"\n" +
+		"chown root:root \"$tunnel_tmp\"\n" +
+		"chmod 0644 \"$tunnel_tmp\"\n" +
+		"mv -fT -- \"$tunnel_tmp\" \"$tunnel_config\"\n" +
+		"main_config=/etc/ssh/sshd_config\n" +
+		"include_line='Include /etc/ssh/zaigr-maintenance-tunnel.conf'\n" +
+		"grep -Fqx -- \"$include_line\" \"$main_config\" || printf '%s\\n' \"$include_line\" >> \"$main_config\"\n" +
 		"sshd -t\n" +
 		"systemctl reload ssh\n" +
 		"trap - EXIT"

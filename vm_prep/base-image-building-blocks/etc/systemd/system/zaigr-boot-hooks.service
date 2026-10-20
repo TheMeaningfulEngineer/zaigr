@@ -1,7 +1,7 @@
 [Unit]
 Description=Run zaigr guest boot hooks
-After=opensnitch.service
-Requires=opensnitch.service
+After=zaigr-runtime-setup.service
+Requires=zaigr-runtime-setup.service
 Before=zaigr-runtime-ready.service ssh.service
 
 [Service]

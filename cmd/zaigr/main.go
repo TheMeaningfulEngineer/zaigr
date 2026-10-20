@@ -64,6 +64,8 @@ func newRootCommand() *cobra.Command {
 	rootCmd.AddCommand(newGlobalCommand())
 	rootCmd.AddCommand(newMiscCommand(rootCmd))
 	rootCmd.AddCommand(newVMSupervisorCommand())
+	rootCmd.AddCommand(newHostNetworkHelperCommand())
+	rootCmd.AddCommand(newHostDNSFrontendCommand())
 
 	return rootCmd
 }

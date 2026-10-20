@@ -2,9 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
-	"strings"
+	"zaigr/cmd/zaigr/hostnet"
 )
 
 func cmdProjectFirewallIPChange(rawAddress string, allow bool) error {
@@ -182,59 +183,17 @@ func syncProjectFirewallIPsToVMContext(ctx context.Context, port string, address
 		return err
 	}
 	store := currentProjectStore()
-	applied, _, err := store.appliedFirewallIPs()
+	_ = port
+	_ = revoked
+	host, record, err := runningHostNetworkRecord(store)
 	if err != nil {
 		return err
 	}
-	attempted, _, err := store.attemptedFirewallIPs()
-	if err != nil {
-		return err
+	if !host {
+		return errors.New("host firewall control is unavailable; stop the legacy VM and start it again to migrate")
 	}
-	desired := make(map[string]struct{}, len(addresses))
-	for _, address := range addresses {
-		desired[address] = struct{}{}
-	}
-	revocationSet := make(map[string]struct{}, len(revoked)+len(applied)+len(attempted))
-	potentiallyApplied := make(map[string]struct{}, len(revoked)+len(applied)+len(attempted)+len(addresses))
-	for _, address := range append(append(append([]string{}, revoked...), applied...), attempted...) {
-		potentiallyApplied[address] = struct{}{}
-		if _, remainsDesired := desired[address]; !remainsDesired {
-			revocationSet[address] = struct{}{}
-		}
-	}
-	for _, address := range addresses {
-		potentiallyApplied[address] = struct{}{}
-	}
-	revoked = revoked[:0]
-	for address := range revocationSet {
-		revoked = append(revoked, address)
-	}
-	sort.Strings(revoked)
-	pending := make([]string, 0, len(potentiallyApplied))
-	for address := range potentiallyApplied {
-		pending = append(pending, address)
-	}
-	sort.Strings(pending)
-	if err := store.writeAttemptedFirewallIPs(pending); err != nil {
-		return err
-	}
-
-	rootKeyPath, _, err := ensureRootSSHKey()
-	if err != nil {
-		return err
-	}
-	args := []string{"/usr/local/sbin/zaigr-inside", "firewall", "sync-ips"}
-	for _, address := range revoked {
-		args = append(args, "--revoke", address)
-	}
-	args = append(args, "--")
-	args = append(args, addresses...)
-	quoted := make([]string, 0, len(args))
-	for _, arg := range args {
-		quoted = append(quoted, singleQuotedArg(arg))
-	}
-	if err := sshRunControlScriptContext(ctx, port, rootKeyPath, "exec "+strings.Join(quoted, " ")+"\n"); err != nil {
-		return fmt.Errorf("sync exact IPv4 permissions to VM: %w", err)
+	if _, err := hostNetworkControl(ctx, store.runtimeDir(), record.LaunchID, "policy-reconcile", hostnet.Forward{}); err != nil {
+		return fmt.Errorf("apply host firewall policy: %w", err)
 	}
 	if err := store.writeAppliedFirewallIPs(addresses); err != nil {
 		return err

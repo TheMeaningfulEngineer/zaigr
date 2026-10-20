@@ -40,7 +40,8 @@ def test_install_standalone_as_regular_user_and_run_vm(container_factory, image)
     admin("apt-get update -o APT::Update::Error-Mode=any", timeout=180)
     admin(
         "DEBIAN_FRONTEND=noninteractive apt-get install -y "
-        "coreutils e2fsprogs openssh-client qemu-system-x86 qemu-utils",
+        "conntrack coreutils e2fsprogs openssh-client qemu-system-x86 qemu-utils "
+        "slirp4netns util-linux",
         timeout=300,
     )
     admin("useradd --create-home --uid 2000 --user-group --shell /bin/bash zaigr-install")
@@ -63,7 +64,7 @@ def test_install_standalone_as_regular_user_and_run_vm(container_factory, image)
     user("test ! -e /usr/bin/zaigr")
     host_check = user("zaigr misc check", timeout=30)
     assert host_check.startswith("Host: Ubuntu " if "ubuntu:" in image else "Host: Debian GNU/Linux ")
-    assert "5/5 checks passed" in host_check
+    assert "6/6 checks passed" in host_check
 
     user("printf 'standalone installation works\\n' > installation-input.txt")
     user("zaigr project vm start", input="y\n", timeout=180)

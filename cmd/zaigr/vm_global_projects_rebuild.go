@@ -112,6 +112,9 @@ func cmdGlobalProjectsRebuild(selectors []string, all, outdated, force, yes bool
 		printGlobalRebuildSummary(nil, nil, skipped)
 		return globalRebuildSelectionError(selectionErrors, plan)
 	}
+	if err := requireHostPreflight("global project rebuild"); err != nil {
+		return err
+	}
 	if !yes && !confirmGlobalRebuild(eligible) {
 		fmt.Fprintln(os.Stderr, "Rebuild cancelled; no project was changed.")
 		return globalRebuildSelectionError(selectionErrors, plan)

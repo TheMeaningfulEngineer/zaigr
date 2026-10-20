@@ -282,6 +282,11 @@ func ensureProjectInitializedForVM(ram string, cpu string) error {
 
 func prepareProjectForVMStart(ram string, cpu string) (*runningVMInfo, error) {
 	logDebug("preparing project for VM start", "ram", ram, "cpu", cpu)
+	if running, _ := detectRunningProjectVM(); running == nil {
+		if err := requireHostPreflight("project VM start"); err != nil {
+			return nil, err
+		}
+	}
 	if err := ensureProjectInitializedForVM(ram, cpu); err != nil {
 		return nil, err
 	}
@@ -297,6 +302,19 @@ func prepareProjectForVMStart(ram string, cpu string) (*runningVMInfo, error) {
 		}
 		logWarn("removed stale project VM monitor marker", "runtime_dir", store.runtimeDir())
 		running = nil
+	}
+	if running != nil {
+		record, readErr := readVMSupervisorRecord(currentProjectStore())
+		if readErr != nil {
+			return nil, readErr
+		}
+		stored := record.NetworkBackend
+		if stored == "" {
+			stored = vmNetworkBackendUser
+		}
+		if _, selectErr := selectVMNetworkBackend(vmNetworkBackendHost, stored); selectErr != nil {
+			return nil, selectErr
+		}
 	}
 
 	hasOverrides := (ram != "") || (cpu != "")
@@ -315,6 +333,56 @@ func prepareProjectForVMStart(ram string, cpu string) (*runningVMInfo, error) {
 	}
 
 	return nil, nil
+}
+
+func projectHasPendingLocalSetups() (bool, error) {
+	definitions, err := loadProjectLocalSetupDefinitions()
+	if err != nil {
+		return false, err
+	}
+	records, err := currentProjectStore().readAppliedSetups()
+	if err != nil {
+		return false, err
+	}
+	installed := make(map[string]appliedSetup, len(records))
+	for _, r := range records {
+		if r.ProjectLocal {
+			installed[r.Name] = r
+		}
+	}
+	for _, d := range definitions {
+		r, ok := installed[d.Name]
+		if !ok || r.Version != d.Version {
+			return true, nil
+		}
+	}
+	for _, r := range records {
+		if !r.ProjectLocal || r.MissingAcknowledged {
+			continue
+		}
+		found := false
+		for _, d := range definitions {
+			if d.Name == r.Name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func runningHostNetworkRecord(store projectStore) (bool, vmSupervisorRecord, error) {
+	record, err := readVMSupervisorRecord(store)
+	if err != nil {
+		return false, record, err
+	}
+	if record.NetworkBackend == "" {
+		record.NetworkBackend = vmNetworkBackendUser
+	}
+	return record.NetworkBackend == vmNetworkBackendHost, record, nil
 }
 
 func startPreparedProjectVM(ram string, cpu string) (port string, returnErr error) {
@@ -339,6 +407,7 @@ func startPreparedProjectVM(ram string, cpu string) (port string, returnErr erro
 		return "", err
 	}
 	logInfo("starting prepared project VM", "ram", ramValue, "cpu", cpuValue)
+	backend := vmNetworkBackendHost
 	imagePort, launch, err := bootProjectVM(ramValue, cpuValue, grants)
 	if err != nil {
 		return "", err
@@ -356,6 +425,11 @@ func startPreparedProjectVM(ram string, cpu string) (port string, returnErr erro
 	startupCtx, cancelStartup := launch.precommitContext()
 	defer cancelStartup()
 	logInfo("project VM is reachable over SSH", "port", imagePort)
+	if backend == vmNetworkBackendHost {
+		if err := applyHostNetworkGuestTransition(startupCtx, imagePort); err != nil {
+			return "", hostTransitionError(err)
+		}
+	}
 	if err := ensureUserSSHAccessContext(startupCtx, imagePort); err != nil {
 		return "", err
 	}
@@ -377,9 +451,15 @@ func startPreparedProjectVM(ram string, cpu string) (port string, returnErr erro
 	return imagePort, nil
 }
 
-func cmdVMShell(ram string, cpu string, preset string, setups []string, root bool) error {
+func cmdVMShell(ram string, cpu string, preset string, setups []string, root bool, fullNetwork bool) error {
 	fmt.Printf(":: zaigr %s (%s/%s) built %s\n", version, runtime.GOOS, runtime.GOARCH, buildTime)
 	logInfo("starting shell command", "preset", preset, "setup_count", len(setups), "root", root)
+	if fullNetwork && !root {
+		return fmt.Errorf("--full-network requires --root; network access is isolated to a root maintenance shell")
+	}
+	if fullNetwork && (preset != "" || len(setups) > 0) {
+		return fmt.Errorf("--full-network cannot be combined with --preset or --setup")
+	}
 
 	if root && (preset != "" || len(setups) > 0) {
 		if preset != "" {
@@ -409,6 +489,11 @@ func cmdVMShell(ram string, cpu string, preset string, setups []string, root boo
 	if err != nil {
 		return err
 	}
+	if fullNetwork {
+		if err := ensureMaintenanceNetworkProjectSafe(currentProjectStore()); err != nil {
+			return err
+		}
+	}
 	running, stale := detectRunningProjectVM()
 	if stale {
 		if err := currentProjectStore().clearRuntimeState(); err != nil {
@@ -428,7 +513,21 @@ func cmdVMShell(ram string, cpu string, preset string, setups []string, root boo
 			return err
 		}
 		printSkippedAppliedSetups(skippedApplied)
-		return cmdVMShellRunning(running.Port, presetDef, runScript, filteredSetupDefs, root)
+		run := func() error {
+			return cmdVMShellRunning(running.Port, presetDef, runScript, filteredSetupDefs, root, lock)
+		}
+		if fullNetwork {
+			if err := markCurrentProjectImageDirty("root-shell", "zaigr shell --root --full-network"); err != nil {
+				return err
+			}
+			return withMaintenanceNetworkSession(currentProjectStore(), running.Port, "zaigr shell --root --full-network", func(namespace string) error {
+				if err := lock.release(); err != nil {
+					return fmt.Errorf("release project lock before maintenance shell: %w", err)
+				}
+				return runMaintenanceProjectSSH(running.Port, namespace)
+			})
+		}
+		return run()
 	}
 
 	filteredSetupDefs, skippedApplied, err := filterSetupDefinitionsByStoredState(setupDefs)
@@ -450,11 +549,28 @@ func cmdVMShell(ram string, cpu string, preset string, setups []string, root boo
 	if err := syncPresetSelection(presetDef); err != nil {
 		return err
 	}
-	if len(runScript) > 0 {
-		logDebug("running preset script in project VM", "root", root)
-		return runPresetInVM(imagePort, presetDef.Name, runScript)
+	run := func() error {
+		if len(runScript) > 0 {
+			logDebug("running preset script in project VM", "root", root)
+			return runPresetInVM(imagePort, presetDef.Name, runScript)
+		}
+		if err := lock.release(); err != nil {
+			return fmt.Errorf("release project startup lock before interactive shell: %w", err)
+		}
+		return execProjectShell(imagePort, root)
 	}
-	return execProjectShell(imagePort, root)
+	if fullNetwork {
+		if err := markCurrentProjectImageDirty("root-shell", "zaigr shell --root --full-network"); err != nil {
+			return err
+		}
+		return withMaintenanceNetworkSession(currentProjectStore(), imagePort, "zaigr shell --root --full-network", func(namespace string) error {
+			if err := lock.release(); err != nil {
+				return fmt.Errorf("release project lock before maintenance shell: %w", err)
+			}
+			return runMaintenanceProjectSSH(imagePort, namespace)
+		})
+	}
+	return run()
 }
 
 func resolveParentProjectForShell() error {
@@ -565,7 +681,7 @@ func confirmRootAccessMarksDirtyProjectImage(action string) bool {
 	return strings.EqualFold(strings.TrimSpace(answer), "y") || strings.EqualFold(strings.TrimSpace(answer), "yes")
 }
 
-func cmdVMShellRunning(port string, presetDef *presetDefinition, runScript []byte, setupDefs []setupDefinition, root bool) error {
+func cmdVMShellRunning(port string, presetDef *presetDefinition, runScript []byte, setupDefs []setupDefinition, root bool, lock *projectMutationLock) error {
 	if len(setupDefs) > 0 {
 		if err := applySetupDefinitionsToVM(port, setupDefs); err != nil {
 			return err
@@ -578,24 +694,35 @@ func cmdVMShellRunning(port string, presetDef *presetDefinition, runScript []byt
 	if len(runScript) > 0 {
 		return runPresetInVM(port, presetDef.Name, runScript)
 	}
+	if lock != nil {
+		if err := lock.release(); err != nil {
+			return fmt.Errorf("release project startup lock before interactive shell: %w", err)
+		}
+	}
 	return execProjectShell(port, root)
 }
 
 func execProjectShell(port string, root bool) error {
 	if !root {
-		return execProjectSSH(port, false)
+		return runProjectSSH(port, false)
 	}
 
-	rootKeyPath, _, err := ensureRootSSHKey()
+	_, _, err := ensureRootSSHKey()
 	if err != nil {
 		return fmt.Errorf("prepare root SSH key: %w", err)
 	}
-	return withTemporaryRootAllowAllFirewallRule(port, rootKeyPath, func() error {
+	if host, _, err := runningHostNetworkRecord(currentProjectStore()); err != nil {
+		return err
+	} else if host {
 		if err := markCurrentProjectImageDirty("root-shell", "zaigr shell --root"); err != nil {
 			return err
 		}
 		return runProjectSSH(port, true)
-	})
+	}
+	if err := markCurrentProjectImageDirty("root-shell", "zaigr shell --root"); err != nil {
+		return err
+	}
+	return runProjectSSH(port, true)
 }
 
 func syncPresetSelection(presetDef *presetDefinition) error {
@@ -693,14 +820,12 @@ func bootProjectVM(ram string, cpu string, grants hostAccessGrants) (string, *vm
 	socketDir := vmSocketDir(launchID)
 	workspaceSock := filepath.Join(socketDir, "workspace.sock")
 	agentStateSock := filepath.Join(socketDir, "agent-state.sock")
+	if err := validateHostNetworkExport(workspace, store.agentStateDir(), store.Path, zaigDir(), store.runtimeDir()); err != nil {
+		return "", nil, err
+	}
 	args := buildQEMUArgsWithContext(imgPath, kernelPath, format, false, ram, cpu, sshPort, rootPubKey, userPubKey, store.hostname(), store.monitorSockPath(), store.agentStateDir(), workspace, store.serialLogPath(), workspaceSock, agentStateSock)
 	args = append(args, hostAccessQEMUDevices(grants)...)
 	diskSize := store.disk()
-
-	fmt.Printf(":: Booting VM (kernel=%s, rootfs=%s, ram=%sMB, cpu=%s, disk=%s)\n",
-		filepath.Base(kernelPath), filepath.Base(imgPath), ram, cpu, diskSize)
-	fmt.Printf(":: SSH: ssh -i %s -p %s user@localhost\n", userKeyPath, sshPort)
-	logInfo("starting qemu", "kernel", kernelPath, "image", imgPath, "port", sshPort, "monitor_sock", store.monitorSockPath())
 
 	guestUID, guestGID, err := readGuestIdentityFromImage(imgPath)
 	if err != nil {
@@ -721,13 +846,17 @@ func bootProjectVM(ram string, cpu string, grants hostAccessGrants) (string, *vm
 		Workspace:           workspace,
 		AgentState:          store.agentStateDir(), Virtiofsd: virtiofsdPath,
 		SerialLog: store.serialLogPath(), SSHPort: sshPort, Mode: "detached",
-		LaunchID: launchID, GuestUID: guestUID, GuestGID: guestGID,
+		LaunchID: launchID, NetworkBackend: vmNetworkBackendHost, GuestUID: guestUID, GuestGID: guestGID,
 		QEMUPath: qemuPath, QEMUArgs: args[1:],
 	}
 	launch, err := launchSupervisedVM(spec)
 	if err != nil {
 		return "", nil, err
 	}
+	fmt.Printf(":: Booting VM (kernel=%s, rootfs=%s, ram=%sMB, cpu=%s, disk=%s)\n",
+		filepath.Base(kernelPath), filepath.Base(imgPath), ram, cpu, diskSize)
+	fmt.Printf(":: SSH: ssh -i %s -p %s user@localhost\n", userKeyPath, sshPort)
+	logInfo("starting qemu", "kernel", kernelPath, "image", imgPath, "port", sshPort, "monitor_sock", store.monitorSockPath())
 	return sshPort, launch, nil
 }
 
@@ -770,6 +899,31 @@ func runProjectSSH(port string, root bool) error {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		return fmt.Errorf("track shell session: %w", err)
+	}
+	defer cleanup()
+	return cmd.Wait()
+}
+
+func runMaintenanceProjectSSH(port, namespace string) error {
+	args, err := projectSSHArgs(port, true)
+	if err != nil {
+		return err
+	}
+	if !validHostPolicyScopeID(strings.TrimPrefix(namespace, "zaigr-maint-")) {
+		return errors.New("invalid maintenance network namespace")
+	}
+	destination := args[len(args)-1]
+	args = append(args[:len(args)-1], "-t", destination, "ip netns exec "+singleQuotedArg(namespace)+" bash --login")
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	cleanup, err := writeShellSessionMarker(currentProjectStore(), cmd.Process.Pid, true, port)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return fmt.Errorf("track maintenance shell session: %w", err)
 	}
 	defer cleanup()
 	return cmd.Wait()
@@ -833,6 +987,7 @@ func buildQEMUArgsWithContext(imagePath, kernelPath, format string, snapshot boo
 		appendParts = append(appendParts, fmt.Sprintf("zaigr.hostname=%s", vmHostname))
 	}
 
+	netdev := "tap,id=net0,fd=3"
 	args := []string{
 		"qemu-system-x86_64",
 		"-M", "microvm,acpi=off,auto-kernel-cmdline=on,isa-serial=on",
@@ -852,7 +1007,7 @@ func buildQEMUArgsWithContext(imagePath, kernelPath, format string, snapshot boo
 		"-chardev", fmt.Sprintf("socket,id=agent_state_fs,path=%s,server=off", qemuOptionPath(agentStateSock)),
 		"-device", "vhost-user-fs-device,chardev=agent_state_fs,tag=zaigr_agent_state",
 		"-append", strings.Join(appendParts, " "),
-		"-netdev", fmt.Sprintf("user,id=net0,ipv6=off,hostfwd=tcp::%s-:22", sshPort),
+		"-netdev", netdev,
 		"-device", "virtio-net-device,netdev=net0",
 	}
 

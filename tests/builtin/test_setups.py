@@ -17,6 +17,13 @@ def _checked_run(cmd, **kwargs):
     return stdout
 
 
+def _assert_egress_blocked_by_policy(stdout, stderr, rc):
+    """Accept only a real blocked connection or the policy's DNS denial."""
+    assert rc in (6, 28), err_msg(stdout, stderr)
+    if rc == 6:
+        assert "Could not resolve host" in stderr, err_msg(stdout, stderr)
+
+
 @pytest.mark.timeout(10800)
 def test_all_builtin_setups_coexist(project):
     """All builtin setups install and remain usable in one cumulative VM."""
@@ -84,32 +91,32 @@ def test_all_builtin_setups_coexist(project):
         "https://registry.npmjs.org",
         timeout=20,
     )
-    assert rc == 28, err_msg(stdout, stderr)
+    _assert_egress_blocked_by_policy(stdout, stderr, rc)
     stdout, stderr, rc = raw(
         f"{zaigr} project vm exec -- "
         "curl -4 -sS -o /dev/null --connect-timeout 3 --max-time 8 https://pypi.org",
         timeout=20,
     )
-    assert rc == 28, err_msg(stdout, stderr)
+    _assert_egress_blocked_by_policy(stdout, stderr, rc)
     stdout, stderr, rc = raw(
         f"{zaigr} project vm exec -- "
         "curl -4 -sS -o /dev/null --connect-timeout 3 --max-time 8 "
         "https://api.openai.com",
         timeout=20,
     )
-    assert rc == 28, err_msg(stdout, stderr)
+    _assert_egress_blocked_by_policy(stdout, stderr, rc)
     stdout, stderr, rc = raw(
         f"{zaigr} project vm exec -- "
         "curl -4 -sS -o /dev/null --connect-timeout 3 --max-time 8 https://claude.ai",
         timeout=20,
     )
-    assert rc == 28, err_msg(stdout, stderr)
+    _assert_egress_blocked_by_policy(stdout, stderr, rc)
     stdout, stderr, rc = raw(
         f"{zaigr} project vm exec -- "
         "curl -4 -sS -o /dev/null --connect-timeout 3 --max-time 8 https://go.dev",
         timeout=20,
     )
-    assert rc == 28, err_msg(stdout, stderr)
+    _assert_egress_blocked_by_policy(stdout, stderr, rc)
 
     # Python
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
@@ -202,7 +209,7 @@ def test_all_builtin_setups_coexist(project):
         "https://registry.npmjs.org",
         timeout=20,
     )
-    assert rc == 28, err_msg(stdout, stderr)
+    _assert_egress_blocked_by_policy(stdout, stderr, rc)
 
     # Go
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
@@ -346,13 +353,19 @@ kas shell /tmp/kas-smoke.yml -c 'bitbake zlib-native -n'
         timeout=1800,
     )
 
-    # Docker after k3s
+    # Runtime packages create root-equivalent daemons, so install them only
+    # while the VM is stopped. Their later presence prevents broad maintenance
+    # networking on this project image.
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
     vm = f"{zaigr} project vm exec --"
 
+    run(f"{zaigr} project vm stop", timeout=60)
     run(f"{zaigr} project setup run k3s", timeout=1800)
     run(f"{zaigr} project setup run docker", timeout=1800)
+    run(f"{zaigr} project setup run podman", timeout=1800)
+    run(f"{zaigr} project setup run zaigr-dev", timeout=1800)
+    run(f"{zaigr} project vm start", input="y\n", timeout=180)
 
     output = run(f"{vm} docker run --rm hello-world", timeout=600)
     assert "Hello from Docker!" in output
@@ -419,7 +432,6 @@ kas shell /tmp/kas-smoke.yml -c 'bitbake zlib-native -n'
     zaigr = project.zaigr_bin
     vm = f"{zaigr} project vm exec --"
 
-    run(f"{zaigr} project setup run podman", timeout=1800)
     run(f"{vm} podman pull docker.io/library/hello-world", timeout=600)
     output = run(
         f"{vm} podman run --rm docker.io/library/hello-world",
@@ -451,10 +463,6 @@ kas shell /tmp/kas-smoke.yml -c 'bitbake zlib-native -n'
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
 
-    run(
-        f"{zaigr} project setup run zaigr-dev",
-        timeout=1800,
-    )
     output = run(
         [
             zaigr,
@@ -475,19 +483,12 @@ kas shell /tmp/kas-smoke.yml -c 'bitbake zlib-native -n'
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
 
-    run(
-        f"{zaigr} project setup run k3s",
-        timeout=1800,
-    )
-    run(
-        f"{zaigr} project vm exec --root -- systemctl stop k3s",
-        input="y\n",
-        timeout=30,
-    )
+    run(f"{zaigr} project vm stop", timeout=60)
     run(
         f"{zaigr} project setup run k3s --force",
         timeout=1800,
     )
+    run(f"{zaigr} project vm start", input="y\n", timeout=180)
     status = run(
         f"{zaigr} project status",
         timeout=10,
@@ -517,7 +518,6 @@ diagnose_coredns() {
     kubectl logs -n kube-system -l k8s-app=kube-dns --tail=100 || true
     systemctl status k3s --no-pager || true
     journalctl -u k3s --no-pager -n 100 || true
-    tail -100 /var/log/opensnitchd.log || true
 }
 
 diagnose_net_test() {

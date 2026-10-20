@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"zaigr/cmd/zaigr/hostnet"
 )
 
 const hostAccessGuestHelper = "/usr/local/lib/zaigr/host-access"
@@ -89,14 +91,29 @@ func hostAccessQEMUDevices(g hostAccessGrants) []string {
 
 // Called only by normal project startup, never by setup/image/rebuild VMs.
 func activateHostAccess(store projectStore, port string, grants hostAccessGrants, lock *projectMutationLock) error {
-	q, err := openHostAccessQMP(store)
+	hostBackend, record, err := runningHostNetworkRecord(store)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = q.conn.Close() }()
+	var q *hostAccessQMP
+	if !hostBackend || len(grants.Devices) > 0 {
+		q, err = openHostAccessQMP(store)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = q.conn.Close() }()
+	}
 	for _, p := range grants.Ports {
-		if err := q.applyPort(p, port, false); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: saved host port %d is Unavailable: %v%s\n", p.Host, err, hostPortOwnerHint(store, p.Host))
+		var forwardErr error
+		if hostBackend {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, forwardErr = hostNetworkControl(ctx, store.runtimeDir(), record.LaunchID, "forward-add", hostnet.Forward{HostPort: uint16(p.Host), GuestPort: uint16(p.VM), Protocol: "tcp"})
+			cancel()
+		} else {
+			forwardErr = q.applyPort(p, port, false)
+		}
+		if forwardErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: saved host port %d is Unavailable: %v%s\n", p.Host, forwardErr, hostPortOwnerHint(store, p.Host))
 		}
 	}
 	r := hostAccessRuntime{Version: hostAccessVersion, Devices: []hostAccessRuntimeDevice{}}
@@ -167,6 +184,24 @@ func hostPortOwnerHint(store projectStore, host int) string {
 		}
 		for _, p := range g.Ports {
 			if p.Host != host {
+				continue
+			}
+			running, stale := detectRunningProjectVMInStore(other)
+			if running == nil || stale {
+				continue
+			}
+			hostBackend, record, backendErr := runningHostNetworkRecord(other)
+			if backendErr == nil && hostBackend {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				status, statusErr := hostNetworkControl(ctx, other.runtimeDir(), record.LaunchID, "status", hostnet.Forward{})
+				cancel()
+				if statusErr == nil {
+					for _, f := range status.Forwards {
+						if int(f.HostPort) == host && int(f.GuestPort) == p.VM && f.Protocol == "tcp" {
+							return "; owned by " + hostAccessOwnerLabel(other)
+						}
+					}
+				}
 				continue
 			}
 			q, err := openHostAccessQMP(other)

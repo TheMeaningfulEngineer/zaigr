@@ -22,13 +22,14 @@ func newShellCommand() *cobra.Command {
 	var preset string
 	var setups []string
 	var root bool
+	var fullNetwork bool
 	cmd := &cobra.Command{
 		Use:   "shell",
 		Short: "Open a shell in a VM sandbox",
 		Long:  "Boot the project image and open a shell.",
 		Args:  cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			return cmdVMShell(ram, cpu, preset, setups, root)
+			return cmdVMShell(ram, cpu, preset, setups, root, fullNetwork)
 		},
 	}
 	cmd.Flags().StringVar(&ram, "ram", "", "RAM in MB (default: 512, or ZAIGR_VM_RAM env)")
@@ -36,6 +37,7 @@ func newShellCommand() *cobra.Command {
 	cmd.Flags().StringVar(&preset, "preset", "", "Run a named preset")
 	cmd.Flags().StringSliceVar(&setups, "setup", nil, "Run one or more named setups")
 	cmd.Flags().BoolVar(&root, "root", false, "Connect as root")
+	cmd.Flags().BoolVar(&fullNetwork, "full-network", false, "Temporarily give this --root maintenance shell and its child processes broad IPv4 TCP/UDP access")
 	_ = cmd.RegisterFlagCompletionFunc("preset", completePresetName)
 	_ = cmd.RegisterFlagCompletionFunc("setup", completeSetupName)
 	return cmd
@@ -144,7 +146,16 @@ func newProjectFirewallCommand() *cobra.Command {
 	cmd.AddCommand(newProjectFirewallAllowCommand())
 	cmd.AddCommand(newProjectFirewallRemoveCommand())
 	cmd.AddCommand(newProjectFirewallShowCommand())
+	cmd.AddCommand(newProjectFirewallDomainCommand())
 	cmd.AddCommand(newProjectFirewallDomainLogCommand())
+	return cmd
+}
+
+func newProjectFirewallDomainCommand() *cobra.Command {
+	cmd := &cobra.Command{Use: "domain", Short: "Manage exact DNS-name firewall permissions", Args: cobra.NoArgs, RunE: func(c *cobra.Command, _ []string) error { return c.Help() }}
+	cmd.AddCommand(&cobra.Command{Use: "allow <name>", Short: "Allow an exact DNS name persistently", Args: cobra.ExactArgs(1), RunE: func(_ *cobra.Command, args []string) error { return cmdProjectFirewallDomainChange(args[0], true) }})
+	cmd.AddCommand(&cobra.Command{Use: "remove <name>", Short: "Remove an exact DNS-name permission", Args: cobra.ExactArgs(1), RunE: func(_ *cobra.Command, args []string) error { return cmdProjectFirewallDomainChange(args[0], false) }})
+	cmd.AddCommand(&cobra.Command{Use: "list", Short: "List effective exact DNS-name permissions", Args: cobra.NoArgs, RunE: func(_ *cobra.Command, _ []string) error { return cmdProjectFirewallDomainList() }})
 	return cmd
 }
 
@@ -185,10 +196,17 @@ func newProjectFirewallRemoveCommand() *cobra.Command {
 func newProjectFirewallDomainLogCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "domain-log",
-		Short: "Stream observed firewall domain events from the running project VM",
-		Args:  cobra.NoArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return cmdProjectFirewallDomainLog()
+		Short: "Stream DNS and firewall packet outcomes observed by the running project VM",
+		Long: "Print DNS resolver outcomes and observed host firewall packet verdicts. " +
+			"Repeated DNS lines with the same name and verdict collapse for about two seconds; -v shows each query type and retry. " +
+			"Firewall allowed/blocked records describe packet decisions, not remote connection or application success.",
+		Args: cobra.NoArgs,
+		RunE: func(c *cobra.Command, _ []string) error {
+			verbose, err := c.Root().PersistentFlags().GetCount("verbose")
+			if err != nil {
+				return err
+			}
+			return cmdProjectFirewallDomainLog(verbose > 0)
 		},
 	}
 	return cmd
@@ -349,7 +367,7 @@ For a new project, run 'zaigr project vm start' to initialize it, then
 	}
 	cmd.Flags().StringVar(&ram, "ram", "", "Set default RAM in MB")
 	cmd.Flags().StringVar(&cpu, "cpu", "", "Set default CPU count")
-	cmd.Flags().StringVar(&sandbox, "virtiofs-sandbox", "", "Filesystem isolation: namespace (default) or none (unsafe)")
+	cmd.Flags().StringVar(&sandbox, "virtiofs-sandbox", "", "Filesystem isolation: namespace (required for host-enforced networking)")
 	return cmd
 }
 

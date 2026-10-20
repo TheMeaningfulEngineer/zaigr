@@ -58,6 +58,11 @@ func cmdSetupRun(names []string, ram string, cpu string, force bool) error {
 		return err
 	}
 	logDebug("loaded setup definitions", "count", len(definitions))
+	if running, _ := detectRunningProjectVM(); !initialized || running == nil {
+		if err := requireHostPreflight("project setup run"); err != nil {
+			return err
+		}
+	}
 
 	bootAfterApply := false
 	if !initialized {
@@ -104,7 +109,9 @@ func cmdSetupRun(names []string, ram string, cpu string, force bool) error {
 			return fmt.Errorf("project VM is already running; --ram and --cpu cannot be changed on a running VM")
 		}
 		logInfo("project setup run will apply to running VM", "port", running.Port, "count", len(definitions))
-		return applySetupDefinitionsToVM(running.Port, definitions)
+		return withMaintenanceNetworkSessionForSetups(store, running.Port, "project setup run", definitions, func(namespace string) error {
+			return applySetupDefinitionsToVMInNamespace(running.Port, namespace, definitions)
+		})
 	}
 
 	logInfo("project setup run will apply directly to project image", "count", len(definitions))
@@ -170,6 +177,22 @@ func applySetupDefinitionsToVM(port string, definitions []setupDefinition) error
 		}
 
 		if err := applySetupDirectlyToRunningVM(port, def, payload); err != nil {
+			return fmt.Errorf("failed to run setup %s: %w", displaySetupName(def.Name, def.ProjectLocal), err)
+		}
+	}
+	return nil
+}
+
+func applySetupDefinitionsToVMInNamespace(port, namespace string, definitions []setupDefinition) error {
+	if err := confirmSetupAptCommands(definitions, "setup execution"); err != nil {
+		return err
+	}
+	for _, def := range definitions {
+		payload, err := buildSetupPayload(def)
+		if err != nil {
+			return err
+		}
+		if err := applySetupDirectlyToRunningVMInNamespace(port, def, payload, namespace); err != nil {
 			return fmt.Errorf("failed to run setup %s: %w", displaySetupName(def.Name, def.ProjectLocal), err)
 		}
 	}
@@ -396,9 +419,13 @@ func loadSetupDefinitionAt(name, rootPath string, projectLocal bool) (setupDefin
 		definition.SourceContent[path] = content
 	}
 	for _, path := range firewallPaths {
+		content, rewritten := reviewSetupFirewallContent(displaySetupName(name, projectLocal), path, definition.SourceContent[path])
+		if rewritten {
+			definition.SourceContent[path] = content
+		}
 		definition.FirewallRules = appendUniqueFirewallEntries(
 			definition.FirewallRules,
-			firewallEntriesFromContent(definition.SourceContent[path]),
+			firewallEntriesFromContent(content),
 		)
 	}
 	sourceVersion, err := setupSourceVersion(definition)
@@ -589,34 +616,9 @@ func firewallEntriesFromContent(data []byte) []string {
 }
 
 func setupFirewallCommand(name string, entries []string) string {
-	var block strings.Builder
-	block.WriteString(`mkdir -p /etc/opensnitchd/lists/domains
-allowed_file=/etc/opensnitchd/lists/domains/allowed.txt
-touch "$allowed_file"
-`)
-	block.WriteString(`
-  while IFS= read -r domain; do
-    case "$domain" in
-      ""|"#"*)
-        continue
-        ;;
-    esac
-    if [ "$domain" = "" ]; then
-      continue
-    fi
-    if ! grep -qxF "$domain" "$allowed_file" 2>/dev/null; then
-      printf '%s\n' "$domain" >> "$allowed_file"
-    fi
-  done <<'__ZAIGR_FIREWALL__'
-`)
-	for _, entry := range entries {
-		block.WriteString(entry)
-		block.WriteByte('\n')
-	}
-	block.WriteString(`__ZAIGR_FIREWALL__
-/usr/local/sbin/zaigr-inside firewall reload-domains
-`)
-	return block.String()
+	_ = name
+	_ = entries
+	return ": # firewall domains are enforced by the host"
 }
 
 func loadPreset(name string) (presetDefinition, error) {

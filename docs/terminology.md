@@ -103,8 +103,9 @@ discards any manual changes that are not recorded in setups.
 
 ## Setup capture
 
-A recording of shell commands and observed network domains while you experiment
-in a [VM](#project-vm). Accepting it saves a reusable [setup](#setup).
+A recording of shell commands and host-observed DNS domains while you experiment
+in an isolated capture [VM](#project-vm). The project VM must be stopped before
+capture starts. Accepting it saves a reusable [setup](#setup).
 Only activity during the capture is recorded; earlier manual changes are not
 reconstructed.
 
@@ -112,8 +113,8 @@ A capture does not include prerequisites from earlier project-local setups.
 It may rely on project state that will not travel with it, so reusing it in
 another project can fail unless those prerequisites are applied there too.
 
-Discarding a capture does not undo edits to your project files. If it used an
-already-running VM, changes inside that VM remain too.
+Discarding a capture removes its image overlay but does not undo edits to your
+shared project files.
 
 ## Project store
 

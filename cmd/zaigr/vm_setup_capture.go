@@ -1,20 +1,26 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/miekg/dns"
+	"zaigr/cmd/zaigr/hostdns"
+	"zaigr/cmd/zaigr/hostnet"
 )
 
 const setupCaptureGuestAgentStateDir = "/home/user/.zaigr-agent-state"
@@ -42,10 +48,21 @@ func cmdProjectSetupCaptureStart() error {
 		return err
 	}
 	defer lock.releaseWithWarning()
-	if err := lock.recover(currentProjectStore(), "project setup capture start"); err != nil {
+	store := currentProjectStore()
+	if err := lock.recover(store, "project setup capture start"); err != nil {
 		return err
 	}
 
+	if meta, has, err := store.readSetupCaptureMetadata(); err != nil {
+		return err
+	} else if has {
+		return activeSetupCaptureRefusalError("zaigr project setup capture start", meta)
+	}
+	if running, _ := detectRunningProjectVM(); running == nil {
+		if err := requireHostPreflight("project setup capture"); err != nil {
+			return err
+		}
+	}
 	if err := ensureProjectInitializedForVM("", ""); err != nil {
 		return err
 	}
@@ -53,17 +70,13 @@ func cmdProjectSetupCaptureStart() error {
 		return err
 	}
 
-	store := currentProjectStore()
-	if meta, has, err := store.readSetupCaptureMetadata(); err != nil {
-		return err
-	} else if has {
-		return activeSetupCaptureRefusalError("zaigr project setup capture start", meta)
-	}
-
 	return startNewSetupCapture(store, true)
 }
 
-func startNewSetupCapture(store projectStore, confirmRunningVM bool) error {
+func startNewSetupCapture(store projectStore, confirmRunningVM bool) (returnErr error) {
+	if err := ensureMaintenanceNetworkProjectSafe(store); err != nil {
+		return err
+	}
 	sessions, err := store.activeShellSessions()
 	if err != nil {
 		return err
@@ -142,25 +155,28 @@ func startNewSetupCapture(store projectStore, confirmRunningVM bool) error {
 		return err
 	}
 
-	rootKeyPath := filepath.Join(zaigDir(), "root-ssh.key")
 	logCtx, stopDomainLog := context.WithCancel(context.Background())
-	domainLog, closeDomainLog, err := startSetupCaptureDomainLog(logCtx, port, rootKeyPath, store.setupCaptureObservedEndpointsPath())
+	domainLog, closeDomainLog, err := startSetupCaptureDomainLog(logCtx, store, store.setupCaptureObservedEndpointsPath())
 	if err != nil {
 		stopDomainLog()
 		return err
 	}
 	defer func() {
 		stopDomainLog()
-		_ = domainLog.Wait()
-		_ = closeDomainLog()
+		if waitErr := domainLog.Wait(); waitErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("setup capture endpoint stream is incomplete: %w", waitErr))
+		}
+		if closeErr := closeDomainLog(); closeErr != nil {
+			returnErr = errors.Join(returnErr, closeErr)
+		}
 	}()
 
 	token, err := setupCaptureFirewallToken()
 	if err != nil {
 		return err
 	}
-	return withTemporaryCaptureAllowAllFirewallRule(port, rootKeyPath, token, func() error {
-		return runProjectSetupCaptureShell(port, token)
+	return withMaintenanceNetworkSession(store, port, "project setup capture", func(namespace string) error {
+		return runProjectSetupCaptureShell(port, token, namespace)
 	})
 }
 
@@ -192,7 +208,7 @@ func activeSetupCaptureRefusalError(command string, meta setupCaptureMetadata) e
 	return fmt.Errorf("%s", message.String())
 }
 
-func startSetupCaptureOnRunningVM(store projectStore, running *runningVMInfo) error {
+func startSetupCaptureOnRunningVM(store projectStore, running *runningVMInfo) (returnErr error) {
 	if running.Port == "" {
 		return fmt.Errorf("project VM is running but its SSH port is unknown")
 	}
@@ -208,9 +224,8 @@ func startSetupCaptureOnRunningVM(store projectStore, running *runningVMInfo) er
 		return err
 	}
 
-	rootKeyPath := filepath.Join(zaigDir(), "root-ssh.key")
 	logCtx, stopDomainLog := context.WithCancel(context.Background())
-	domainLog, closeDomainLog, err := startSetupCaptureDomainLog(logCtx, running.Port, rootKeyPath, store.setupCaptureObservedEndpointsPath())
+	domainLog, closeDomainLog, err := startSetupCaptureDomainLog(logCtx, store, store.setupCaptureObservedEndpointsPath())
 	if err != nil {
 		_ = store.clearSetupCaptureMetadata()
 		stopDomainLog()
@@ -218,16 +233,20 @@ func startSetupCaptureOnRunningVM(store projectStore, running *runningVMInfo) er
 	}
 	defer func() {
 		stopDomainLog()
-		_ = domainLog.Wait()
-		_ = closeDomainLog()
+		if waitErr := domainLog.Wait(); waitErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("setup capture endpoint stream is incomplete: %w", waitErr))
+		}
+		if closeErr := closeDomainLog(); closeErr != nil {
+			returnErr = errors.Join(returnErr, closeErr)
+		}
 	}()
 
 	token, err := setupCaptureFirewallToken()
 	if err != nil {
 		return err
 	}
-	return withTemporaryCaptureAllowAllFirewallRule(running.Port, rootKeyPath, token, func() error {
-		return runProjectSetupCaptureShell(running.Port, token)
+	return withMaintenanceNetworkSession(store, running.Port, "project setup capture", func(namespace string) error {
+		return runProjectSetupCaptureShell(running.Port, token, namespace)
 	})
 }
 
@@ -328,6 +347,7 @@ func cmdProjectSetupCaptureAccept() error {
 		return err
 	}
 	defer lock.releaseWithWarning()
+	store := currentProjectStore()
 	if _, err := requireProject("project setup capture accept"); err != nil {
 		return err
 	}
@@ -335,7 +355,6 @@ func cmdProjectSetupCaptureAccept() error {
 		return err
 	}
 
-	store := currentProjectStore()
 	meta, ok, err := store.readSetupCaptureMetadata()
 	if err != nil {
 		return err
@@ -373,10 +392,6 @@ func cmdProjectSetupCaptureAccept() error {
 	if hasOverlay && running != nil && running.ImagePath != "" && running.ImagePath != meta.OverlayImagePath {
 		return fmt.Errorf("active project VM is not running the capture overlay (%s); stop or restart the capture shell first", filepath.Base(meta.OverlayImagePath))
 	} else if hasOverlay && running != nil && running.ImagePath == meta.OverlayImagePath {
-		rootKeyPath := filepath.Join(zaigDir(), "root-ssh.key")
-		if err := removeAllTemporaryCaptureAllowAllFirewallRules(running.Port, rootKeyPath); err != nil {
-			return fmt.Errorf("remove temporary capture firewall before accepting: %w", err)
-		}
 		if _, err := stopProjectVMInStore(store, false); err != nil {
 			return fmt.Errorf("stop capture VM before accepting: %w", err)
 		}
@@ -422,6 +437,9 @@ func cmdProjectSetupCaptureAccept() error {
 
 	fmt.Printf(":: Accepted setup capture as %s\n", meta.Name)
 	fmt.Printf(":: Updated setup definition: %s\n", filepath.Join(zaigDir(), "setups", meta.Name))
+	if !hasOverlay && setupCaptureFullLeaseActive(store) {
+		fmt.Println("The capture shell remains open; its private network access ends when that shell exits.")
+	}
 	if promotedImagePath != "" {
 		fmt.Printf(":: Promoted capture overlay to project image: %s\n", filepath.Base(promotedImagePath))
 	}
@@ -527,11 +545,11 @@ func cmdProjectSetupCaptureDiscard() error {
 		return err
 	}
 	defer lock.releaseWithWarning()
+	store := currentProjectStore()
 	if _, err := requireProject("project setup capture discard"); err != nil {
 		return err
 	}
 
-	store := currentProjectStore()
 	meta, ok, err := store.readSetupCaptureMetadata()
 	if err != nil {
 		return err
@@ -549,7 +567,21 @@ func cmdProjectSetupCaptureDiscard() error {
 	}
 
 	fmt.Printf(":: Discarded setup capture\n")
+	if meta.OverlayImagePath == "" && setupCaptureFullLeaseActive(store) {
+		fmt.Println("The capture shell remains open; its private network access ends when that shell exits.")
+	}
 	return nil
+}
+
+func setupCaptureFullLeaseActive(store projectStore) bool {
+	host, record, err := runningHostNetworkRecord(store)
+	if err != nil || !host {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	status, err := hostNetworkControl(ctx, store.runtimeDir(), record.LaunchID, "status", hostnet.Forward{})
+	return err == nil && status.MaintenanceSessions > 0
 }
 
 func discardSetupCaptureState(store projectStore, meta setupCaptureMetadata, prompt bool) (bool, error) {
@@ -572,10 +604,6 @@ func discardSetupCaptureState(store projectStore, meta setupCaptureMetadata, pro
 				fmt.Fprintln(os.Stderr, ":: Discard cancelled")
 				return false, nil
 			}
-		}
-		rootKeyPath := filepath.Join(zaigDir(), "root-ssh.key")
-		if err := removeAllTemporaryCaptureAllowAllFirewallRules(running.Port, rootKeyPath); err != nil {
-			return false, fmt.Errorf("remove temporary capture firewall before discard: %w", err)
 		}
 		if result, err := stopProjectVMInStore(store, false); err != nil {
 			return false, fmt.Errorf("stop capture VM: %w", err)
@@ -604,13 +632,25 @@ func discardSetupCaptureState(store projectStore, meta setupCaptureMetadata, pro
 	return true, nil
 }
 
-func runProjectSetupCaptureShell(port string, token string) error {
+func runProjectSetupCaptureShell(port string, token string, namespace string) error {
+	store := currentProjectStore()
+	captureMeta, captureActive, metaErr := store.readSetupCaptureMetadata()
+	if metaErr != nil {
+		return metaErr
+	}
+	_, launchRecord, launchErr := runningHostNetworkRecord(store)
+	if launchErr != nil {
+		return launchErr
+	}
 	args, err := projectSSHArgs(port, true)
 	if err != nil {
 		return err
 	}
 	args = append([]string{args[0], "-tt"}, args[1:]...)
-	args = append(args, "bash -eu -c "+singleQuotedArg(setupCaptureShellCommand(token)))
+	if !validHostPolicyScopeID(strings.TrimPrefix(namespace, "zaigr-maint-")) {
+		return errors.New("invalid maintenance namespace for setup capture")
+	}
+	args = append(args, "ip netns exec "+singleQuotedArg(namespace)+" bash -eu -c "+singleQuotedArg(setupCaptureShellCommand(token)))
 
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdin = os.Stdin
@@ -626,7 +666,34 @@ func runProjectSetupCaptureShell(port string, token string) error {
 		return fmt.Errorf("track shell session: %w", err)
 	}
 	defer cleanup()
-	return cmd.Wait()
+	waitErr := cmd.Wait()
+	if intentionalCaptureTeardown(waitErr, store, captureMeta, captureActive, launchRecord.LaunchID) {
+		return nil
+	}
+	return waitErr
+}
+
+func intentionalCaptureTeardown(waitErr error, store projectStore, meta setupCaptureMetadata, captureActive bool, launchID string) bool {
+	if waitErr == nil || !captureActive || meta.OverlayImagePath == "" || launchID == "" {
+		return false
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(waitErr, &exitErr) || exitErr.ExitCode() != 255 {
+		return false
+	}
+	deadline := time.Now().Add(12 * time.Second)
+	for {
+		stopped := fullNetworkLeaseLaunchStopped(store.runtimeDir(), launchID)
+		_, exists, metadataErr := store.readSetupCaptureMetadata()
+		_, overlayErr := os.Stat(meta.OverlayImagePath)
+		if stopped && metadataErr == nil && !exists && os.IsNotExist(overlayErr) {
+			return true
+		}
+		if metadataErr != nil || time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func setupCaptureShellCommand(token string) string {
@@ -699,7 +766,48 @@ func setupCaptureFirewallToken() (string, error) {
 	return hex.EncodeToString(token[:]), nil
 }
 
-func startSetupCaptureDomainLog(ctx context.Context, port string, rootKeyPath string, outputPath string) (*exec.Cmd, func() error, error) {
+type setupCaptureDomainLog struct {
+	done chan struct{}
+	err  error
+}
+
+func (log *setupCaptureDomainLog) Wait() error {
+	<-log.done
+	if errors.Is(log.err, context.Canceled) || errors.Is(log.err, net.ErrClosed) {
+		return nil
+	}
+	return log.err
+}
+
+type setupCaptureEventWriter struct {
+	output *os.File
+	ready  func()
+	once   sync.Once
+}
+
+func (w *setupCaptureEventWriter) Write(data []byte) (int, error) {
+	var event hostdns.Event
+	if err := json.Unmarshal(data, &event); err != nil {
+		return 0, err
+	}
+	if event.Gap || event.Decision == "history-gap" {
+		return 0, errors.New("host DNS event history overflowed during setup capture")
+	}
+	w.ready()
+	if event.Decision == "heartbeat" || event.Name == "" {
+		return len(data), nil
+	}
+	decision := "blocked"
+	if event.RCode == dns.RcodeSuccess && len(event.Addresses) > 0 {
+		decision = "allowed"
+	}
+	if _, err := fmt.Fprintf(w.output, "%d %s %s\n", event.Time.UnixNano(), decision, event.Name); err != nil {
+		return 0, err
+	}
+	return len(data), nil
+}
+
+func startSetupCaptureDomainLog(ctx context.Context, store projectStore, outputPath string) (*setupCaptureDomainLog, func() error, error) {
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
 		return nil, nil, fmt.Errorf("create capture endpoint log dir: %w", err)
 	}
@@ -708,65 +816,43 @@ func startSetupCaptureDomainLog(ctx context.Context, port string, rootKeyPath st
 		return nil, nil, fmt.Errorf("open capture endpoint log: %w", err)
 	}
 
-	args := append(sshManagedOptions(), "-o", sshConnectTimeoutOption)
-	args = append(
-		args,
-		"-i", rootKeyPath,
-		"-p", port,
-		"root@localhost",
-		"env", "ZAIGR_INSIDE_DOMAIN_LOG_READY_MARKER="+setupCaptureDomainLogReadyMarker,
-		"/usr/local/sbin/zaigr-inside", "firewall", "domain-log",
-	)
-	cmd := exec.CommandContext(ctx, "ssh", args...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
+	host, record, err := runningHostNetworkRecord(store)
+	if err != nil || !host {
 		_ = output.Close()
-		return nil, nil, fmt.Errorf("open capture endpoint stream: %w", err)
+		if err != nil {
+			return nil, nil, fmt.Errorf("inspect host DNS event stream: %w", err)
+		}
+		return nil, nil, errors.New("setup capture requires host-enforced networking")
 	}
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
+	statusCtx, cancelStatus := context.WithTimeout(ctx, 5*time.Second)
+	status, statusErr := hostNetworkControl(statusCtx, store.runtimeDir(), record.LaunchID, "status", hostnet.Forward{})
+	cancelStatus()
+	if statusErr != nil {
 		_ = output.Close()
-		return nil, nil, fmt.Errorf("start capture endpoint log: %w", err)
+		return nil, nil, fmt.Errorf("snapshot host DNS event sequence: %w", statusErr)
 	}
-	done := make(chan struct{})
-	ready := make(chan struct{}, 1)
+	ready := make(chan struct{})
+	log := &setupCaptureDomainLog{done: make(chan struct{})}
+	writer := &setupCaptureEventWriter{output: output}
+	writer.ready = func() { writer.once.Do(func() { close(ready) }) }
 	go func() {
-		defer close(done)
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" {
-				continue
-			}
-			if line == setupCaptureDomainLogReadyMarker {
-				select {
-				case ready <- struct{}{}:
-				default:
-				}
-				continue
-			}
-			_, _ = fmt.Fprintf(output, "%d %s\n", time.Now().UnixNano(), line)
-		}
-		if err := scanner.Err(); err != nil && !strings.Contains(err.Error(), "file already closed") {
-			fmt.Fprintf(os.Stderr, ":: Capture endpoint log stopped: %v\n", err)
-		}
+		log.err = streamHostNetworkDomainEventsReady(ctx, store.runtimeDir(), record.LaunchID, status.EventSequence, writer, writer.ready)
+		close(log.done)
 	}()
 	closeLog := func() error {
-		<-done
+		<-log.done
 		return output.Close()
 	}
 	select {
 	case <-ready:
-	case <-done:
+	case <-log.done:
 		_ = output.Close()
-		return nil, nil, fmt.Errorf("capture endpoint log stopped before becoming ready")
+		return nil, nil, fmt.Errorf("capture endpoint log stopped before becoming ready: %w", log.err)
 	case <-time.After(10 * time.Second):
-		_ = cmd.Process.Kill()
-		<-done
 		_ = output.Close()
 		return nil, nil, fmt.Errorf("capture endpoint log did not become ready")
 	}
-	return cmd, closeLog, nil
+	return log, closeLog, nil
 }
 
 func setupCaptureObservedEndpoints(store projectStore, meta setupCaptureMetadata) ([]string, error) {

@@ -1,4 +1,0 @@
-# Debian packages
-deb.debian.org
-debian.map.fastlydns.net
-security.debian.org

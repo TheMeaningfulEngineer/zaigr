@@ -5,9 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -15,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"zaigr/cmd/zaigr/hostnet"
 )
 
 func cmdProjectShowVMConfig() error {
@@ -43,6 +42,7 @@ func cmdProjectShowVMConfig() error {
 		return err
 	}
 	fmt.Printf("virtiofs-sandbox=%s\n", sandbox)
+	fmt.Printf("network-policy=host-enforced\n")
 	return nil
 }
 
@@ -61,7 +61,6 @@ func cmdProjectStartVM(ram string, cpu string) error {
 	if err := requireNoActiveSetupCapture("zaigr project vm start"); err != nil {
 		return err
 	}
-
 	running, err := prepareProjectForVMStart(ram, cpu)
 	if err != nil {
 		return err
@@ -94,8 +93,11 @@ func cmdProjectSetVMConfig(ram string, cpu string, sandbox string) error {
 	if ram == "" && cpu == "" && sandbox == "" {
 		return fmt.Errorf("provide --ram, --cpu and/or --virtiofs-sandbox")
 	}
-	if sandbox != "" && sandbox != "namespace" && sandbox != "none" {
-		return fmt.Errorf("--virtiofs-sandbox must be namespace or none")
+	if sandbox == "none" {
+		return virtiofsNamespaceRequiredError("--virtiofs-sandbox none is unsupported")
+	}
+	if sandbox != "" && sandbox != "namespace" {
+		return fmt.Errorf("--virtiofs-sandbox must be namespace")
 	}
 
 	running, stale := detectRunningProjectVM()
@@ -128,9 +130,6 @@ func cmdProjectSetVMConfig(ram string, cpu string, sandbox string) error {
 	}
 
 	if sandbox != "" {
-		if sandbox == "none" {
-			fmt.Fprintln(os.Stderr, unsafeVirtiofsWarning)
-		}
 		if err := store.writeVirtiofsSandbox(sandbox); err != nil {
 			return err
 		}
@@ -168,8 +167,18 @@ func cmdProjectVMExec(commandArgs []string, root bool) error {
 	}
 
 	command := projectVMExecShellCommand(commandArgs)
+	hostBackend, networkRecord, backendErr := runningHostNetworkRecord(currentProjectStore())
+	if backendErr != nil {
+		return backendErr
+	}
 	if !root {
-		if err := reconcileSavedProjectFirewallIPsToVM(running.Port); err != nil {
+		if hostBackend {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, err := hostNetworkControl(ctx, currentProjectStore().runtimeDir(), networkRecord.LaunchID, "policy-reconcile", hostnet.Forward{}); err != nil {
+				return fmt.Errorf("reconcile host firewall before project vm exec: %w", err)
+			}
+		} else if err := reconcileSavedProjectFirewallIPsToVM(running.Port); err != nil {
 			return fmt.Errorf("reconcile project firewall before project vm exec: %w", err)
 		}
 		return sshRunCommandWithExitStatus(running.Port, "", "user", command)
@@ -182,12 +191,13 @@ func cmdProjectVMExec(commandArgs []string, root bool) error {
 	if err != nil {
 		return fmt.Errorf("prepare root SSH key: %w", err)
 	}
-	return withTemporaryRootAllowAllFirewallRule(running.Port, rootKeyPath, func() error {
+	if hostBackend {
 		if err := markCurrentProjectImageDirty("root-exec", "zaigr project vm exec --root"); err != nil {
 			return err
 		}
 		return sshRunCommandWithExitStatus(running.Port, rootKeyPath, "root", command)
-	})
+	}
+	return sshRunCommandWithExitStatus(running.Port, rootKeyPath, "root", command)
 }
 
 func projectVMExecShellCommand(commandArgs []string) string {
@@ -312,11 +322,6 @@ func cmdProjectFirewallShow() error {
 	if _, err := requireProject("project firewall show"); err != nil {
 		return err
 	}
-	addresses, err := currentProjectStore().firewallIPs()
-	if err != nil {
-		return err
-	}
-
 	running, stale := detectRunningProjectVMWithMetadata()
 	if stale {
 		if err := currentProjectStore().clearRuntimeState(); err != nil {
@@ -325,16 +330,7 @@ func cmdProjectFirewallShow() error {
 		running = nil
 	}
 
-	if running != nil {
-		printProjectFirewallIPs(addresses, true)
-		if err := projectShowFirewallFromVM(running.Port); err != nil {
-			return err
-		}
-		return nil
-	}
-
-	printProjectFirewallIPs(addresses, false)
-	return projectShowFirewallFromTemporaryVM()
+	return printProjectHostFirewallShow(currentProjectStore(), running)
 }
 
 func cmdProjectClean() error {
@@ -367,6 +363,9 @@ func cmdProjectClean() error {
 		return fmt.Errorf("project VM is running; stop it with 'zaigr project vm stop' before running project clean")
 	}
 	if err := requireNoActiveProjectShells(currentProjectStore(), "project clean"); err != nil {
+		return err
+	}
+	if err := requireHostPreflight("project clean"); err != nil {
 		return err
 	}
 	if err := lock.recover(currentProjectStore(), "project clean"); err != nil {
@@ -424,6 +423,9 @@ func cmdProjectRebuild(force bool) error {
 		return fmt.Errorf("project VM is running; stop it with 'zaigr project vm stop' before running project rebuild")
 	}
 	if err := requireNoActiveProjectShells(currentProjectStore(), "project rebuild"); err != nil {
+		return err
+	}
+	if err := requireHostPreflight("project rebuild"); err != nil {
 		return err
 	}
 	if err := lock.recover(currentProjectStore(), "project rebuild"); err != nil {
@@ -813,147 +815,19 @@ func waitForQemuProcessesExit(processes []qemuProcessIdentity, timeout time.Dura
 	}
 }
 
-func projectFirewallEntriesFromVM(port string) (map[string]struct{}, []string, error) {
-	rootKeyPath, _, err := ensureRootSSHKey()
-	if err != nil {
-		return nil, nil, err
-	}
-	command := "if [ -f /etc/opensnitchd/lists/domains/allowed.txt ]; then " +
-		"cat /etc/opensnitchd/lists/domains/allowed.txt; else " +
-		"printf 'allowed domain list not found\\n'; fi"
-	out, err := sshReadCommand(port, rootKeyPath, "root", command)
-	if err != nil {
-		return nil, nil, fmt.Errorf("read VM firewall: %w", err)
-	}
-	active, ordered := parseFirewallEntries(string(out))
-	return active, ordered, nil
-}
-
-func projectShowFirewallFromVM(port string) error {
-	active, ordered, err := projectFirewallEntriesFromVM(port)
-	if err != nil {
-		return err
-	}
-	return projectShowFirewallEntries(active, ordered)
-}
-
-func projectShowFirewallFromTemporaryVM() (returnErr error) {
-	if err := requireKVMAccess(); err != nil {
-		return err
-	}
-
-	store := currentProjectStore()
-	imagePath := store.authoritativeImagePath()
-	if _, err := os.Stat(imagePath); err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("project image not found; run 'zaigr project vm start' first")
-		}
-		return fmt.Errorf("stat project image: %w", err)
-	}
-
-	kernelPath, err := ensureKernelQuiet(false)
-	if err != nil {
-		return err
-	}
-	sshPort, err := allocateEphemeralSSHPort()
-	if err != nil {
-		return err
-	}
-	_, rootPubKey, err := ensureRootSSHKey()
-	if err != nil {
-		return fmt.Errorf("ensure root SSH key: %w", err)
-	}
-	_, userPubKey, err := ensureUserSSHKey()
-	if err != nil {
-		return fmt.Errorf("ensure user SSH key: %w", err)
-	}
-	qemuPath, err := exec.LookPath("qemu-system-x86_64")
-	if err != nil {
-		return fmt.Errorf("qemu not found: %w", err)
-	}
-	if err := store.ensureAgentStateDir(); err != nil {
-		return err
-	}
-
-	runtimeDir, err := os.MkdirTemp("", "zaigr-inspect-*")
-	if err != nil {
-		return fmt.Errorf("create inspection runtime: %w", err)
-	}
-	defer func() {
-		if returnErr == nil {
-			_ = os.RemoveAll(runtimeDir)
-		}
-	}()
-	monitorSock := filepath.Join(runtimeDir, "vm.sock")
-	workspaceSock := filepath.Join(runtimeDir, "workspace.sock")
-	agentStateSock := filepath.Join(runtimeDir, "state.sock")
-	workspace, err := os.Getwd()
-	if err != nil {
-		return err
-	}
-	args := buildQEMUArgsWithContext(
-		imagePath,
-		kernelPath,
-		"qcow2",
-		true,
-		defaultVMRam,
-		defaultVMCPUs,
-		sshPort,
-		rootPubKey,
-		userPubKey,
-		store.hostname(),
-		monitorSock,
-		store.agentStateDir(), workspace, store.serialLogPath(), workspaceSock, agentStateSock,
-	)
-	virtiofsdPath, err := ensureVirtiofsdWithWriter(false, io.Discard)
-	if err != nil {
-		return err
-	}
-	launchID, err := newVMLaunchID()
-	if err != nil {
-		return err
-	}
-	guestUID, guestGID, err := readGuestIdentityFromImage(imagePath)
-	if err != nil {
-		return err
-	}
-	spec := vmLaunchSpec{
-		Store: store.Path, LogRoot: store.Path, RuntimeDir: runtimeDir,
-		MonitorSock: monitorSock, WorkspaceSock: workspaceSock, AgentStateSock: agentStateSock,
-		Workspace: workspace, AgentState: store.agentStateDir(), Virtiofsd: virtiofsdPath,
-		SerialLog: store.serialLogPath(), SSHPort: sshPort, Mode: "attached", LaunchID: launchID,
-		GuestUID: guestUID, GuestGID: guestGID, QEMUPath: qemuPath, QEMUArgs: args[1:],
-	}
-
-	fmt.Fprintf(os.Stderr, ":: Project VM is not running; booting temporary VM to read firewall\n")
-	logInfo("starting temporary VM for firewall inspection", "image", imagePath, "port", sshPort, "monitor_sock", monitorSock)
-
-	launch, err := launchSupervisedVM(spec)
-	if err != nil {
-		return err
-	}
-	defer func() { qmpQuit(monitorSock); returnErr = errors.Join(returnErr, launch.stop()) }()
-	if err := waitForVMGuestReady(launch, 60*time.Second); err != nil {
-		return err
-	}
-	if err := launch.commit(); err != nil {
-		return err
-	}
-
-	active, ordered, err := projectFirewallEntriesFromVM(sshPort)
-	if err != nil {
-		return fmt.Errorf("read VM firewall: %w", err)
-	}
-	return projectShowFirewallEntries(active, ordered)
-}
-
 func syncAppliedSetupFirewallToVM(port string) error {
 	return syncAppliedSetupFirewallToVMContext(context.Background(), port)
 }
 
 func syncAppliedSetupFirewallToVMContext(ctx context.Context, port string) error {
-	if err := syncSavedProjectFirewallIPsToVMContext(ctx, port); err != nil {
+	_ = port
+	store := currentProjectStore()
+	host, record, err := runningHostNetworkRecord(store)
+	if err != nil {
 		return err
+	}
+	if !host {
+		return fmt.Errorf("host firewall control is unavailable; stop the legacy VM and start it again to migrate")
 	}
 	groups, err := loadAppliedSetupFirewallGroups()
 	if err != nil {
@@ -967,11 +841,6 @@ func syncAppliedSetupFirewallToVMContext(ctx context.Context, port string) error
 	if err != nil {
 		return err
 	}
-	store := currentProjectStore()
-	previousGlobalEntries, err := store.appliedGlobalFirewallEntries()
-	if err != nil {
-		return err
-	}
 	syncGroups := append([]setupFirewallGroup{}, groups...)
 	if len(globalEntries) > 0 {
 		syncGroups = append(syncGroups, setupFirewallGroup{
@@ -979,15 +848,7 @@ func syncAppliedSetupFirewallToVMContext(ctx context.Context, port string) error
 			Entries: globalEntries,
 		})
 	}
-	staleGlobalEntries := staleGlobalFirewallEntries(previousGlobalEntries, setupEntries, globalEntries)
-	if len(syncGroups) == 0 && len(staleGlobalEntries) == 0 {
-		return nil
-	}
 	digest := appliedSetupFirewallDigest(syncGroups)
-	if syncedDigest, err := store.readAppliedFirewallSyncMarker(); err == nil && syncedDigest == digest && len(staleGlobalEntries) == 0 {
-		logInfo("skipping applied setup firewall sync; already synced this VM boot", "digest", digest)
-		return nil
-	}
 	if len(setupEntries) > 0 {
 		if err := store.appendFirewallEntries(setupEntries); err != nil {
 			return err
@@ -999,17 +860,8 @@ func syncAppliedSetupFirewallToVMContext(ctx context.Context, port string) error
 			fmt.Fprintf(os.Stderr, "  %s\n", entry)
 		}
 	}
-	rootKeyPath, _, err := ensureRootSSHKey()
-	if err != nil {
-		return err
-	}
-	if err := sshRunControlScriptContext(ctx, port, rootKeyPath, firewallSyncCommands(syncGroups, staleGlobalEntries)); err != nil {
-		return fmt.Errorf("sync applied setup firewall to VM: %w", err)
-	}
-	stableCtx, stableCancel := context.WithTimeout(ctx, 30*time.Second)
-	defer stableCancel()
-	if !waitForStableSSHContext(stableCtx, port, 3) {
-		return fmt.Errorf("VM did not become stably reachable via SSH after syncing applied setup firewall")
+	if _, err := hostNetworkControl(ctx, store.runtimeDir(), record.LaunchID, "policy-reconcile", hostnet.Forward{}); err != nil {
+		return fmt.Errorf("reconcile host firewall policy: %w", err)
 	}
 	if err := store.writeAppliedFirewallSyncMarker(digest); err != nil {
 		return err
@@ -1068,111 +920,20 @@ func appliedSetupFirewallDigest(groups []setupFirewallGroup) string {
 	return fmt.Sprintf("%x", sum)
 }
 
-func projectShowFirewallEntries(entries map[string]struct{}, ordered []string) error {
-	groups, err := loadAppliedSetupFirewallGroups()
-	if err != nil {
-		return err
-	}
-	globalEntries, err := globalFirewallEntries()
-	if err != nil {
-		return err
-	}
-
-	covered := make(map[string]struct{})
-	totalPrinted := 0
-	activeGlobal := make([]string, 0, len(globalEntries))
-	for _, entry := range globalEntries {
-		if _, ok := entries[entry]; ok {
-			activeGlobal = append(activeGlobal, entry)
-		}
-	}
-	if len(activeGlobal) > 0 {
-		totalPrinted++
-		fmt.Println("# global")
-		for _, entry := range activeGlobal {
-			fmt.Println(entry)
-			covered[entry] = struct{}{}
-		}
-	}
-	for _, group := range groups {
-		active := make([]string, 0, len(group.Entries))
-		for _, entry := range group.Entries {
-			if _, ok := entries[entry]; ok {
-				active = append(active, entry)
-			}
-		}
-		if len(active) == 0 {
-			continue
-		}
-		totalPrinted++
-		fmt.Printf("# %s\n", group.Name)
-		for _, entry := range active {
-			fmt.Println(entry)
-			covered[entry] = struct{}{}
-		}
-	}
-
-	extras := make([]string, 0, len(entries))
-	for _, entry := range ordered {
-		if _, ok := covered[entry]; !ok {
-			extras = append(extras, entry)
-		}
-	}
-
-	if totalPrinted == 0 && len(extras) == 0 {
-		fmt.Println("No project-specific firewall entries have been recorded.")
-		return nil
-	}
-	if len(extras) > 0 {
-		fmt.Println("# other entries")
-		for _, entry := range extras {
-			fmt.Println(entry)
-		}
-	}
-	return nil
-}
-
 type setupFirewallGroup struct {
 	Name    string
 	Entries []string
 }
 
 func setupFirewallCommands(groups []setupFirewallGroup) string {
-	var script strings.Builder
-	for _, group := range groups {
-		if len(group.Entries) == 0 {
-			continue
-		}
-		script.WriteString(setupFirewallCommand(group.Name, group.Entries))
-		script.WriteByte('\n')
-	}
-	return script.String()
+	_ = groups
+	return ": # firewall domains are enforced by the host\n"
 }
 
 func firewallSyncCommands(groups []setupFirewallGroup, removeEntries []string) string {
-	var script strings.Builder
-	if len(removeEntries) > 0 {
-		script.WriteString(`allowed_file=/etc/opensnitchd/lists/domains/allowed.txt
-if [ -f "$allowed_file" ]; then
-  tmp=$(mktemp "${allowed_file}.XXXXXX")
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in
-`)
-		for _, entry := range removeEntries {
-			script.WriteString("      ")
-			script.WriteString(entry)
-			script.WriteString(")\n        continue\n        ;;\n")
-		}
-		script.WriteString(`    esac
-    printf '%s\n' "$line" >> "$tmp"
-  done < "$allowed_file"
-  chmod 0644 "$tmp"
-  mv "$tmp" "$allowed_file"
-fi
-`)
-	}
-	script.WriteString(setupFirewallCommands(groups))
-	return script.String()
+	_ = groups
+	_ = removeEntries
+	return ": # firewall domains are enforced by the host\n"
 }
 
 func loadAppliedSetupFirewallGroups() ([]setupFirewallGroup, error) {
@@ -1199,23 +960,6 @@ func appendUniqueFirewallEntries(current []string, additions []string) []string 
 		seen[entry] = struct{}{}
 	}
 	return current
-}
-
-func parseFirewallEntries(raw string) (map[string]struct{}, []string) {
-	lines := strings.Split(raw, "\n")
-	active := make(map[string]struct{}, len(lines))
-	ordered := make([]string, 0, len(lines))
-	for _, line := range lines {
-		entry := strings.TrimSpace(line)
-		if entry == "" || strings.HasPrefix(entry, "#") {
-			continue
-		}
-		if _, exists := active[entry]; !exists {
-			active[entry] = struct{}{}
-			ordered = append(ordered, entry)
-		}
-	}
-	return active, ordered
 }
 
 func coalesce(value string, fallback string) string {

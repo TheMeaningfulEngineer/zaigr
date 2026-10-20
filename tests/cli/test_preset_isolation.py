@@ -790,91 +790,25 @@ done
 
 
 @pytest.mark.timeout(300)
-def test_preset_masks_state_and_ssh_keys_when_home_is_inside_workspace(
-    project_factory,
-):
-    """The workspace mount must not provide an alias around preset isolation."""
+def test_workspace_overlapping_zaigr_state_is_refused_with_recovery_guidance(project_factory):
+    """A project workspace cannot export Zaigr's host-owned control and key store."""
     project = project_factory("home-inside-workspace")
     project.home = project.cwd
-    run = partial(_checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
-    preset_name = "isolation edge"
-
-    SetupFactory(project.home).preset(
-        name=preset_name,
-        run=r"""
-stty -echo
-printf 'EDGE_READY\n'
-while IFS= read -r command; do
-    eval "$command"
-done
-""",
-        setups=[],
-    )
-
-    run(f"{zaigr} project vm start", input="y\n", timeout=180)
-    run(
-        f"{zaigr} project vm exec -- mkdir -p "
-        "/home/user/.zaigr-agent-state/isolation-sibling",
-        timeout=20,
-    )
-    run(
-        f"{zaigr} project vm exec -- tee "
-        "/home/user/.zaigr-agent-state/isolation-sibling/secret.txt",
-        input="workspace-alias-secret\n",
-        timeout=20,
-    )
-
-    shell = spawn_interactive(
-        f"{zaigr} shell --preset {shlex.quote(preset_name)}",
+    stdout, stderr, rc = _run(
+        [zaigr, "project", "vm", "start"],
         cwd=project.cwd,
         env=project.env,
-        timeout=180,
+        input="y\n",
+        timeout=60,
     )
-    try:
-        shell.expect_exact("EDGE_READY", timeout=180)
-
-        shell.sendline(
-            "if test -r /home/user/workspace/.zaigr/root-ssh.key; then "
-            "printf 'ROOT_KEY_ALLOWED\\n'; else printf 'ROOT_KEY_DENIED\\n'; fi"
-        )
-        _expect_denied(shell, "ROOT_KEY_DENIED", "ROOT_KEY_ALLOWED")
-        shell.sendline(
-            "if test -r /home/user/workspace/.zaigr/user-ssh.key; then "
-            "printf 'USER_KEY_ALLOWED\\n'; else printf 'USER_KEY_DENIED\\n'; fi"
-        )
-        _expect_denied(shell, "USER_KEY_DENIED", "USER_KEY_ALLOWED")
-        shell.sendline(
-            "if cat /home/user/workspace/.zaigr/store/*/agent-state/"
-            "isolation-sibling/secret.txt >/dev/null 2>&1; then "
-            "printf 'STATE_ALIAS_ALLOWED\\n'; else printf 'STATE_ALIAS_DENIED\\n'; fi"
-        )
-        _expect_denied(shell, "STATE_ALIAS_DENIED", "STATE_ALIAS_ALLOWED")
-        shell.sendline(
-            "if cat '/home/user/workspace/.zaigr/presets/isolation edge/run' "
-            ">/dev/null 2>&1; then printf 'CONTROL_STATE_ALLOWED\\n'; else "
-            "printf 'CONTROL_STATE_DENIED\\n'; fi"
-        )
-        _expect_denied(shell, "CONTROL_STATE_DENIED", "CONTROL_STATE_ALLOWED")
-
-        for user, marker in (("root", "ROOT"), ("user", "USER")):
-            shell.sendline(
-                "if ssh -o BatchMode=yes -o ConnectTimeout=5 "
-                "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-                f"-i /home/user/workspace/.zaigr/{user}-ssh.key "
-                f"{user}@127.0.0.1 true >/dev/null 2>&1; then "
-                f"printf '{marker}_SSH_ALLOWED\\n'; else "
-                f"printf '{marker}_SSH_DENIED\\n'; fi"
-            )
-            _expect_denied(shell, f"{marker}_SSH_DENIED", f"{marker}_SSH_ALLOWED")
-
-        shell.sendline("exit")
-        shell.expect(pexpect.EOF)
-        shell.close()
-        assert shell.exitstatus == 0
-    finally:
-        if shell.isalive():
-            shell.close(force=True)
+    assert rc != 0, err_msg(stdout, stderr)
+    diagnostic = stdout + stderr
+    assert "overlaps Zaigr's protected" in diagnostic
+    assert str(project.home / ".zaigr") in diagnostic
+    assert "use a narrower project workspace" in diagnostic
+    assert "then retry" in diagnostic
+    assert "Booting VM" not in stdout
 
 
 @pytest.mark.timeout(300)

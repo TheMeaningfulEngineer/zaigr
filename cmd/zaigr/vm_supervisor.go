@@ -17,10 +17,13 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/sys/unix"
+	"zaigr/cmd/zaigr/hostnet"
 )
 
 type vmOwnedProcess struct {
@@ -32,18 +35,21 @@ type vmOwnedProcess struct {
 }
 
 type vmSupervisorRecord struct {
-	VirtiofsSandbox      string         `json:"virtiofs_sandbox,omitempty"`
-	FormatVersion        int            `json:"format_version"`
-	LaunchID             string         `json:"launch_id"`
-	Mode                 string         `json:"mode"`
-	RuntimeDir           string         `json:"runtime_dir"`
-	SocketDir            string         `json:"socket_dir,omitempty"`
-	Supervisor           vmOwnedProcess `json:"supervisor"`
-	QEMU                 vmOwnedProcess `json:"qemu,omitempty"`
-	WorkspaceDaemon      vmOwnedProcess `json:"workspace_daemon,omitempty"`
-	AgentStateDaemon     vmOwnedProcess `json:"agent_state_daemon,omitempty"`
-	WorkspaceDescendant  vmOwnedProcess `json:"workspace_descendant,omitempty"`
-	AgentStateDescendant vmOwnedProcess `json:"agent_state_descendant,omitempty"`
+	VirtiofsSandbox      string                    `json:"virtiofs_sandbox,omitempty"`
+	FormatVersion        int                       `json:"format_version"`
+	LaunchID             string                    `json:"launch_id"`
+	Mode                 string                    `json:"mode"`
+	NetworkBackend       string                    `json:"network_backend,omitempty"`
+	RuntimeDir           string                    `json:"runtime_dir"`
+	SocketDir            string                    `json:"socket_dir,omitempty"`
+	Supervisor           vmOwnedProcess            `json:"supervisor"`
+	QEMU                 vmOwnedProcess            `json:"qemu,omitempty"`
+	WorkspaceDaemon      vmOwnedProcess            `json:"workspace_daemon,omitempty"`
+	AgentStateDaemon     vmOwnedProcess            `json:"agent_state_daemon,omitempty"`
+	WorkspaceDescendant  vmOwnedProcess            `json:"workspace_descendant,omitempty"`
+	AgentStateDescendant vmOwnedProcess            `json:"agent_state_descendant,omitempty"`
+	NetworkGeneration    uint64                    `json:"network_generation,omitempty"`
+	NetworkProcesses     map[string]vmOwnedProcess `json:"network_processes,omitempty"`
 }
 
 type vmLaunchSpec struct {
@@ -63,6 +69,7 @@ type vmLaunchSpec struct {
 	SerialLog           string
 	SSHPort             string
 	Mode                string
+	NetworkBackend      string
 	LaunchID            string
 	GuestUID            int
 	GuestGID            int
@@ -118,6 +125,7 @@ func newVMSupervisorCommand() *cobra.Command {
 	f.StringVar(&spec.SerialLog, "serial-log", "", "durable QEMU serial log")
 	f.StringVar(&spec.SSHPort, "ssh-port", "", "SSH forwarding port")
 	f.StringVar(&spec.Mode, "mode", "", "attached or detached")
+	spec.NetworkBackend = vmNetworkBackendHost
 	f.StringVar(&spec.LaunchID, "launch-id", "", "launch identity")
 	f.IntVar(&spec.GuestUID, "guest-uid", 0, "guest user UID")
 	f.IntVar(&spec.GuestGID, "guest-gid", 0, "guest user primary GID")
@@ -125,8 +133,14 @@ func newVMSupervisorCommand() *cobra.Command {
 }
 
 func validateVMLaunchSpec(spec vmLaunchSpec) error {
+	if spec.NetworkBackend != vmNetworkBackendHost {
+		return fmt.Errorf("new VM launches require host-enforced networking")
+	}
 	if spec.VirtiofsSandbox != "" && spec.VirtiofsSandbox != "namespace" && spec.VirtiofsSandbox != "none" {
 		return fmt.Errorf("invalid virtiofs sandbox mode: %q", spec.VirtiofsSandbox)
+	}
+	if spec.VirtiofsSandbox != "namespace" {
+		return virtiofsNamespaceRequiredError("the requested VM launch does not use virtiofs-sandbox=namespace")
 	}
 	if spec.SocketDir != "" && (spec.SocketDir != vmSocketDir(spec.LaunchID) || spec.WorkspaceSock != filepath.Join(spec.SocketDir, "workspace.sock") || spec.AgentStateSock != filepath.Join(spec.SocketDir, "agent-state.sock")) {
 		return fmt.Errorf("invalid VM socket directory")
@@ -258,6 +272,23 @@ func validateVMSupervisorRecord(record vmSupervisorRecord) error {
 	if record.AgentStateDescendant.PID > 0 && record.AgentStateDescendant.ProcessGroup != record.AgentStateDaemon.ProcessGroup {
 		return fmt.Errorf("VM supervisor record has mismatched agent-state daemon group")
 	}
+	if record.NetworkBackend != "" && record.NetworkBackend != vmNetworkBackendUser && record.NetworkBackend != vmNetworkBackendHost {
+		return fmt.Errorf("VM supervisor record has invalid network backend")
+	}
+	if record.NetworkBackend == vmNetworkBackendHost && record.NetworkGeneration == 0 {
+		return fmt.Errorf("host-network VM record has no policy generation")
+	}
+	if len(record.NetworkProcesses) > 8 {
+		return fmt.Errorf("VM supervisor record has too many host network processes")
+	}
+	for name, process := range record.NetworkProcesses {
+		if name == "" || process.PID <= 0 || process.ProcessGroup <= 0 || process.ExeDevice == 0 || process.ExeInode == 0 {
+			return fmt.Errorf("VM supervisor record has incomplete host network process identity")
+		}
+		if _, err := strconv.ParseUint(process.StartTime, 10, 64); err != nil {
+			return fmt.Errorf("VM supervisor record has invalid host network process start time: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -352,6 +383,16 @@ func validateStaleVMRecord(store projectStore, record vmSupervisorRecord) error 
 	if !filepath.IsAbs(runtimeDir) || (runtimeDir != store.runtimeDir() && !shortTemp) {
 		return fmt.Errorf("stale VM record has an unsafe runtime directory: %s", record.RuntimeDir)
 	}
+	supervisorLive, err := vmProcessLive(record.Supervisor)
+	if err != nil {
+		return fmt.Errorf("inspect previous VM supervisor: %w", err)
+	}
+	if supervisorLive {
+		return fmt.Errorf("previous VM supervisor is still live")
+	}
+	if err := stopRecordedNetworkProcesses(record); err != nil {
+		return fmt.Errorf("stop stale host network processes: %w", err)
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		supervisorLive, err := vmProcessLive(record.Supervisor)
@@ -370,6 +411,13 @@ func validateStaleVMRecord(store projectStore, record vmSupervisorRecord) error 
 			if childLive {
 				live = true
 			}
+		}
+		for _, child := range record.NetworkProcesses {
+			childLive, err := vmProcessLive(child)
+			if err != nil {
+				return fmt.Errorf("inspect previous host network process %d: %w", child.PID, err)
+			}
+			live = live || childLive
 		}
 		if !live {
 			empty, err := daemonGroupsEmpty(record)
@@ -610,6 +658,10 @@ func launchSupervisedVM(spec vmLaunchSpec) (*vmLaunchHandle, error) {
 		return nil, fmt.Errorf("start VM supervisor: %w", err)
 	}
 	started = true
+	// The child now owns its duplicated readiness descriptor. Closing this
+	// parent's writer makes EOF observable if the supervisor exits before
+	// sending a structured readiness message.
+	_ = readyWrite.Close()
 	identity, err := vmProcessIdentity(command.Process.Pid)
 	if err != nil {
 		_ = command.Process.Kill()
@@ -661,12 +713,36 @@ func (handle *vmLaunchHandle) readMessage(timeout time.Duration) (vmLaunchMessag
 			err error
 		}{msg, err}
 	}()
+	readResult := func(got struct {
+		msg vmLaunchMessage
+		err error
+	}) (vmLaunchMessage, error) {
+		if got.err != nil {
+			select {
+			case <-handle.exited:
+				return vmLaunchMessage{}, fmt.Errorf("supervisor exited: %v while reading readiness response: %w; see %s", handle.exitErr, got.err, filepath.Join(handle.spec.LogRoot, "vm-supervisor.log"))
+			default:
+				return vmLaunchMessage{}, fmt.Errorf("read supervisor readiness response: %w; see %s", got.err, filepath.Join(handle.spec.LogRoot, "vm-supervisor.log"))
+			}
+		}
+		return got.msg, got.err
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
 	select {
 	case got := <-result:
-		return got.msg, got.err
+		return readResult(got)
 	case <-handle.exited:
-		return vmLaunchMessage{}, fmt.Errorf("supervisor exited: %v", handle.exitErr)
-	case <-time.After(timeout):
+		// A final structured error and process exit can become ready at once.
+		// Drain the reader result before falling back to the exit status, while
+		// keeping the wait bounded by the original startup deadline.
+		select {
+		case got := <-result:
+			return readResult(got)
+		case <-deadline.C:
+			return vmLaunchMessage{}, fmt.Errorf("supervisor exited: %v; see %s", handle.exitErr, filepath.Join(handle.spec.LogRoot, "vm-supervisor.log"))
+		}
+	case <-deadline.C:
 		return vmLaunchMessage{}, fmt.Errorf("supervisor reply timed out after %s", timeout)
 	}
 }
@@ -823,9 +899,228 @@ func qemuExitResult(err error) error {
 	return fmt.Errorf("QEMU exited: %w", err)
 }
 
+func startSupervisorHostNetwork(spec vmLaunchSpec, store projectStore) (*hostNetworkHandle, error) {
+	names, generation, grants, err := loadHostNetworkInitialPolicy(store)
+	if err != nil {
+		return nil, err
+	}
+	slirp, err := exec.LookPath("slirp4netns")
+	if err != nil {
+		return nil, fmt.Errorf("locate slirp4netns for host network backend: %w", err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	sshPort, err := strconv.ParseUint(spec.SSHPort, 10, 16)
+	if err != nil || sshPort == 0 {
+		return nil, fmt.Errorf("invalid SSH host port %q for host network backend", spec.SSHPort)
+	}
+	return startHostNetworkRuntime(context.Background(), hostnet.Options{
+		LaunchID: spec.LaunchID, RuntimeDir: spec.RuntimeDir, Executable: executable,
+		SlirpPath: slirp, SSHHostPort: uint16(sshPort), SSHGuestPort: 22,
+		InitialIPGrants: grants, InitialGeneration: generation,
+	}, store, names, generation)
+}
+
+func hostNetworkOwnedProcesses(processes map[string]hostnet.ProcessIdentity) (map[string]vmOwnedProcess, error) {
+	if len(processes) == 0 || len(processes) > 8 {
+		return nil, fmt.Errorf("host network reported invalid process count %d", len(processes))
+	}
+	owned := make(map[string]vmOwnedProcess, len(processes))
+	for name, reported := range processes {
+		if name == "" || reported.PID <= 0 {
+			return nil, fmt.Errorf("host network reported incomplete process identity")
+		}
+		identity, err := vmProcessIdentity(reported.PID)
+		if err != nil {
+			return nil, err
+		}
+		if identity.StartTime != reported.StartTime {
+			return nil, fmt.Errorf("host network process %s changed identity during startup", name)
+		}
+		owned[name] = identity
+	}
+	return owned, nil
+}
+
+func verifyHostNetworkReady(handle *hostNetworkHandle, record *vmSupervisorRecord, recordMu *sync.Mutex) error {
+	if handle == nil {
+		return nil
+	}
+	status, err := handle.Status(context.Background())
+	if err != nil {
+		return err
+	}
+	recordMu.Lock()
+	generation := record.NetworkGeneration
+	processes := make(map[string]vmOwnedProcess, len(record.NetworkProcesses))
+	for name, process := range record.NetworkProcesses {
+		processes[name] = process
+	}
+	recordMu.Unlock()
+	if status.Generation != generation {
+		return fmt.Errorf("policy generation differs from recorded generation (%d != %d)", status.Generation, generation)
+	}
+	if len(status.Processes) != len(processes) {
+		return fmt.Errorf("host network process set differs from the supervisor record")
+	}
+	for name, reported := range status.Processes {
+		process, ok := processes[name]
+		if !ok || process.PID != reported.PID || process.StartTime != reported.StartTime {
+			return fmt.Errorf("host network process %s identity differs from the supervisor record", name)
+		}
+		live, err := vmProcessLive(process)
+		if err != nil {
+			return fmt.Errorf("inspect host network process %s: %w", name, err)
+		}
+		if !live {
+			return fmt.Errorf("host network process %s exited", name)
+		}
+	}
+	return nil
+}
+
+func verifyNetworkProcessesStopped(processes map[string]vmOwnedProcess) error {
+	for name, process := range processes {
+		live, err := vmProcessLive(process)
+		if err != nil {
+			return fmt.Errorf("inspect host network process %s: %w", name, err)
+		}
+		if live {
+			return fmt.Errorf("host network process %s (PID %d) remains live after teardown", name, process.PID)
+		}
+		members, err := daemonGroupMembers(process)
+		if err != nil {
+			return fmt.Errorf("inspect host network process group %s: %w", name, err)
+		}
+		if len(members) > 0 {
+			return fmt.Errorf("host network process group %s (PGID %d) remains live after teardown", name, process.ProcessGroup)
+		}
+	}
+	return nil
+}
+
+func forwardHostNetworkEvents(handle *hostNetworkHandle, exit chan<- vmChildExit) {
+	childExits := handle.ChildExits()
+	fatal := handle.Fatal()
+	for childExits != nil || fatal != nil {
+		select {
+		case <-handle.Done():
+			return
+		case child, ok := <-childExits:
+			if !ok {
+				childExits = nil
+				continue
+			}
+			select {
+			case exit <- vmChildExit{name: "host-network-" + child.Name, err: child.Err}:
+			case <-handle.Done():
+				return
+			}
+		case err, ok := <-fatal:
+			if !ok {
+				fatal = nil
+				continue
+			}
+			select {
+			case exit <- vmChildExit{name: "host-network-fatal", err: err}:
+			case <-handle.Done():
+				return
+			}
+			fatal = nil
+		}
+	}
+}
+
+// openPinnedVMShare opens the already validated directory without following a
+// replacement symlink. The supervisor later compares the namespace daemon's
+// root device/inode to this descriptor before allowing QEMU to attach.
+func openPinnedVMShare(path string) (*os.File, error) {
+	canonical, err := canonicalPathWithMissingSuffix(path)
+	if err != nil {
+		return nil, err
+	}
+	fd, err := unix.Open(path, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), "zaigr-pinned-virtiofs-share")
+	fail := func(err error) (*os.File, error) { _ = file.Close(); return nil, err }
+	info, err := file.Stat()
+	if err != nil {
+		return fail(err)
+	}
+	if !info.IsDir() {
+		return fail(fmt.Errorf("export path is not a directory"))
+	}
+	resolved, err := filepath.EvalSymlinks(fmt.Sprintf("/proc/self/fd/%d", fd))
+	if err != nil {
+		return fail(err)
+	}
+	if filepath.Clean(resolved) != canonical {
+		return fail(fmt.Errorf("export directory changed while it was being pinned"))
+	}
+	return file, nil
+}
+
+func pinnedVMSharePath(file *os.File) (string, error) {
+	if file == nil {
+		return "", errors.New("missing pinned export directory")
+	}
+	resolved, err := filepath.EvalSymlinks(fmt.Sprintf("/proc/self/fd/%d", file.Fd()))
+	if err != nil {
+		return "", err
+	}
+	if strings.HasSuffix(resolved, " (deleted)") {
+		return "", errors.New("pinned export directory was removed")
+	}
+	return filepath.Clean(resolved), nil
+}
+
+func verifyVMShareNamespaceRoot(process vmOwnedProcess, pinned *os.File) error {
+	if process.PID <= 0 || pinned == nil {
+		return errors.New("missing namespace process or pinned export directory")
+	}
+	expected, err := pinned.Stat()
+	if err != nil {
+		return err
+	}
+	actual, err := os.Stat(fmt.Sprintf("/proc/%d/root", process.PID))
+	if err != nil {
+		return fmt.Errorf("stat namespace root for PID %d: %w", process.PID, err)
+	}
+	expectedStat, ok := expected.Sys().(*syscall.Stat_t)
+	if !ok {
+		return errors.New("pinned export stat lacks device and inode")
+	}
+	actualStat, ok := actual.Sys().(*syscall.Stat_t)
+	if !ok {
+		return errors.New("namespace root stat lacks device and inode")
+	}
+	if expectedStat.Dev != actualStat.Dev || expectedStat.Ino != actualStat.Ino {
+		return fmt.Errorf("virtiofs namespace root does not match pinned export directory")
+	}
+	return nil
+}
+
 func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	ready := os.NewFile(3, "ready")
+	var committed bool
+	var readyErrorReported bool
+	defer func() {
+		// Some validation failures happen before the supervisor's normal
+		// teardown handler is installed. Report those through the same bounded
+		// readiness protocol instead of making the launcher infer an exit code.
+		if retErr != nil && !committed && !readyErrorReported && ready != nil {
+			_, _ = fmt.Fprintf(ready, "{\"state\":\"error\",\"message\":%q}\n", retErr.Error())
+		}
+		if ready != nil {
+			_ = ready.Close()
+		}
+	}()
 	startupDeadline := time.Now().Add(30 * time.Second)
 	precommitDeadline := time.Now().Add(150 * time.Second)
 	precommitTimer := time.NewTimer(time.Until(precommitDeadline))
@@ -833,24 +1128,61 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 	if err := validateVMLaunchSpec(spec); err != nil {
 		return err
 	}
-	ready := os.NewFile(3, "ready")
 	control := os.NewFile(4, "control")
 	lock := os.NewFile(5, "lifetime-lock")
 	syscall.CloseOnExec(3)
 	syscall.CloseOnExec(4)
 	syscall.CloseOnExec(5)
-	defer func() { _ = ready.Close() }()
 	defer func() { _ = control.Close() }()
 	defer func() { _ = lock.Close() }()
 	if ready == nil || control == nil || lock == nil {
 		return fmt.Errorf("missing inherited supervisor descriptors")
 	}
 	store := projectStore{Path: spec.Store}
+	var err error
+	var workspaceRoot, agentStateRoot *os.File
+	if spec.NetworkBackend == vmNetworkBackendHost {
+		if spec.VirtiofsSandbox != "namespace" {
+			return fmt.Errorf("host network backend requires namespace virtiofs sandbox for export identity verification")
+		}
+		for _, keyPath := range []string{rootSSHKeyPath(), userSSHKeyPath()} {
+			if err := validateProtectedSSHPrivateKey(keyPath); err != nil {
+				return fmt.Errorf("validate host SSH credential before VM export: %w", err)
+			}
+		}
+		if err := validateHostNetworkExport(spec.Workspace, spec.AgentState, spec.Store, zaigDir(), spec.RuntimeDir); err != nil {
+			return fmt.Errorf("VM export validation: %w", err)
+		}
+		workspaceRoot, err = openPinnedVMShare(spec.Workspace)
+		if err != nil {
+			return fmt.Errorf("pin workspace export: %w", err)
+		}
+		defer workspaceRoot.Close()
+		agentStateRoot, err = openPinnedVMShare(spec.AgentState)
+		if err != nil {
+			return fmt.Errorf("pin agent-state export: %w", err)
+		}
+		defer agentStateRoot.Close()
+		pinnedWorkspacePath, err := pinnedVMSharePath(workspaceRoot)
+		if err != nil {
+			return fmt.Errorf("resolve pinned workspace export: %w", err)
+		}
+		pinnedAgentStatePath, err := pinnedVMSharePath(agentStateRoot)
+		if err != nil {
+			return fmt.Errorf("resolve pinned agent-state export: %w", err)
+		}
+		if err := validateHostNetworkExport(pinnedWorkspacePath, pinnedAgentStatePath, spec.Store, zaigDir(), spec.RuntimeDir); err != nil {
+			return fmt.Errorf("pinned VM export validation: %w", err)
+		}
+	}
 	own, err := vmProcessIdentity(os.Getpid())
 	if err != nil {
 		return err
 	}
-	record := vmSupervisorRecord{FormatVersion: 1, LaunchID: spec.LaunchID, Mode: spec.Mode, RuntimeDir: spec.RuntimeDir, SocketDir: spec.SocketDir, Supervisor: own, VirtiofsSandbox: spec.VirtiofsSandbox}
+	record := vmSupervisorRecord{FormatVersion: 1, LaunchID: spec.LaunchID, Mode: spec.Mode, NetworkBackend: spec.NetworkBackend, RuntimeDir: spec.RuntimeDir, SocketDir: spec.SocketDir, Supervisor: own, VirtiofsSandbox: spec.VirtiofsSandbox}
+	if spec.NetworkBackend == vmNetworkBackendHost {
+		record.NetworkGeneration = 1
+	}
 	if err := writeVMSupervisorRecord(store, record); err != nil {
 		return err
 	}
@@ -859,7 +1191,7 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 		return err
 	}
 	defer func() { _ = supervisorLog.Close() }()
-	exit := make(chan vmChildExit, 3)
+	exit := make(chan vmChildExit, 8)
 	commands := make(chan string, 2)
 	go func() {
 		scanner := bufio.NewScanner(control)
@@ -873,13 +1205,42 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 	defer signal.Stop(signals)
 	children := map[string]*exec.Cmd{}
 	alive := map[string]bool{}
-	committed := false
+	var networkHandle *hostNetworkHandle
+	var networkExitWriter *os.File
+	var qemuTap *os.File
+	var recordMu sync.Mutex
+	networkCleanupFailed := false
 	defer func() {
+		// Closing the slirp exit writer is the first teardown action: it drops
+		// uplink connectivity before coordinator locks or DNS workers can delay
+		// cleanup of guest access.
+		if networkExitWriter != nil {
+			_ = networkExitWriter.Close()
+			networkExitWriter = nil
+		}
+		if qemuTap != nil {
+			_ = qemuTap.Close()
+			qemuTap = nil
+		}
 		if retErr != nil && !committed {
 			_, _ = fmt.Fprintf(ready, "{\"state\":\"error\",\"message\":%q}\n", retErr.Error())
+			readyErrorReported = true
+		}
+		if networkHandle != nil {
+			closeErr := networkHandle.Close(context.Background())
+			retErr = errors.Join(retErr, closeErr)
+			if closeErr != nil {
+				networkCleanupFailed = true
+			}
+			if err := verifyNetworkProcessesStopped(record.NetworkProcesses); err != nil {
+				retErr = errors.Join(retErr, err)
+				networkCleanupFailed = true
+			}
 		}
 		if err := teardownVMChildren(spec, record, children, alive, exit, supervisorLog); err != nil {
 			retErr = errors.Join(retErr, err)
+		} else if networkCleanupFailed {
+			retErr = errors.Join(retErr, errors.New("host network cleanup was not verified; retaining supervisor recovery metadata"))
 		} else {
 			if err := os.RemoveAll(spec.RuntimeDir); err != nil {
 				retErr = errors.Join(retErr, fmt.Errorf("remove VM runtime: %w", err))
@@ -895,10 +1256,32 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 		}
 		child := exec.Command(path, args...)
 		child.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Pdeathsig: syscall.SIGKILL}
+		switch name {
+		case "workspace":
+			if spec.NetworkBackend == vmNetworkBackendHost {
+				child.ExtraFiles = []*os.File{workspaceRoot}
+			}
+		case "agent-state":
+			if spec.NetworkBackend == vmNetworkBackendHost {
+				child.ExtraFiles = []*os.File{agentStateRoot}
+			}
+		case "qemu":
+			if spec.NetworkBackend == vmNetworkBackendHost {
+				if qemuTap == nil {
+					_ = log.Close()
+					return errors.New("host network TAP descriptor is unavailable")
+				}
+				child.ExtraFiles = []*os.File{qemuTap}
+			}
+		}
 		child.Stdout, child.Stderr = log, log
 		if err := child.Start(); err != nil {
 			_ = log.Close()
 			return err
+		}
+		if name == "qemu" && qemuTap != nil {
+			_ = qemuTap.Close()
+			qemuTap = nil
 		}
 		_ = log.Close()
 		identity, err := vmProcessIdentity(child.Process.Pid)
@@ -910,6 +1293,7 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 		children[name] = child
 		alive[name] = true
 		go func() { exit <- vmChildExit{name, child.Wait()} }()
+		recordMu.Lock()
 		switch name {
 		case "workspace":
 			record.WorkspaceDaemon = identity
@@ -919,12 +1303,52 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 			record.QEMU = identity
 		}
 		if err := writeVMSupervisorRecord(store, record); err != nil {
+			recordMu.Unlock()
 			return err
 		}
+		recordMu.Unlock()
 		return nil
 	}
+	if spec.NetworkBackend == vmNetworkBackendHost {
+		networkHandle, err = startSupervisorHostNetwork(spec, store)
+		if err != nil {
+			return fmt.Errorf("start host network backend: %w", err)
+		}
+		networkExitWriter = networkHandle.TakeSupervisorExitWriter()
+		qemuTap = networkHandle.TakeTapFile()
+		if networkExitWriter == nil || qemuTap == nil {
+			return errors.New("host network backend did not provide TAP and supervisor exit descriptors")
+		}
+		status, err := networkHandle.Status(context.Background())
+		if err != nil {
+			return fmt.Errorf("inspect host network startup: %w", err)
+		}
+		processes, err := hostNetworkOwnedProcesses(status.Processes)
+		if err != nil {
+			return fmt.Errorf("record host network process identities: %w", err)
+		}
+		recordMu.Lock()
+		record.NetworkGeneration = status.Generation
+		record.NetworkProcesses = processes
+		if err := writeVMSupervisorRecord(store, record); err != nil {
+			recordMu.Unlock()
+			return err
+		}
+		recordMu.Unlock()
+		networkHandle.SetPolicyRecordUpdater(func(generation uint64) error {
+			recordMu.Lock()
+			defer recordMu.Unlock()
+			record.NetworkGeneration = generation
+			return writeVMSupervisorRecord(store, record)
+		})
+		go forwardHostNetworkEvents(networkHandle, exit)
+	}
 
-	if err := startChild("workspace", spec.Virtiofsd, virtiofsDaemonArgs(spec.Workspace, spec.WorkspaceSock, spec.GuestUID, spec.GuestGID, spec.VirtiofsSandbox), "virtiofsd-workspace.log"); err != nil {
+	workspacePath := spec.Workspace
+	if spec.NetworkBackend == vmNetworkBackendHost {
+		workspacePath = "/proc/self/fd/3"
+	}
+	if err := startChild("workspace", spec.Virtiofsd, virtiofsDaemonArgs(workspacePath, spec.WorkspaceSock, spec.GuestUID, spec.GuestGID, spec.VirtiofsSandbox), "virtiofsd-workspace.log"); err != nil {
 		return fmt.Errorf("start workspace virtiofsd (%s): %w", filepath.Join(spec.LogRoot, "virtiofsd-workspace.log"), err)
 	}
 	if err := waitVMSocket(spec.WorkspaceSock, "workspace", filepath.Join(spec.LogRoot, "virtiofsd-workspace.log"), children, alive, exit, commands, signals); err != nil {
@@ -937,15 +1361,37 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 		return fmt.Errorf("VM supervisor 30s startup deadline exceeded")
 	}
 	if spec.VirtiofsSandbox == "namespace" {
-		record.WorkspaceDescendant, err = waitDaemonDescendant(record.WorkspaceDaemon, startupDeadline, exit, commands, signals, alive)
+		var descendant vmOwnedProcess
+		descendant, err = waitDaemonDescendant(record.WorkspaceDaemon, startupDeadline, exit, commands, signals, alive)
 		if err != nil {
 			return fmt.Errorf("identify workspace namespace child: %w", err)
 		}
+		recordMu.Lock()
+		record.WorkspaceDescendant = descendant
+		if spec.NetworkBackend == vmNetworkBackendHost {
+			if err := verifyVMShareNamespaceRoot(descendant, workspaceRoot); err != nil {
+				recordMu.Unlock()
+				return fmt.Errorf("verify pinned workspace export in virtiofs namespace: %w", err)
+			}
+		}
+		if err := writeVMSupervisorRecord(store, record); err != nil {
+			recordMu.Unlock()
+			return err
+		}
+		recordMu.Unlock()
+	} else {
+		recordMu.Lock()
+		if err := writeVMSupervisorRecord(store, record); err != nil {
+			recordMu.Unlock()
+			return err
+		}
+		recordMu.Unlock()
 	}
-	if err := writeVMSupervisorRecord(store, record); err != nil {
-		return err
+	agentStatePath := spec.AgentState
+	if spec.NetworkBackend == vmNetworkBackendHost {
+		agentStatePath = "/proc/self/fd/3"
 	}
-	if err := startChild("agent-state", spec.Virtiofsd, virtiofsDaemonArgs(spec.AgentState, spec.AgentStateSock, spec.GuestUID, spec.GuestGID, spec.VirtiofsSandbox), "virtiofsd-agent-state.log"); err != nil {
+	if err := startChild("agent-state", spec.Virtiofsd, virtiofsDaemonArgs(agentStatePath, spec.AgentStateSock, spec.GuestUID, spec.GuestGID, spec.VirtiofsSandbox), "virtiofsd-agent-state.log"); err != nil {
 		return fmt.Errorf("start agent-state virtiofsd (%s): %w", filepath.Join(spec.LogRoot, "virtiofsd-agent-state.log"), err)
 	}
 	if err := waitVMSocket(spec.AgentStateSock, "agent-state", filepath.Join(spec.LogRoot, "virtiofsd-agent-state.log"), children, alive, exit, commands, signals); err != nil {
@@ -958,13 +1404,31 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 		return fmt.Errorf("VM supervisor 30s startup deadline exceeded")
 	}
 	if spec.VirtiofsSandbox == "namespace" {
-		record.AgentStateDescendant, err = waitDaemonDescendant(record.AgentStateDaemon, startupDeadline, exit, commands, signals, alive)
+		var descendant vmOwnedProcess
+		descendant, err = waitDaemonDescendant(record.AgentStateDaemon, startupDeadline, exit, commands, signals, alive)
 		if err != nil {
 			return fmt.Errorf("identify agent-state namespace child: %w", err)
 		}
-	}
-	if err := writeVMSupervisorRecord(store, record); err != nil {
-		return err
+		recordMu.Lock()
+		record.AgentStateDescendant = descendant
+		if spec.NetworkBackend == vmNetworkBackendHost {
+			if err := verifyVMShareNamespaceRoot(descendant, agentStateRoot); err != nil {
+				recordMu.Unlock()
+				return fmt.Errorf("verify pinned agent-state export in virtiofs namespace: %w", err)
+			}
+		}
+		if err := writeVMSupervisorRecord(store, record); err != nil {
+			recordMu.Unlock()
+			return err
+		}
+		recordMu.Unlock()
+	} else {
+		recordMu.Lock()
+		if err := writeVMSupervisorRecord(store, record); err != nil {
+			recordMu.Unlock()
+			return err
+		}
+		recordMu.Unlock()
 	}
 	if err := startChild("qemu", spec.QEMUPath, spec.QEMUArgs, "vm-qemu.log"); err != nil {
 		return fmt.Errorf("start QEMU (%s): %w", filepath.Join(spec.LogRoot, "vm-qemu.log"), err)
@@ -994,6 +1458,9 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 		return fmt.Errorf("VM precommit deadline exceeded")
 	case <-time.After(qmpTimeout):
 		return fmt.Errorf("QMP did not become ready within %s", qmpTimeout)
+	}
+	if err := verifyHostNetworkReady(networkHandle, &record, &recordMu); err != nil {
+		return fmt.Errorf("host network failed before VM readiness: %w", err)
 	}
 	if _, err := io.WriteString(ready, "{\"state\":\"ready\"}\n"); err != nil {
 		return err
@@ -1042,6 +1509,9 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 					if !live {
 						return fmt.Errorf("%s exited before commit", child.name)
 					}
+				}
+				if err := verifyHostNetworkReady(networkHandle, &record, &recordMu); err != nil {
+					return fmt.Errorf("host network failed before VM commit: %w", err)
 				}
 				committed = true
 				precommitTimer.Stop()
@@ -1413,6 +1883,44 @@ func daemonGroupsEmpty(record vmSupervisorRecord) (bool, error) {
 	return true, nil
 }
 
+func stopRecordedNetworkProcesses(record vmSupervisorRecord) error {
+	processes := make([]vmOwnedProcess, 0, len(record.NetworkProcesses))
+	for _, process := range record.NetworkProcesses {
+		processes = append(processes, process)
+	}
+	for _, process := range processes {
+		if err := signalVerifiedVMProcess(process, syscall.SIGTERM); err != nil {
+			return err
+		}
+	}
+	wait := func(deadline time.Time) error {
+		for time.Now().Before(deadline) {
+			allGone := true
+			for _, process := range processes {
+				live, err := vmProcessLive(process)
+				if err != nil {
+					return err
+				}
+				allGone = allGone && !live
+			}
+			if allGone {
+				return nil
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		return fmt.Errorf("host network processes did not stop before deadline")
+	}
+	if err := wait(time.Now().Add(2 * time.Second)); err == nil {
+		return nil
+	}
+	for _, process := range processes {
+		if err := signalVerifiedVMProcess(process, syscall.SIGKILL); err != nil {
+			return err
+		}
+	}
+	return wait(time.Now().Add(2 * time.Second))
+}
+
 func groupsEmpty(record vmSupervisorRecord) bool {
 	empty, err := daemonGroupsEmpty(record)
 	return err == nil && empty
@@ -1550,6 +2058,9 @@ func removeVMSocketDir(dir, launchID string) error {
 }
 
 func removeVMRuntime(record vmSupervisorRecord) error {
+	if err := stopRecordedNetworkProcesses(record); err != nil {
+		return err
+	}
 	if err := removeVMSocketDir(record.SocketDir, record.LaunchID); err != nil {
 		return err
 	}

@@ -55,6 +55,130 @@ func globalBaseRevisionRoot(revision string) string {
 	return filepath.Join(globalBaseRoot(), "revisions", revision)
 }
 
+func globalBaseWorkspaceRoot() (string, error) {
+	cacheRoot, err := os.UserCacheDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve user cache directory for global build workspace: %w", err)
+	}
+	root := filepath.Join(cacheRoot, "zaigr", "global-base-workspaces")
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	root = filepath.Clean(abs)
+	if pathsOverlap(root, zaigDir()) {
+		return "", errors.New("global image build workspace cache must be outside ~/.zaigr")
+	}
+	if err := ensurePrivateGlobalBaseWorkspaceRoot(root); err != nil {
+		return "", err
+	}
+	return root, nil
+}
+
+func ensurePrivateGlobalBaseWorkspaceRoot(root string) error {
+	if !filepath.IsAbs(root) {
+		return errors.New("global image build workspace cache path must be absolute")
+	}
+	volume := filepath.VolumeName(root)
+	current := volume + string(filepath.Separator)
+	rel := strings.TrimPrefix(strings.TrimPrefix(root, volume), string(filepath.Separator))
+	for _, component := range strings.Split(rel, string(filepath.Separator)) {
+		if component == "" || component == "." {
+			continue
+		}
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			if err := os.Mkdir(current, 0700); err != nil && !errors.Is(err, os.ErrExist) {
+				return fmt.Errorf("create global image build workspace cache %s: %w", current, err)
+			}
+			info, err = os.Lstat(current)
+		}
+		if err != nil {
+			return fmt.Errorf("inspect global image build workspace cache %s: %w", current, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("global image build workspace path has a symlink or non-directory component: %s", current)
+		}
+	}
+	info, err := os.Lstat(root)
+	if err != nil {
+		return err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || int(stat.Uid) != os.Getuid() || info.Mode().Perm() != 0700 {
+		return errors.New("global image build workspace cache must be owned by the current user with mode 0700")
+	}
+	return nil
+}
+
+func globalBaseWorkspaceForStaging(staging string) (string, error) {
+	stage := filepath.Clean(staging)
+	stageRoot, err := canonicalPathWithMissingSuffix(globalBaseStagingRoot())
+	if err != nil {
+		return "", fmt.Errorf("resolve global image staging root: %w", err)
+	}
+	stageParent, err := canonicalPathWithMissingSuffix(filepath.Dir(stage))
+	if err != nil || stageParent != stageRoot {
+		return "", errors.New("global image staging directory is outside the expected staging root")
+	}
+	name := filepath.Base(stage)
+	if !strings.HasPrefix(name, "build-") || len(name) <= len("build-") || strings.ContainsAny(name, `/\\`) {
+		return "", errors.New("invalid global image staging directory name")
+	}
+	stageInfo, err := os.Lstat(stage)
+	if err != nil {
+		return "", fmt.Errorf("inspect global image staging directory: %w", err)
+	}
+	stageStat, ok := stageInfo.Sys().(*syscall.Stat_t)
+	if !ok || !stageInfo.IsDir() || stageInfo.Mode()&os.ModeSymlink != 0 || int(stageStat.Uid) != os.Getuid() || stageInfo.Mode().Perm() != 0700 {
+		return "", errors.New("global image staging directory must be a current-user-owned mode-0700 directory")
+	}
+	root, err := globalBaseWorkspaceRoot()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, name), nil
+}
+
+func globalBaseWorkspacePathFile(staging string) string {
+	return filepath.Join(staging, "workspace-path")
+}
+
+func removeStagedGlobalBaseWorkspace(staging string) error {
+	expected, err := globalBaseWorkspaceForStaging(staging)
+	if err != nil {
+		return err
+	}
+	pathFile := globalBaseWorkspacePathFile(staging)
+	pathInfo, readErr := os.Lstat(pathFile)
+	if readErr == nil {
+		stat, ok := pathInfo.Sys().(*syscall.Stat_t)
+		if !ok || !pathInfo.Mode().IsRegular() || pathInfo.Mode()&os.ModeSymlink != 0 || int(stat.Uid) != os.Getuid() || pathInfo.Mode().Perm() != 0600 || pathInfo.Size() > 4096 {
+			return errors.New("staged global image workspace path record is not a bounded current-user-owned mode-0600 file")
+		}
+	}
+	pathData, readErr := os.ReadFile(pathFile)
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		return fmt.Errorf("read staged global image workspace path: %w", readErr)
+	}
+	if readErr == nil && strings.TrimSpace(string(pathData)) != expected {
+		return errors.New("staged global image workspace path does not match the current XDG_CACHE_HOME; restore the original cache location before retrying cleanup")
+	}
+	info, err := os.Lstat(expected)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect staged global image workspace: %w", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || int(stat.Uid) != os.Getuid() || info.Mode().Perm() != 0700 {
+		return errors.New("staged global image workspace must be a current-user-owned mode-0700 directory")
+	}
+	return os.RemoveAll(expected)
+}
+
 func (store projectStore) backingPinPath() string {
 	return filepath.Join(store.Path, projectBackingFileName)
 }
@@ -383,6 +507,9 @@ func cmdGlobalBaseImageReset() error {
 		return fmt.Errorf("lock global base image: %w", err)
 	}
 	defer releaseGlobalBaseMutationLock(lock)
+	if err := cleanupGlobalBaseStaging(); err != nil {
+		return fmt.Errorf("clean stale global image staging before reset: %w", err)
+	}
 	if err := os.Remove(globalBaseManifestPath()); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("reset global base image: %w", err)
 	}
@@ -453,6 +580,9 @@ func cmdGlobalBaseImageSetupRun(names []string, ram, cpu string, force bool) err
 	if len(definitions) == 0 {
 		return nil
 	}
+	if err := requireHostPreflight("global base image setup"); err != nil {
+		return err
+	}
 	if err := confirmSetupAptCommands(definitions, "global base image setup"); err != nil {
 		return err
 	}
@@ -479,7 +609,11 @@ func cleanupGlobalBaseStaging() error {
 		} else if !os.IsNotExist(err) {
 			return err
 		}
-		if err := os.RemoveAll(filepath.Join(globalBaseStagingRoot(), entry.Name())); err != nil {
+		staging := filepath.Join(globalBaseStagingRoot(), entry.Name())
+		if err := removeStagedGlobalBaseWorkspace(staging); err != nil {
+			return fmt.Errorf("remove stale global base image workspace %s: %w", entry.Name(), err)
+		}
+		if err := os.RemoveAll(staging); err != nil {
 			return fmt.Errorf("remove stale global base image staging %s: %w", entry.Name(), err)
 		}
 	}
@@ -537,11 +671,24 @@ func buildAndPublishGlobalBase(previous globalBaseManifest, customized bool, def
 			returnErr = errors.Join(returnErr, err)
 			return
 		}
+		if err := removeStagedGlobalBaseWorkspace(staging); err != nil {
+			returnErr = errors.Join(returnErr, err)
+			return
+		}
 		returnErr = errors.Join(returnErr, os.RemoveAll(staging))
 	}()
-	workspace := filepath.Join(staging, "workspace")
-	agentState := filepath.Join(staging, "agent-state")
+	workspace, err := globalBaseWorkspaceForStaging(staging)
+	if err != nil {
+		return err
+	}
+	if err := os.Mkdir(workspace, 0700); err != nil {
+		return fmt.Errorf("create global image build workspace %s: %w", workspace, err)
+	}
+	if err := writeFileAtomically(globalBaseWorkspacePathFile(staging), []byte(workspace+"\n"), 0600); err != nil {
+		return fmt.Errorf("record global image build workspace: %w", err)
+	}
 	runtimeStore := projectStore{Hash: "global-base-build", Path: filepath.Join(staging, "runtime-store")}
+	agentState := runtimeStore.agentStateDir()
 	for _, dir := range []string{workspace, agentState, runtimeStore.Path} {
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			return err

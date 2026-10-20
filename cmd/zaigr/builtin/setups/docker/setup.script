@@ -62,38 +62,6 @@ echo 'user:100000:131072' >> /etc/subuid
 echo 'user:100000:131072' >> /etc/subgid
 usermod -aG docker user
 
-mkdir -p /etc/opensnitchd/rules
-cat > /etc/opensnitchd/rules/090-zaigr-dockerd.json <<'EOF'
-{
-  "name": "090-zaigr-dockerd",
-  "enabled": true,
-  "precedence": true,
-  "action": "allow",
-  "duration": "always",
-  "operator": {
-    "type": "simple",
-    "sensitive": false,
-    "operand": "process.path",
-    "data": "/usr/bin/dockerd"
-  }
-}
-EOF
-cat > /etc/opensnitchd/rules/090-zaigr-containerd.json <<'EOF'
-{
-  "name": "090-zaigr-containerd",
-  "enabled": true,
-  "precedence": true,
-  "action": "allow",
-  "duration": "always",
-  "operator": {
-    "type": "simple",
-    "sensitive": false,
-    "operand": "process.path",
-    "data": "/usr/bin/containerd"
-  }
-}
-EOF
-
 mkdir -p /etc/zaigr/boot.d
 cat > /etc/zaigr/boot.d/10-docker <<'EOF'
 #!/bin/bash

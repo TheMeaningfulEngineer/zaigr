@@ -11,41 +11,20 @@ BB="$(cd "$(dirname "$0")" && pwd)"
 ROOTFS_TAR="$REPO/.cache/base-rootfs.tar"
 ROOTFS_IMG="$REPO/.cache/base-rootfs.img"
 ROOTFS_ZST="$REPO/cmd/zaigr/vm_data/base-rootfs.img.zst"
-ZAIGR_INSIDE_SCRIPT="$BB/zaigr-inside"
-ALLOWED_HOSTS="$BB/allowed-hosts.txt"
 MERGED_USR_HOOKS="/usr/share/mmdebstrap/hooks/merged-usr"
 FILE_MIRROR_HOOKS="/usr/share/mmdebstrap/hooks/file-mirror-automount"
-
-OPENSNITCH_VER="1.8.0"
-OPENSNITCH_DEB="opensnitch_${OPENSNITCH_VER}-1_amd64.deb"
-OPENSNITCH_URL="https://github.com/evilsocket/opensnitch/releases/download/v$OPENSNITCH_VER/$OPENSNITCH_DEB"
 
 for tool in mmdebstrap fakeroot zstd curl; do
     command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: $tool not found" >&2; exit 1; }
 done
 
-test -f "$ZAIGR_INSIDE_SCRIPT" || { echo "ERROR: $ZAIGR_INSIDE_SCRIPT not found" >&2; exit 1; }
-test -f "$ALLOWED_HOSTS" || { echo "ERROR: $ALLOWED_HOSTS not found" >&2; exit 1; }
 test -d "$MERGED_USR_HOOKS" || { echo "ERROR: mmdebstrap merged-/usr hooks not found: $MERGED_USR_HOOKS" >&2; exit 1; }
 test -d "$FILE_MIRROR_HOOKS" || { echo "ERROR: mmdebstrap file mirror hooks not found: $FILE_MIRROR_HOOKS" >&2; exit 1; }
 
 mkdir -p "$(dirname "$ROOTFS_ZST")" "$(dirname "$ROOTFS_IMG")"
 
-# Download OpenSnitch .deb
-OPENSNITCH_DEB_PATH="$REPO/.cache/$OPENSNITCH_DEB"
-if [ ! -f "$OPENSNITCH_DEB_PATH" ]; then
-    echo ":: Downloading OpenSnitch $OPENSNITCH_VER ..."
-    curl -fsSL -o "$OPENSNITCH_DEB_PATH" "$OPENSNITCH_URL"
-fi
-
-# Local packages passed to mmdebstrap in unshare mode must be reachable by the
-# unshared user. Stage OpenSnitch under /tmp with the documented permissions.
-OPENSNITCH_STAGE_DIR=$(mktemp -d /tmp/zaigr-opensnitch.XXXXXX)
 ROOTFS_DIR=$(mktemp -d)
-trap 'rm -rf "$OPENSNITCH_STAGE_DIR" "$ROOTFS_DIR" "$ROOTFS_TAR" "$ROOTFS_IMG"' EXIT
-chmod 0755 "$OPENSNITCH_STAGE_DIR"
-OPENSNITCH_DEB_STAGE="$OPENSNITCH_STAGE_DIR/$OPENSNITCH_DEB"
-install -m 0644 "$OPENSNITCH_DEB_PATH" "$OPENSNITCH_DEB_STAGE"
+trap 'rm -rf "$ROOTFS_DIR" "$ROOTFS_TAR" "$ROOTFS_IMG"' EXIT
 
 # Generate a random root password — only the hash enters the image
 ROOT_PW=$(openssl rand -hex 16)
@@ -55,7 +34,7 @@ echo ":: Building base image rootfs (mmdebstrap) ..."
 # Minimal packages — just enough to boot systemd, run a shell, and network.
 # systemd-sysv is intentionally omitted because QEMU boots systemd explicitly.
 PACKAGES="bash,bash-completion,coreutils,mount,procps,iproute2,conntrack,util-linux,e2fsprogs,systemd"
-PACKAGES="$PACKAGES,ca-certificates,curl,libnetfilter-queue1,libpcap0.8t64,openssh-server"
+PACKAGES="$PACKAGES,ca-certificates,curl,openssh-server"
 
 mmdebstrap \
     --mode=unshare \
@@ -65,7 +44,6 @@ mmdebstrap \
     --hook-dir="$MERGED_USR_HOOKS" \
     --hook-dir="$FILE_MIRROR_HOOKS" \
     --include="$PACKAGES" \
-    --include="$OPENSNITCH_DEB_STAGE" \
     --customize-hook='test "$(readlink "$1/bin")" = usr/bin' \
     --customize-hook='test "$(readlink "$1/sbin")" = usr/sbin' \
     --customize-hook='test "$(readlink "$1/lib")" = usr/lib' \
@@ -99,45 +77,9 @@ fakeroot sh -c "
     chown root:root \"$ROOTFS_DIR/usr/local/lib/zaigr/run-preset-isolated\"
     chmod 0700 \"$ROOTFS_DIR/usr/local/lib/zaigr/run-preset-isolated\"
 
-    mkdir -p \"$ROOTFS_DIR/etc/opensnitchd/rules\"
-    mkdir -p \"$ROOTFS_DIR/etc/opensnitchd/lists/domains\"
     mkdir -p \"$ROOTFS_DIR/etc/systemd/system/multi-user.target.wants\"
 
-    cat > \"$ROOTFS_DIR/etc/opensnitchd/default-config.json\" <<'CONF'
-{
-  \"DefaultAction\": \"deny\",
-  \"DefaultDuration\": \"always\",
-  \"InterceptUnknown\": true,
-  \"ProcMonitorMethod\": \"proc\",
-  \"LogLevel\": 1,
-  \"Server\": {
-    \"Address\": \"\",
-    \"LogFile\": \"/var/log/opensnitchd.log\"
-  },
-  \"Stats\": {
-    \"MaxEvents\": 150,
-    \"MaxStats\": 50
-  }
-}
-CONF
-
-    cp \"$ALLOWED_HOSTS\" \"$ROOTFS_DIR/etc/opensnitchd/lists/domains/allowed.txt\"
-
-    echo '{\"name\":\"000-allow-loopback\",\"enabled\":true,\"action\":\"allow\",\"duration\":\"always\",\"operator\":{\"type\":\"simple\",\"operand\":\"dest.ip\",\"data\":\"127.0.0.1\"}}' \
-        > \"$ROOTFS_DIR/etc/opensnitchd/rules/000-allow-loopback.json\"
-
-    echo '{\"name\":\"010-allow-dns\",\"enabled\":true,\"action\":\"allow\",\"duration\":\"always\",\"operator\":{\"type\":\"simple\",\"operand\":\"dest.port\",\"data\":\"53\"}}' \
-        > \"$ROOTFS_DIR/etc/opensnitchd/rules/010-allow-dns.json\"
-
-    echo '{\"name\":\"100-allow-whitelisted-domains\",\"enabled\":true,\"action\":\"allow\",\"duration\":\"always\",\"operator\":{\"type\":\"lists\",\"operand\":\"lists.domains_regexp\",\"data\":\"/etc/opensnitchd/lists/domains/\"}}' \
-        > \"$ROOTFS_DIR/etc/opensnitchd/rules/100-allow-whitelisted-domains.json\"
-
     ln -sfn /usr/lib/systemd/system/ssh.service \"$ROOTFS_DIR/etc/systemd/system/multi-user.target.wants/ssh.service\"
-
-    mkdir -p \"$ROOTFS_DIR/usr/local/sbin\"
-    cp \"$ZAIGR_INSIDE_SCRIPT\" \"$ROOTFS_DIR/usr/local/sbin/zaigr-inside\"
-    chown root:root \"$ROOTFS_DIR/usr/local/sbin/zaigr-inside\"
-    chmod 750 \"$ROOTFS_DIR/usr/local/sbin/zaigr-inside\"
 
     echo \"base-image:$BASE_VERSION\" > \"$ROOTFS_DIR/etc/base-image-version\"
     chmod 644 \"$ROOTFS_DIR/etc/base-image-version\"

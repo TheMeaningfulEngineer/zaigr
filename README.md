@@ -27,16 +27,32 @@ host dependencies separately from your distribution's repositories. On Debian
 or Ubuntu:
 
 ```sh
-sudo apt install coreutils e2fsprogs openssh-client qemu-system-x86 qemu-utils
+sudo apt install coreutils e2fsprogs openssh-client qemu-system-x86 qemu-utils slirp4netns util-linux
 ```
+
+Firewall enforcement now runs on the host, outside the VM. Older installations
+may need these host tools before starting a VM or rebuilding/applying setups;
+the guest's packages cannot provide them. `zaigr misc check` aggregates missing
+tools, QEMU/KVM, filesystem sandbox, disk-space and host-networking failures.
+It prints only the missing Debian/Ubuntu packages and a suggested install
+command. Zaigr never installs packages or changes host policy automatically.
+
+The host kernel must support nftables conntrack marks
+(`CONFIG_NF_CONNTRACK_MARK`). The bundled kernel enables this option. When
+running Zaigr inside an older Zaigr VM, boot that VM with the updated bundled
+kernel before using the new firewall. `zaigr misc check` verifies rule setup.
 
 The bundled static virtiofs daemon serves the workspace and agent-state mounts.
 By default, each file server uses a namespace sandbox. This requires permission
 to create user, mount, PID and network namespaces and configure sandbox mounts.
-Run `zaigr misc check` as the account that will
-run zaigr. It checks host tools and QEMU virtiofs support, and starts the bundled
-daemon against an empty temporary export to verify sandbox readiness. It does
-not boot a VM or modify a project; it may populate the normal daemon cache.
+Run `zaigr misc check` as the account that will run zaigr. It checks host tools,
+QEMU/KVM, disk space, the host namespace/network prerequisites, and QEMU
+virtiofs support. It starts the bundled daemon against an empty temporary
+export and starts/stops a disposable host-network namespace with no VM, grants,
+or forwarded ports. It does not modify a project; it may populate the normal
+daemon cache. The disposable network probe verifies namespace, TAP, nftables
+controller and slirp startup, but it cannot predict every later runtime or
+host-policy failure.
 It detects the host distribution and kernel. On failure it diagnoses known
 namespace restrictions, including Ubuntu's AppArmor policy and container
 restrictions, and reports the required host change. It automatically reads
@@ -45,44 +61,56 @@ Confirmed audit findings are distinguished from likely causes inferred from
 host settings and the failure. If kernel logs are inaccessible, it reports that
 limit and still gives the available diagnosis. A successful check covers the temporary
 export; individual project paths can still have different access restrictions.
-If the host cannot start the sandbox, project startup or rebuild explains the
-risk of proceeding without isolation and offers `cancel`, `info`, or `unsafe`.
-Choosing `info` displays concise host-specific setup instructions, then returns
-to the prompt without changing the setting. Full diagnostics and policy details
-are available through `zaigr misc check`. The prompt defaults to cancel;
-only entering `unsafe` selects and saves `virtiofs-sandbox=none` for that
-project. EOF, an empty answer or any unrecognized answer cancels.
-Subsequent starts and rebuilds use the saved choice and print
-a warning when namespace isolation is disabled. The choice survives project
-clean and rebuild and does not change other projects. Global image operations
-without a project ask for consent for that operation only.
+The namespace sandbox is required by host-enforced networking to verify the
+identity of exported directories. If the host cannot start it, startup and
+rebuild fail with diagnostic guidance before launching a VM. Run
+`zaigr misc check` and resolve the reported host restriction. There is no
+`unsafe` fallback; `virtiofs-sandbox=none` is no longer supported.
 
-Without the namespace sandbox, an exploit in the file server could compromise
-the invoking host user account: read or change files outside the shares, steal
-credentials, or run commands as that user. The Rust daemon benefits from
-memory-safety protections, but logic flaws such as path-resolution errors,
-race conditions, or protocol confusion can still matter. The sandbox adds
-containment; it does not guarantee protection against every escape. Guest
-access to the selected shares is intentional in either mode. Other daemon
-protections, including its default seccomp filter, remain enabled.
+VM creation, stopped-image setup/rebuild and batch rebuild run the same host
+preflight before changing project images or stopping a VM. Operations that
+attach to an already-running VM use its existing host network runtime and do
+not recheck cold-start requirements. The check includes exact namespace and
+disposable runtime probe errors, distinguishes observed host settings from
+likely causes, and leaves package installation and host-policy changes to the
+administrator. For an older project, run `zaigr misc check` first. Resolve all
+reported host requirements, rerun the check until it passes, then stop the VM
+and run `zaigr project rebuild` before reopening it. This catches known host
+requirements before rebuild work begins; it cannot predict every later runtime
+failure.
 
-Inspect or change the preference on an initialized, stopped project:
+On Ubuntu, [`setpriv` is part of util-linux](https://manpages.ubuntu.com/manpages/noble/man1/setpriv.1.html).
+Zaigr creates namespaces directly, so it does not require the `unshare` command.
+For Ubuntu AppArmor restrictions, see the [Ubuntu security documentation](https://documentation.ubuntu.com/security/security-features/privilege-restriction/apparmor/).
+
+For an existing, stopped project with the old `none` preference, restore the
+supported setting after resolving the host restriction:
 
 ```sh
 zaigr project vm show-config
 zaigr project vm set-config --virtiofs-sandbox namespace
-# Explicitly accept the risk for this project instead:
-zaigr project vm set-config --virtiofs-sandbox none
 ```
 
+The sandbox contains the file server and protects files outside the selected
+shares. It does not guarantee protection against every escape. Guest access to
+the selected shares remains intentional.
+
+The workspace must not overlap Zaigr's host store, private data, or runtime
+directories. A project rooted at `$HOME` normally contains `~/.zaigr` and is
+therefore refused: exporting it would expose authoritative policy and private
+host management state. Put project files in a separate directory such as
+`~/projects/my-project` that does not contain those protected directories.
+Symlink aliases do not bypass this check.
+
 On Ubuntu with AppArmor user-namespace restrictions, `misc check` prints commands
-to generate, review and load a daemon-specific exception using
-`zaigr misc apparmor-profile`. This does not disable the global restriction or
-install a service. The generated policy applies to the daemon's cached executable
-path, which is user-writable: other code running as your account could replace
-that executable and obtain the same exception. Regenerate the profile after a
-daemon upgrade. The check always tests namespace sandbox availability, even when
-the current project has opted out. Debian and other hosts are probed in the same
+to generate, review and load a path-scoped profile for Zaigr and its cached
+virtiofs daemon using `zaigr misc apparmor-profile`. This does not disable the
+global restriction or install a service. The generated policy applies to both
+executable paths, which are path permissions rather than verified code identities;
+subprocesses inherit the profile, and other code running as your account could
+replace either executable and obtain the same permission. Regenerate the profile
+when either path changes. The check always tests namespace sandbox availability, even when
+an existing project has an obsolete preference. Debian and other hosts are probed in the same
 way; zaigr does not assume a distribution is exempt from host restrictions.
 
 If startup fails, inspect the project's
@@ -192,26 +220,70 @@ zaigr shell --preset codex
 [setup](docs/terminology.md#setup) is already recorded as applied, installing the
 current Codex package.
 
+Setup installation in a running project VM uses a private network namespace.
+Installer processes get temporary broad networking; existing model processes
+and services keep their normal network policy. The host revokes the temporary
+access when installation ends; the setup's declared exact domains remain
+available afterward. Dedicated image-building VMs still use a temporary
+VM-wide grant, with no concurrent model session.
+
 ### I need the agent to access another domain
 
-Open a root shell in the [VM](docs/terminology.md#project-vm):
+Allow the exact hostname from the host:
 
 ```sh
-zaigr shell --root
+zaigr project firewall domain allow docs.python.org
+zaigr project firewall show
 ```
 
-Inside that shell, allow the hostname you need. For example:
+The host enforces this permission for the entire VM, including root processes.
+The grant is saved outside the guest image and applies to the running VM.
+Remove it from the host with `zaigr project firewall domain remove docs.python.org`.
+
+### I need an unrestricted network shell
+
+Run this command on the host:
 
 ```sh
-zaigr-inside firewall allow docs.python.org
-zaigr-inside firewall list
-exit
+zaigr shell --root --full-network
 ```
 
-The agent can now access that domain. This leaves the
-[project image](docs/terminology.md#project-image)
-[dirty](docs/terminology.md#dirty-project-image), which is expected for manual
-changes. The permission is an ad hoc runtime change.
+It opens a root maintenance shell in a private network namespace, with temporary
+broad IPv4 TCP/UDP access, including private networks and host data services.
+Only that shell and its descendants use the maintenance tunnel. Existing model
+processes and ordinary shells retain their normal network policy.
+
+The filesystem is shared, so tools you install remain available afterward.
+Exit the shell to revoke its network access; if the owning host command dies,
+a host-kernel deadline expires the grant. `--root` alone keeps restricted
+networking. `--full-network` requires `--root` and cannot be combined with
+`--preset` or `--setup`.
+
+Maintenance requires that the model cannot become guest root. The built-in
+`docker` and `k3s` setups give the model root-equivalent access, so images with
+those setups cannot open isolated maintenance networking, even after the
+foreground model stops. This also applies to inherited setups, attached setup,
+and capture. Use a separate clean image without those privileges, or grant
+specific destinations through the host firewall. Failed or interrupted setup
+history must be resolved by replacing the image before maintenance is allowed.
+Stop the VM with `zaigr project vm stop`, inspect `zaigr project setup list
+--applied`, then run `zaigr project rebuild`. A successful rebuild clears the
+failed-setup restriction; a failed rebuild or successful retry against the
+same image does not. Rebuilt images containing Docker/k3s remain restricted.
+Use `zaigr project clean` if you want to discard the applied setups instead.
+Custom scripts and manually granted privileges remain the administrator's
+responsibility; setup names are not a general privilege detector.
+
+To install Docker/k3s, stop the project VM and run the setup against its image,
+then start the project again. Subsequent setups on that image also require the
+stopped-image workflow. This uses a dedicated image-building VM with no
+concurrent model session; it does not grant the running model maintenance access.
+Image building trusts the existing image and setup scripts. Stopping a VM does
+not remove services or boot hooks left by a previously privileged model; use a
+fresh trusted image if that history is suspect.
+
+Existing shared services stay in their original network namespace even when
+invoked from maintenance.
 
 ### I need a custom [setup](docs/terminology.md#setup) for this [project](docs/terminology.md#project)
 
@@ -244,11 +316,19 @@ and rerun the last command.
 
 ### I want to turn an experiment into a reusable [setup](docs/terminology.md#setup)
 
-Start a [capture](docs/terminology.md#setup-capture) from the host:
+Stop the project VM, then start a [capture](docs/terminology.md#setup-capture)
+from the host:
 
 ```sh
+zaigr project vm stop
 zaigr project setup capture start
 ```
+
+With a stopped project, capture uses a temporary overlay VM. It can also attach
+to an already-running project VM. The capture shell uses a private maintenance
+network namespace; other processes keep their normal network restrictions.
+Accepting or discarding a running-VM capture leaves its shell open and prints
+a reminder that its temporary network access ends when the shell exits.
 
 Inside the [capture](docs/terminology.md#setup-capture) shell, install and try the
 tools you need. For example:
@@ -279,8 +359,8 @@ Or discard the [capture](docs/terminology.md#setup-capture) instead:
 zaigr project setup capture discard
 ```
 
-Discarding a [capture](docs/terminology.md#setup-capture) attached to an already
-running [VM](docs/terminology.md#project-vm) does not undo the changes you made.
+Accepting promotes the capture image; discarding removes the capture overlay.
+Changes to shared workspace files are not undone by discarding an image.
 
 ### I want to add tools to my [base image](docs/terminology.md#base-image)
 

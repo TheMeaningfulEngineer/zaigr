@@ -18,10 +18,11 @@ import (
 func checkVirtiofs(host checkHost) checkResult {
 	result := checkVirtiofsMode(host, "namespace")
 	if !result.passed {
-		result.detail += "\n" + virtiofsSandboxGuidance(host)
+		result.summary = "could not start the required filesystem sandbox"
+		result.guidance = hostNamespaceGuidance(host)
 	}
 	if mode, err := currentProjectStore().virtiofsSandbox(); err == nil && mode == "none" {
-		result.detail += "\nProject preference: virtiofs-sandbox=none (unsafe). This check still tests namespace sandbox availability."
+		result.detail += "\nProject setting: virtiofs-sandbox=none is unsupported; use virtiofs-sandbox=namespace after resolving the host restriction."
 	}
 	return result
 }

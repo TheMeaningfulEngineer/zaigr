@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"syscall"
 
 	"github.com/klauspost/compress/zstd"
+	"golang.org/x/sys/unix"
 )
 
 // buildImageFromEmbeddedBase prepares a reusable base whose filesystem already
@@ -226,11 +228,21 @@ func userSSHKeyPath() string {
 // ensureSSHKey generates an ed25519 keypair if one does not already exist.
 func ensureSSHKey(privPath string, comment string) (string, string, error) {
 	pubPath := privPath + ".pub"
+	directory := filepath.Dir(privPath)
 
-	if err := os.MkdirAll(filepath.Dir(privPath), 0755); err != nil {
+	if filepath.Clean(privPath) != filepath.Join(filepath.Clean(zaigDir()), filepath.Base(privPath)) ||
+		(filepath.Base(privPath) != filepath.Base(rootSSHKeyPath()) && filepath.Base(privPath) != filepath.Base(userSSHKeyPath())) {
+		return "", "", errors.New("SSH private key path is outside the protected ~/.zaigr key locations")
+	}
+	if err := os.MkdirAll(directory, 0755); err != nil {
 		return "", "", err
 	}
-	lock, err := os.OpenFile(privPath+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	keyDirectory, err := openAndTightenSSHKeyDirectory(directory)
+	if err != nil {
+		return "", "", err
+	}
+	defer keyDirectory.Close()
+	lock, err := openSSHKeyLock(keyDirectory, filepath.Base(privPath)+".lock")
 	if err != nil {
 		return "", "", fmt.Errorf("open SSH key lock: %w", err)
 	}
@@ -239,14 +251,30 @@ func ensureSSHKey(privPath string, comment string) (string, string, error) {
 		return "", "", fmt.Errorf("lock SSH key generation: %w", err)
 	}
 	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
+	if err := verifySSHKeyDirectoryIdentity(keyDirectory, directory); err != nil {
+		return "", "", err
+	}
 
-	if _, err := os.Stat(privPath); err == nil {
+	if _, err := os.Lstat(privPath); err == nil {
+		if err := validateProtectedSSHPrivateKey(privPath); err != nil {
+			return "", "", fmt.Errorf("validate existing SSH private key: %w", err)
+		}
 		logDebug("using existing SSH key", "path", privPath)
-		pub, err := os.ReadFile(pubPath)
+		pub, err := readSSHKeyPublic(keyDirectory, filepath.Base(pubPath))
 		if err != nil {
 			return "", "", fmt.Errorf("read SSH public key: %w", err)
 		}
-		return privPath, strings.TrimSpace(string(pub)), nil
+		if err := verifySSHKeyDirectoryIdentity(keyDirectory, directory); err != nil {
+			return "", "", err
+		}
+		return privPath, pub, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", "", fmt.Errorf("inspect existing SSH private key: %w", err)
+	}
+	if _, err := os.Lstat(pubPath); err == nil {
+		return "", "", fmt.Errorf("SSH public key %q exists without its private key; refusing to overwrite or follow it", pubPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", "", fmt.Errorf("inspect orphaned SSH public key %q: %w", pubPath, err)
 	}
 
 	cmd := exec.Command("ssh-keygen", "-t", "ed25519", "-f", privPath, "-N", "", "-C", comment)
@@ -255,9 +283,140 @@ func ensureSSHKey(privPath string, comment string) (string, string, error) {
 		return "", "", fmt.Errorf("ssh-keygen: %s", strings.TrimSpace(string(out)))
 	}
 
-	pub, err2 := os.ReadFile(pubPath)
+	if err := validateProtectedSSHPrivateKey(privPath); err != nil {
+		return "", "", fmt.Errorf("validate generated SSH private key: %w", err)
+	}
+	pub, err2 := readSSHKeyPublic(keyDirectory, filepath.Base(pubPath))
 	if err2 != nil {
 		return "", "", fmt.Errorf("read generated SSH public key: %w", err2)
 	}
-	return privPath, strings.TrimSpace(string(pub)), nil
+	if err := verifySSHKeyDirectoryIdentity(keyDirectory, directory); err != nil {
+		return "", "", err
+	}
+	return privPath, pub, nil
+}
+
+func sshKeyDirectoryOwnershipError(path string, foundUID, mode uint32) error {
+	return fmt.Errorf(
+		"protected SSH key directory %q is unsafe: found uid=%d mode=%04o; expected uid=%d with group/other write bits clear (mask 0022). Zaigr only removes those write bits automatically when the directory is already owned by the current user; inspect foreign ownership and directory contents before correcting it",
+		path,
+		foundUID,
+		mode&07777,
+		os.Getuid(),
+	)
+}
+
+func openAndTightenSSHKeyDirectory(path string) (*os.File, error) {
+	root := filepath.Clean(zaigDir())
+	path = filepath.Clean(path)
+	if path != root {
+		return nil, fmt.Errorf("SSH key directory %q is not the protected directory %q", path, root)
+	}
+	canonical, err := canonicalPathWithMissingSuffix(root)
+	if err != nil {
+		return nil, fmt.Errorf("resolve protected SSH key directory %q: %w", root, err)
+	}
+	if canonical != root {
+		return nil, fmt.Errorf("protected SSH key directory %q resolves to %q; symlinks and path aliases are not accepted", root, canonical)
+	}
+	fd, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open protected SSH key directory %q without following symlinks: %w", root, err)
+	}
+	directory := os.NewFile(uintptr(fd), "zaigr-protected-ssh-key-directory")
+	if err := verifySSHKeyDirectoryIdentity(directory, root); err != nil {
+		_ = directory.Close()
+		return nil, err
+	}
+	var before unix.Stat_t
+	if err := unix.Fstat(fd, &before); err != nil {
+		_ = directory.Close()
+		return nil, fmt.Errorf("inspect protected SSH key directory %q: %w", root, err)
+	}
+	if before.Mode&unix.S_IFMT != unix.S_IFDIR || before.Uid != uint32(os.Getuid()) {
+		_ = directory.Close()
+		return nil, sshKeyDirectoryOwnershipError(root, before.Uid, before.Mode)
+	}
+	if before.Mode&0022 != 0 {
+		mode := before.Mode &^ uint32(0022)
+		if err := unix.Fchmod(fd, mode); err != nil {
+			_ = directory.Close()
+			return nil, fmt.Errorf("tighten protected SSH key directory %q from mode %04o: %w", root, before.Mode&07777, err)
+		}
+	}
+	var after unix.Stat_t
+	if err := unix.Fstat(fd, &after); err != nil {
+		_ = directory.Close()
+		return nil, fmt.Errorf("recheck protected SSH key directory %q: %w", root, err)
+	}
+	if before.Dev != after.Dev || before.Ino != after.Ino || before.Uid != after.Uid || after.Uid != uint32(os.Getuid()) || after.Mode&unix.S_IFMT != unix.S_IFDIR || after.Mode&0022 != 0 {
+		_ = directory.Close()
+		return nil, sshKeyDirectoryOwnershipError(root, after.Uid, after.Mode)
+	}
+	if err := verifySSHKeyDirectoryIdentity(directory, root); err != nil {
+		_ = directory.Close()
+		return nil, err
+	}
+	if before.Mode&0022 != 0 {
+		fmt.Fprintf(os.Stderr, ":: Secured SSH key directory %s: mode %04o -> %04o (removed group/other write bits)\n", root, before.Mode&07777, after.Mode&07777)
+	}
+	return directory, nil
+}
+
+func verifySSHKeyDirectoryIdentity(directory *os.File, expectedPath string) error {
+	if directory == nil {
+		return errors.New("protected SSH key directory handle is missing")
+	}
+	fdPath := fmt.Sprintf("/proc/self/fd/%d", directory.Fd())
+	resolved, err := filepath.EvalSymlinks(fdPath)
+	if err != nil || filepath.Clean(resolved) != filepath.Clean(expectedPath) {
+		return fmt.Errorf("protected SSH key directory %q changed identity while opening", expectedPath)
+	}
+	canonical, err := canonicalPathWithMissingSuffix(expectedPath)
+	if err != nil || canonical != filepath.Clean(expectedPath) {
+		return fmt.Errorf("protected SSH key directory %q is no longer canonical", expectedPath)
+	}
+	return nil
+}
+
+func openSSHKeyLock(directory *os.File, name string) (*os.File, error) {
+	fd, err := unix.Openat(int(directory.Fd()), name, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("open %s without following symlinks: %w", name, err)
+	}
+	lock := os.NewFile(uintptr(fd), name)
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		_ = lock.Close()
+		return nil, fmt.Errorf("inspect %s: %w", name, err)
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != uint32(os.Getuid()) || stat.Nlink != 1 || stat.Mode&0022 != 0 {
+		_ = lock.Close()
+		return nil, fmt.Errorf("SSH key lock %q must be a current-user-owned, single-link regular file without group/other write access (found uid %d, mode %04o)", name, stat.Uid, stat.Mode&07777)
+	}
+	return lock, nil
+}
+
+func readSSHKeyPublic(directory *os.File, name string) (string, error) {
+	fd, err := unix.Openat(int(directory.Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return "", err
+	}
+	file := os.NewFile(uintptr(fd), name)
+	defer file.Close()
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return "", err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != uint32(os.Getuid()) || stat.Nlink != 1 || stat.Mode&0022 != 0 {
+		return "", fmt.Errorf("SSH public key %q must be a current-user-owned, single-link regular file without group/other write access (found uid %d, mode %04o)", name, stat.Uid, stat.Mode&07777)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, 64*1024+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > 64*1024 {
+		return "", fmt.Errorf("SSH public key %q exceeds 64 KiB", name)
+	}
+	return strings.TrimSpace(string(data)), nil
 }

@@ -49,15 +49,10 @@ def _verified_signal(identity, sig):
 
 
 @pytest.mark.timeout(300)
-@pytest.mark.parametrize("sandbox", ["namespace", "none"])
-def test_supervisor_death_reaps_qemu_and_both_daemon_groups(project, sandbox):
+def test_supervisor_death_reaps_qemu_and_both_daemon_groups(project):
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
     run(f"{zaigr} project vm start", input="y\n", timeout=180)
-    if sandbox == "none":
-        run(f"{zaigr} project vm stop")
-        run(f"{zaigr} project vm set-config --virtiofs-sandbox none")
-        run(f"{zaigr} project vm start", timeout=180)
     record_path = project.store_dir / "vm-supervisor.json"
     record = json.loads(record_path.read_text(encoding="utf-8"))
     groups = [
@@ -66,9 +61,8 @@ def test_supervisor_death_reaps_qemu_and_both_daemon_groups(project, sandbox):
         record["agent_state_daemon"]["process_group"],
     ]
     assert all(_live_group_members(group) for group in groups)
-    if sandbox == "namespace":
-        assert record["workspace_descendant"]["pid"] in _live_group_members(groups[1])
-        assert record["agent_state_descendant"]["pid"] in _live_group_members(groups[2])
+    assert record["workspace_descendant"]["pid"] in _live_group_members(groups[1])
+    assert record["agent_state_descendant"]["pid"] in _live_group_members(groups[2])
 
     _verified_signal(record["supervisor"], signal.SIGKILL)
     deadline = time.monotonic() + 5
@@ -89,12 +83,19 @@ def test_supervisor_death_before_qemu_connects_reaps_daemons(project, test_root)
     fake_bin = test_root / "fake-bin"
     fake_bin.mkdir()
     marker = test_root / "qemu-wrapper-ready"
+    release = test_root / "qemu-wrapper-release"
     wrapper = fake_bin / "qemu-system-x86_64"
     wrapper.write_text(
         "#!/usr/bin/python3\n"
         "import os, sys, time\n"
-        f"open({str(marker)!r}, 'w').close()\n"
-        "time.sleep(30)\n"
+        f"marker_tmp = {str(marker) + '.tmp'!r}\n"
+        f"open(marker_tmp, 'w').close()\n"
+        f"os.replace(marker_tmp, {str(marker)!r})\n"
+        f"deadline = time.monotonic() + 120\n"
+        f"while not os.path.exists({str(release)!r}):\n"
+        "    if time.monotonic() >= deadline:\n"
+        "        raise SystemExit('qemu wrapper release barrier timed out')\n"
+        "    time.sleep(0.05)\n"
         f"os.execv({real_qemu!r}, [{real_qemu!r}, *sys.argv[1:]])\n",
         encoding="utf-8",
     )
@@ -111,10 +112,33 @@ def test_supervisor_death_before_qemu_connects_reaps_daemons(project, test_root)
         while time.monotonic() < deadline and not marker.exists():
             time.sleep(0.05)
         assert marker.exists(), start.transcript.tail(4000)
-        record = json.loads(record_path.read_text(encoding="utf-8"))
-        groups = [record[name]["process_group"] for name in ("qemu", "workspace_daemon", "agent_state_daemon")]
-        assert all(_live_group_members(group) for group in groups)
-        assert not pathlib.Path(project.store_dir / "runtime/vm.sock").exists()
+        # The wrapper marker can be written before the supervisor has persisted
+        # the QEMU process identity. Wait for the complete public runtime record
+        # and live process groups while the wrapper is held behind its barrier.
+        deadline = time.monotonic() + 60
+        record = None
+        groups = []
+        while time.monotonic() < deadline:
+            try:
+                candidate = json.loads(record_path.read_text(encoding="utf-8"))
+                names = ("qemu", "workspace_daemon", "agent_state_daemon")
+                identities = [candidate.get(name, {}) for name in names]
+                candidate_groups = [identity.get("process_group", 0) for identity in identities]
+                if (
+                    all(group > 1 for group in candidate_groups)
+                    and all(_live_group_members(group) for group in candidate_groups)
+                    and not pathlib.Path(project.store_dir / "runtime/vm.sock").exists()
+                ):
+                    record = candidate
+                    groups = candidate_groups
+                    break
+            except (FileNotFoundError, json.JSONDecodeError):
+                pass
+            time.sleep(0.05)
+        assert record is not None, (
+            "VM supervisor did not persist live daemon and blocked-QEMU identities; "
+            + start.transcript.tail(4000)
+        )
 
         _verified_signal(record["supervisor"], signal.SIGKILL)
         deadline = time.monotonic() + 5

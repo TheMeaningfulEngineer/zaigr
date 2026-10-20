@@ -1,10 +1,12 @@
 """Adversarial public workflows for persistent exact project IPv4 permissions."""
 
+import os
 import shlex
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from pathlib import Path
 
 import pexpect
 import pytest
@@ -49,10 +51,22 @@ def _assert_stream_stops(stream):
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         try:
-            stream.read_nonblocking(size=4096, timeout=2)
-        except (pexpect.EOF, pexpect.TIMEOUT):
+            stream.read_nonblocking(size=4096, timeout=min(1, deadline - time.monotonic()))
+        except pexpect.EOF:
             return
+        except pexpect.TIMEOUT:
+            continue
     pytest.fail("Revoked established connection still delivered traffic after ten seconds")
+
+
+def _assert_file_stops(path):
+    """Require a detached guest stream capture to stay unchanged for ten seconds."""
+    size = path.stat().st_size
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        time.sleep(min(1, deadline - time.monotonic()))
+        current_size = path.stat().st_size
+        assert current_size == size, f"Revoked established traffic extended {path}"
 
 
 @pytest.fixture()
@@ -103,6 +117,58 @@ int main(int argc, char **argv) {
     return "/home/user/workspace/ip-chaos-udp"
 
 
+@pytest.fixture()
+def tcp_source_port_22_client(project):
+    """Build a real HTTP client that binds guest source port 22."""
+    source = project.cwd / "ip-chaos-tcp22.c"
+    source.write_text(r'''
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    if (argc != 3) return 2;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int reuse = 1;
+    struct sockaddr_in local = { .sin_family = AF_INET,
+        .sin_port = htons(22) };
+    struct sockaddr_in peer = { .sin_family = AF_INET,
+        .sin_port = htons(atoi(argv[2])) };
+    if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) ||
+        inet_pton(AF_INET, "10.0.2.15", &local.sin_addr) != 1 ||
+        inet_pton(AF_INET, argv[1], &peer.sin_addr) != 1 ||
+        bind(fd, (struct sockaddr *)&local, sizeof(local)) ||
+        connect(fd, (struct sockaddr *)&peer, sizeof(peer))) {
+        perror("TCP source-port-22 setup"); return 3;
+    }
+    socklen_t local_size = sizeof(local);
+    if (getsockname(fd, (struct sockaddr *)&local, &local_size)) {
+        perror("getsockname"); return 4;
+    }
+    printf("SOURCE_PORT=%u\n", ntohs(local.sin_port));
+    fflush(stdout);
+    char request[256];
+    int length = snprintf(request, sizeof(request),
+        "GET /stream HTTP/1.0\r\nHost: %s\r\n\r\n", argv[1]);
+    if (write(fd, request, length) != length) { perror("HTTP request"); return 5; }
+    char buffer[4096];
+    ssize_t count;
+    while ((count = read(fd, buffer, sizeof(buffer))) > 0) {
+        if (write(STDOUT_FILENO, buffer, count) != count) return 6;
+    }
+    if (count < 0) { perror("HTTP response"); return 7; }
+    close(fd);
+    return 0;
+}
+''', encoding="utf-8")
+    _checked_run(["gcc", "-static", "-Wall", "-Wextra", "-Werror", "-O2",
+                  "-o", project.cwd / "ip-chaos-tcp22", source], timeout=30)
+    return "/home/user/workspace/ip-chaos-tcp22"
+
+
 @pytest.mark.timeout(360)
 def test_udp_reused_source_tuple_cannot_inherit_revoked_access(
     project, ip_endpoints, udp_client
@@ -148,7 +214,8 @@ def test_udp_reused_source_tuple_cannot_inherit_revoked_access(
 @pytest.mark.parametrize("process_name", ["sshd-prefix", "forged-pid"])
 @pytest.mark.timeout(360)
 def test_outbound_source_port_22_named_sshd_is_revoked(
-    project, ip_endpoints, host_endpoint, destination, process_name
+    project, ip_endpoints, host_endpoint, tcp_source_port_22_client,
+    destination, process_name
 ):
     """An ordinary process named sshd cannot inherit the inbound control exemption."""
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
@@ -160,288 +227,236 @@ def test_outbound_source_port_22_named_sshd_is_revoked(
     )
     run(f"{zaigr} project vm start", input="y\n", timeout=180)
     run(f"{zaigr} project firewall allow {address}")
-    # A guest-only second address avoids the actual inbound listener's port.
-    # All changes belong to this disposable VM and are restored before teardown.
-    run(f"{zaigr} project vm exec -- tee /tmp/ip-chaos-sshd.conf",
-        input="ListenAddress 10.0.2.15\n")
-    run(f"{zaigr} project vm exec --root -- cp /tmp/ip-chaos-sshd.conf /etc/ssh/sshd_config.d/ip-chaos.conf", input="y\n")
-    run(f"{zaigr} project vm exec --root -- systemctl restart ssh", input="y\n")
-    run(f"{zaigr} project vm exec --root -- ip address add 10.0.2.16/24 dev eth0", input="y\n")
+    # Use the VM's actual assigned source address. A spoofed .16 source is
+    # rejected by the host tap before reaching this policy, so it cannot be a
+    # positive control for the granted destination.
     previous = run(f"{zaigr} project vm exec -- cat /proc/sys/net/ipv4/ip_unprivileged_port_start").strip()
+    sshd_pid = run(f"{zaigr} project vm exec -- pgrep -o -x sshd").strip()
+    assert sshd_pid.isdecimal(), sshd_pid
     run(f"{zaigr} project vm exec --root -- sysctl -w net.ipv4.ip_unprivileged_port_start=0", input="y\n")
     if process_name == "sshd-prefix":
         executable = "/tmp/sshd-chaos"
     else:
-        # This is public guest process information, not product runtime metadata.
-        # A comm containing pid= can resemble an owner field in ss text output.
-        sshd_pid = run(f"{zaigr} project vm exec -- pgrep -o -x sshd").strip()
-        assert sshd_pid.isdecimal(), sshd_pid
         executable = f"/tmp/pid={sshd_pid}"
-    run(f"{zaigr} project vm exec -- cp /usr/bin/curl {executable}")
-    shell = spawn_interactive(f"{zaigr} shell", cwd=project.cwd, env=project.env)
-    shell.expect(USER_PROMPT, timeout=20)
-    stream = spawn_interactive(
-        f"{zaigr} project vm exec -- {executable} --noproxy '*' -4fsSN "
-        "--interface 10.0.2.16 --local-port 22 --max-time 90 "
-        f"http://{address}:{port}/stream",
-        cwd=project.cwd, env=project.env,
+    run(f"{zaigr} project vm exec -- cp {tcp_source_port_22_client} {executable}")
+    output_path = project.cwd / f"source-port-22-{uuid.uuid4().hex}.log"
+    ready_path = project.cwd / f"source-port-22-{uuid.uuid4().hex}.ready"
+    sshd_log_path = project.cwd / f"source-port-22-{uuid.uuid4().hex}-sshd.log"
+    guest_output_path = f"/home/user/workspace/{output_path.name}"
+    guest_ready_path = f"/home/user/workspace/{ready_path.name}"
+    guest_ready_tmp_path = guest_ready_path + ".tmp"
+    guest_sshd_log_path = f"/home/user/workspace/{sshd_log_path.name}"
+    run(f"{zaigr} project vm exec -- rm -f {guest_output_path}")
+    runner_path = f"/home/user/workspace/source-port-22-{uuid.uuid4().hex}.sh"
+    runner = (
+        "#!/bin/sh\n"
+        "sleep 3\n"
+        "pkill -x sshd || true\n"
+        "sleep 1\n"
+        f"timeout 30 su -s /bin/sh user -c {shlex.quote(f'{executable} {address} {port}')} "
+        f"> {shlex.quote(guest_output_path)} 2>&1\n"
+        "mkdir -p /run/sshd\n"
+        f"/usr/sbin/sshd -D -e > {shlex.quote(guest_sshd_log_path)} 2>&1 </dev/null &\n"
+        "sshd_pid=$!\n"
+        "sleep 1\n"
+        f"if kill -0 \"$sshd_pid\"; then echo ready > {shlex.quote(guest_ready_tmp_path)}; "
+        f"else echo failed > {shlex.quote(guest_ready_tmp_path)}; fi\n"
+        f"mv {shlex.quote(guest_ready_tmp_path)} {shlex.quote(guest_ready_path)}\n"
     )
-    try:
-        stream.expect_exact(token + ":2", timeout=15)
-        run(f"{zaigr} project firewall remove {address}")
-        _assert_stream_stops(stream)
-        shell.sendline("printf '\\nCONTROL_SURVIVED\\n'")
-        shell.expect_exact("\r\nCONTROL_SURVIVED\r\n")
-        shell.expect(USER_PROMPT)
-        assert run(f"{zaigr} project vm exec -- printf CONTROL_EXEC") == "CONTROL_EXEC"
-        assert_host_services(endpoint, ip_endpoints["key"])
-        _assert_blocked(*_run(
-            f"{zaigr} project vm exec -- curl --noproxy '*' -4fsS "
-            f"--connect-timeout 2 --max-time 4 http://{address}:{port}/",
-            cwd=project.cwd, env=project.env, timeout=15,
-        ))
-    finally:
-        for process in (stream, shell):
-            if process.isalive():
-                process.close(force=True)
-        run(f"{zaigr} project vm exec --root -- sysctl -w net.ipv4.ip_unprivileged_port_start={previous}", input="y\n")
-        run(f"{zaigr} project vm exec --root -- rm /etc/ssh/sshd_config.d/ip-chaos.conf", input="y\n")
-        run(f"{zaigr} project vm exec --root -- systemctl restart ssh", input="y\n")
-        run(f"{zaigr} project vm exec --root -- ip address del 10.0.2.16/24 dev eth0", input="y\n")
+    run(f"{zaigr} project vm exec --root -- tee {runner_path}", input="y\n" + runner)
+    run(f"{zaigr} project vm exec --root -- rm -f {guest_ready_path} {guest_ready_tmp_path}", input="y\n")
+    # A detached root coordinator closes every authenticated SSH channel before
+    # an ordinary-UID fake sshd binds local source port 22. It later restores
+    # sshd so public VM commands can verify the management path is usable.
+    coordinator_started = time.monotonic()
+    run(
+        f"{zaigr} project vm exec --root -- sh -c "
+        + shlex.quote(f"nohup sh {runner_path} </dev/null >/dev/null 2>&1 &"),
+        input="y\n",
+    )
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if output_path.exists() and "{0}:2".format(token) in output_path.read_text(errors="replace"):
+            break
+        time.sleep(0.2)
+    else:
+        pytest.fail(f"Source-port client did not establish its real stream: {output_path.read_text(errors='replace') if output_path.exists() else 'no output file'}")
+    output = output_path.read_text(errors="replace")
+    assert "SOURCE_PORT=22" in output, output
+    assert token + ":2" in output, output
+    run(f"{zaigr} project firewall remove {address}")
+    # Revoke while the detached ordinary process streams to a shared workspace
+    # file; the host can observe actual delivered body bytes after its SSH
+    # channel has closed, without interpreting an expect buffer as a cutoff.
+    _assert_file_stops(output_path)
+    silence_observed_at = time.monotonic()
+    assert silence_observed_at - coordinator_started < 28, (
+        "The ten-second quiet window ended too close to the client's 30-second "
+        "timeout, so natural client exit could explain the unchanged capture"
+    )
+    deadline = time.monotonic() + 40
+    while time.monotonic() < deadline:
+        if ready_path.exists() and ready_path.read_text(errors="replace").strip():
+            break
+        time.sleep(0.2)
+    assert ready_path.exists() and ready_path.read_text(errors="replace").strip(), (
+        "guest runner did not report SSH management service startup"
+    )
+    assert ready_path.read_text().strip() == "ready", sshd_log_path.read_text(errors="replace")
+    assert run(f"{zaigr} project vm exec -- printf CONTROL_EXEC") == "CONTROL_EXEC"
+    assert_host_services(endpoint, ip_endpoints["key"])
+    _assert_blocked(*_run(
+        f"{zaigr} project vm exec -- curl --noproxy '*' -4fsS "
+        f"--connect-timeout 2 --max-time 4 http://{address}:{port}/",
+        cwd=project.cwd, env=project.env, timeout=15,
+    ))
+    run(f"{zaigr} project vm exec --root -- sysctl -w net.ipv4.ip_unprivileged_port_start={previous}", input="y\n")
 
 
-@pytest.mark.parametrize("recovery", ["remove-retry", "vm-reuse"])
-@pytest.mark.timeout(480)
-def test_partial_live_changes_retain_every_pending_revocation(
-    project, ip_endpoints, host_endpoint, recovery
+@pytest.mark.timeout(240)
+def test_partial_live_policy_withdrawal_survives_conntrack_failure(
+    project, ip_endpoints, test_root
 ):
-    """Repeated partial mutations recover all changed destinations and preserve control."""
-    run = partial(_checked_run, cwd=project.cwd, env=project.env)
-    zaigr = project.zaigr_bin
-    first, second = ip_endpoints["first"], ip_endpoints["second"]
-    run(f"{zaigr} project vm start", input="y\n", timeout=180)
-    run(f"{zaigr} project firewall allow {first['ip']}")
-    run(f"{zaigr} project firewall allow 10.0.2.2")
-    root = spawn_interactive(f"{zaigr} shell --root", cwd=project.cwd, env=project.env)
-    root.expect(r"\[y/N\]")
-    root.sendline("y")
-    root.expect(ROOT_PROMPT, timeout=30)
-    shell = spawn_interactive(f"{zaigr} shell", cwd=project.cwd, env=project.env)
-    streams = []
-    udp_sessions = []
-    fault_active = False
-    try:
-        shell.expect(USER_PROMPT, timeout=30)
-        for address, port, token in (
-            (first["ip"], 18080, first["token"]),
-            ("10.0.2.2", host_endpoint["port"], host_endpoint["token"]),
-        ):
-            stream = spawn_interactive(
-                f"{zaigr} project vm exec -- curl --noproxy '*' -4fsSN "
-                f"--max-time 180 http://{address}:{port}/stream",
-                cwd=project.cwd, env=project.env,
-            )
-            streams.append(stream)
-            stream.expect_exact(token + ":2", timeout=10)
-        udp = spawn_interactive(
-            f"{zaigr} project vm exec -- timeout 180 bash -c " + shlex.quote(
-                f"exec 3<>/dev/udp/{first['ip']}/18082; printf 'UDP_READY\\n'; "
-                "while IFS= read -r request; do printf '%s\\n' \"$request\" >&3; "
-                "head -n 1 <&3; done"
-            ), cwd=project.cwd, env=project.env,
-        )
-        udp_sessions.append(udp)
-        udp.expect_exact("UDP_READY", timeout=10)
-        nonce = uuid.uuid4().hex
-        udp.sendline(nonce)
-        udp.expect_exact(first["token"] + ":" + nonce, timeout=5)
-        # Recovery is available through this existing root shell. A 120-second
-        # systemd timer also restores the real utility if the test is interrupted.
-        root.sendline(
-            "systemd-run --unit=ip-chaos-restore --on-active=120 "
-            "/bin/mv /usr/bin/ss.ip-chaos-held /usr/bin/ss"
-        )
-        root.expect_exact("Running timer as unit: ip-chaos-restore.timer")
-        root.expect(ROOT_PROMPT)
-        root.sendline("mv /usr/bin/ss /usr/bin/ss.ip-chaos-held")
-        root.expect(ROOT_PROMPT)
-        fault_active = True
-        stdout, stderr, rc = _run(
-            f"{zaigr} project firewall remove {first['ip']}",
-            cwd=project.cwd, env=project.env, timeout=30,
-        )
-        assert rc != 0 and "saved" in stdout + stderr, err_msg(stdout, stderr)
-        assert "could not be applied" in stdout + stderr, err_msg(stdout, stderr)
-        # The missing socket utility leaves a real established flow alive after
-        # the policy publication; this proves a partial live side effect.
-        marker = uuid.uuid4().hex
-        _checked_run(first["host_command"] + [
-            "curl", "--noproxy", "*", "-4fsS", "--max-time", "4",
-            f"http://{first['ip']}:18080/mark/{marker}",
-        ])
-        streams[0].expect_exact(marker, timeout=5)
-        nonce = uuid.uuid4().hex
-        udp.sendline(nonce)
-        udp.expect_exact(first["token"] + ":" + nonce, timeout=5)
-        stdout, stderr, rc = _run(
-            f"{zaigr} project firewall allow {second['ip']}",
-            cwd=project.cwd, env=project.env, timeout=30,
-        )
-        assert rc != 0 and "saved" in stdout + stderr, err_msg(stdout, stderr)
-        shell.sendline(
-            "curl --noproxy '*' -4fsS --max-time 4 "
-            f"http://{second['ip']}:18080/"
-        )
-        shell.expect_exact(second["token"] + ":0", timeout=10)
-        shell.expect(USER_PROMPT)
-        # This connection belongs to a grant that has never been recorded as
-        # successfully applied. Its later revocation depends on pending history.
-        shell.sendline(
-            "curl --noproxy '*' -4fsSN --max-time 180 "
-            f"http://{second['ip']}:18080/stream"
-        )
-        shell.expect_exact(second["token"] + ":2", timeout=10)
-        # A new entry must not claim it has applied the pending policy.
-        stdout, stderr, rc = _run(
-            f"{zaigr} project vm exec -- printf SHOULD_NOT_ENTER",
-            cwd=project.cwd, env=project.env, timeout=30,
-        )
-        assert rc != 0 and "SHOULD_NOT_ENTER" not in stdout, err_msg(stdout, stderr)
-        for address in (second["ip"], first["ip"], second["ip"]):
-            stdout, stderr, rc = _run(
-                [zaigr, "project", "firewall", "remove", address],
-                cwd=project.cwd, env=project.env, timeout=30,
-            )
-            assert rc != 0, err_msg(stdout, stderr)
-            assert "saved" in stdout + stderr, err_msg(stdout, stderr)
-        marker = uuid.uuid4().hex
-        _checked_run(second["host_command"] + [
-            "curl", "--noproxy", "*", "-4fsS", "--max-time", "4",
-            f"http://{second['ip']}:18080/mark/{marker}",
-        ])
-        shell.expect_exact(marker, timeout=5)
-        shown = run(f"{zaigr} project firewall show")
-        assert "pending or unconfirmed" in shown, shown
-        assert first["ip"] not in shown and second["ip"] not in shown, shown
-        root.sendline("mv /usr/bin/ss.ip-chaos-held /usr/bin/ss")
-        root.expect(ROOT_PROMPT)
-        fault_active = False
-        root.sendline("systemctl stop ip-chaos-restore.timer")
-        root.expect(ROOT_PROMPT)
-        if recovery == "remove-retry":
-            output = run(f"{zaigr} project firewall remove {second['ip']}")
-            assert "applied" in output, output
-        else:
-            assert run(f"{zaigr} project vm exec -- printf RECONCILED") == "RECONCILED"
-        _assert_stream_stops(streams[0])
-        _assert_stream_stops(shell)
-        shell.sendcontrol("c")
-        shell.expect(USER_PROMPT, timeout=10)
-        nonce = uuid.uuid4().hex
-        udp.sendline(nonce)
-        assert udp.expect_exact(
-            [first["token"] + ":" + nonce, pexpect.EOF, pexpect.TIMEOUT], timeout=3,
-        ) != 0
-        marker = uuid.uuid4().hex
-        _checked_run(ip_endpoints["host_command"] + [
-            "curl", "--noproxy", "*", "-4fsS", "--max-time", "4",
-            f"http://127.0.0.1:{host_endpoint['port']}/mark/{marker}",
-        ])
-        streams[1].expect_exact(marker, timeout=5)
-        for endpoint in (first, second):
-            # Restore the server's normal sentinel after the stream markers.
-            _checked_run(endpoint["host_command"] + [
-                "curl", "--noproxy", "*", "-4fsS", "--max-time", "4",
-                f"http://{endpoint['ip']}:18080/mark/",
-            ])
-            assert_host_services(endpoint, ip_endpoints["key"])
-            _assert_blocked(*_run(
-                f"{zaigr} project vm exec -- curl --noproxy '*' -4fsS "
-                f"--connect-timeout 2 --max-time 4 http://{endpoint['ip']}:18081/",
-                cwd=project.cwd, env=project.env, timeout=15,
-            ))
-        shell.sendline("printf '\\nCONTROL_SURVIVED\\n'")
-        shell.expect_exact("\r\nCONTROL_SURVIVED\r\n")
-        shell.expect(USER_PROMPT)
-        assert "status: applied" in run(f"{zaigr} project firewall show")
-    finally:
-        if fault_active:
-            root.sendline("mv /usr/bin/ss.ip-chaos-held /usr/bin/ss")
-            root.expect(ROOT_PROMPT, timeout=10)
-            root.sendline("systemctl stop ip-chaos-restore.timer")
-            root.expect(ROOT_PROMPT, timeout=10)
-        for process in streams + udp_sessions + [shell, root]:
-            if process.isalive():
-                process.close(force=True)
-
-
-@pytest.mark.timeout(360)
-def test_live_rule_enumeration_failure_is_not_reported_as_applied(project, ip_endpoints):
-    """Failure to enumerate existing policies must not silently retain a removed grant."""
-    run = partial(_checked_run, cwd=project.cwd, env=project.env)
-    zaigr = project.zaigr_bin
+    """The nft grant is withdrawn even when host conntrack cleanup fails."""
     endpoint = ip_endpoints["first"]
+    fail_marker = test_root / "conntrack-failure-enabled"
+    fault_log = Path(str(fail_marker) + ".log")
+    env = project.env
+    env["ZAIGR_TEST_CONNTRACK_DELETE_FAILURE"] = str(fail_marker)
+    run = partial(_checked_run, cwd=project.cwd, env=env)
+    zaigr = project.zaigr_bin
     run(f"{zaigr} project vm start", input="y\n", timeout=180)
     run(f"{zaigr} project firewall allow {endpoint['ip']}")
-    root = spawn_interactive(f"{zaigr} shell --root", cwd=project.cwd, env=project.env)
-    root.expect(r"\[y/N\]")
-    root.sendline("y")
-    root.expect(ROOT_PROMPT, timeout=30)
-    shell = spawn_interactive(f"{zaigr} shell", cwd=project.cwd, env=project.env)
-    fault_active = False
+    output = run(
+        f"{zaigr} project vm exec -- curl --noproxy '*' -4fsS "
+        f"--connect-timeout 3 --max-time 6 http://{endpoint['ip']}:18080/"
+    )
+    assert output.strip() == endpoint["token"] + ":0"
+    stream = spawn_interactive(
+        f"{zaigr} project vm exec -- curl --noproxy '*' -4fsSN --max-time 120 "
+        f"http://{endpoint['ip']}:18080/stream",
+        cwd=project.cwd, env=env,
+    )
+    stream.expect_exact(endpoint["token"] + ":2", timeout=10)
+    assert not fault_log.exists(), "conntrack fault fired before the failure was armed"
+    fail_marker.write_text(endpoint["ip"] + "\n", encoding="ascii")
     try:
-        shell.expect(USER_PROMPT, timeout=20)
-        root.sendline(
-            "systemd-run --unit=ip-chaos-find-restore --on-active=90 "
-            "/bin/mv /usr/bin/find.ip-chaos-held /usr/bin/find"
-        )
-        root.expect_exact("Running timer as unit: ip-chaos-find-restore.timer")
-        root.expect(ROOT_PROMPT)
-        root.sendline("mv /usr/bin/find /usr/bin/find.ip-chaos-held")
-        root.expect(ROOT_PROMPT)
-        fault_active = True
         stdout, stderr, rc = _run(
             f"{zaigr} project firewall remove {endpoint['ip']}",
-            cwd=project.cwd, env=project.env, timeout=30,
+            cwd=project.cwd, env=env, timeout=30,
         )
-        # Observe the existing shell before any new entry can reconcile policy.
-        shell.sendline(
-            "curl --noproxy '*' -4fsS --connect-timeout 2 --max-time 4 "
-            f"http://{endpoint['ip']}:18080/"
+        diagnostic = stdout + stderr
+        assert rc != 0, diagnostic
+        assert "saved" in diagnostic and "could not be applied" in diagnostic, diagnostic
+        # The daemon's periodic policy reconciliation can hit the injected
+        # conntrack fault before this CLI request reaches the host helper. Keep
+        # durable evidence of the actual failing boundary, while requiring the
+        # public operation to report that its saved policy was not applied.
+        fault_events = fault_log.read_text()
+        assert "injected-host-conntrack-failure" in fault_events, fault_events
+        assert f"deletion for {endpoint['ip']} attempted and failed" in fault_events, fault_events
+        assert (
+            "injected-host-conntrack-failure" in diagnostic
+            or "host-network-control.sock" in diagnostic
+        ), diagnostic
+        shown, show_error, show_rc = _run(
+            f"{zaigr} project firewall show",
+            cwd=project.cwd, env=env, timeout=20,
         )
-        shell.expect(USER_PROMPT, timeout=10)
-        traffic = shell.before
-        assert rc != 0, err_msg(stdout, stderr) + "\nExisting shell traffic:\n" + traffic
-        assert "saved" in stdout + stderr, err_msg(stdout, stderr)
-        assert "applied to the running" not in stdout, stdout
-        root.sendline("mv /usr/bin/find.ip-chaos-held /usr/bin/find")
-        root.expect(ROOT_PROMPT)
-        fault_active = False
-        root.sendline("systemctl stop ip-chaos-find-restore.timer")
-        root.expect(ROOT_PROMPT)
-        run(f"{zaigr} project firewall remove {endpoint['ip']}")
-        assert_host_services(endpoint, ip_endpoints["key"])
+        assert show_rc != 0, (shown, show_error)
+        assert "pending or unconfirmed" in shown
+        assert "host-network-control.sock" in show_error
+        _assert_stream_stops(stream)
+        fail_marker.unlink()
+        stop_stdout, stop_stderr, stop_rc = _run(
+            f"{zaigr} project vm stop", cwd=project.cwd, env=env, timeout=60,
+        )
+        if stop_rc != 0:
+            if "project VM is not running" not in stop_stderr:
+                assert "project vm stop --abrupt" in stop_stderr, stop_stderr
+                abrupt_stdout, abrupt_stderr, abrupt_rc = _run(
+                    f"{zaigr} project vm stop --abrupt",
+                    cwd=project.cwd, env=env, timeout=60,
+                )
+                assert abrupt_rc == 0 or "project VM is not running" in abrupt_stderr, (
+                    abrupt_stdout, abrupt_stderr,
+                )
+        deadline = time.monotonic() + 10
+        status = ""
+        while time.monotonic() < deadline:
+            status = run(f"{zaigr} project status")
+            if "status: not running" in status.lower():
+                break
+            time.sleep(0.5)
+        assert "status: not running" in status.lower(), status
+        run(f"{zaigr} project vm start", timeout=180)
         _assert_blocked(*_run(
             f"{zaigr} project vm exec -- curl --noproxy '*' -4fsS "
-            f"--connect-timeout 2 --max-time 4 http://{endpoint['ip']}:18081/",
-            cwd=project.cwd, env=project.env, timeout=15,
+            f"--connect-timeout 2 --max-time 4 http://{endpoint['ip']}:18080/",
+            cwd=project.cwd, env=env, timeout=15,
+        ))
+        run(f"{zaigr} project firewall allow {endpoint['ip']}")
+        allowed = run(
+            f"{zaigr} project vm exec -- curl --noproxy '*' -4fsS "
+            f"--connect-timeout 3 --max-time 6 http://{endpoint['ip']}:18080/"
+        )
+        assert allowed.strip() == endpoint["token"] + ":0"
+        run(f"{zaigr} project firewall remove {endpoint['ip']}")
+        _assert_blocked(*_run(
+            f"{zaigr} project vm exec -- curl --noproxy '*' -4fsS "
+            f"--connect-timeout 2 --max-time 4 http://{endpoint['ip']}:18080/",
+            cwd=project.cwd, env=env, timeout=15,
         ))
     finally:
-        if fault_active:
-            root.sendline("mv /usr/bin/find.ip-chaos-held /usr/bin/find")
-            root.expect(ROOT_PROMPT, timeout=10)
-            root.sendline("systemctl stop ip-chaos-find-restore.timer")
-            root.expect(ROOT_PROMPT, timeout=10)
-        for process in (shell, root):
-            if process.isalive():
-                process.close(force=True)
+        fail_marker.unlink(missing_ok=True)
+        if stream.isalive():
+            stream.close(force=True)
+
+
+@pytest.mark.timeout(180)
+def test_global_firewall_enumeration_failure_is_recoverable(project):
+    """A real project-store permission failure is visible and can be reconciled."""
+    if os.geteuid() == 0:
+        pytest.fail("permission-boundary test requires the normal unprivileged test uid")
+    run = partial(_checked_run, cwd=project.cwd, env=project.env)
+    zaigr = project.zaigr_bin
+    run(f"{zaigr} project vm start", input="y\n", timeout=180)
+    store_root = project.home / ".zaigr" / "store"
+    store_root.mkdir(parents=True, exist_ok=True)
+    original_mode = store_root.stat().st_mode & 0o777
+    store_root.chmod(0)
+    try:
+        stdout, stderr, rc = _run(
+            f"{zaigr} global firewall allow enumeration-recovery.example",
+            cwd=project.cwd, env=project.env, timeout=20,
+        )
+        diagnostic = stdout + stderr
+        assert rc != 0, diagnostic
+        assert "global firewall saved" in diagnostic
+        assert "project stores could not be enumerated" in diagnostic
+        assert "permission denied" in diagnostic.lower()
+    finally:
+        store_root.chmod(original_mode)
+    assert "enumeration-recovery.example" in run(f"{zaigr} global firewall list")
+    effective = run(f"{zaigr} project firewall domain list")
+    assert "enumeration-recovery.example" in effective, effective
+    assert "enumeration-recovery.example" in run(
+        f"{zaigr} global firewall allow enumeration-recovery.example"
+    )
+    assert run(f"{zaigr} project vm exec -- printf LIVE_POLICY_RECONCILED") == "LIVE_POLICY_RECONCILED"
+    removed = run(
+        f"{zaigr} global firewall remove enumeration-recovery.example"
+    )
+    assert "removed enumeration-recovery.example" in removed
+    assert "enumeration-recovery.example" not in run(f"{zaigr} project firewall domain list")
+    assert run(f"{zaigr} project vm exec -- printf LIVE_POLICY_REMOVED") == "LIVE_POLICY_REMOVED"
 
 
 @pytest.mark.timeout(360)
 def test_running_corrupt_policy_refuses_new_entry_without_broadening_live_shell(
     project, ip_endpoints
 ):
-    """Malformed documented metadata cannot partially grant its valid first line."""
+    """Malformed policy fails closed, and the saved valid policy recovers on boot."""
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
     first, second = ip_endpoints["first"], ip_endpoints["second"]
@@ -450,41 +465,53 @@ def test_running_corrupt_policy_refuses_new_entry_without_broadening_live_shell(
     policy = project.store_dir / "firewall-ips"
     original = policy.read_bytes()
     shell = spawn_interactive(f"{zaigr} shell", cwd=project.cwd, env=project.env)
+    stream = None
     try:
         shell.expect(USER_PROMPT, timeout=20)
+        stream = spawn_interactive(
+            f"{zaigr} project vm exec -- curl --noproxy '*' -4fsSN --max-time 120 "
+            f"http://{second['ip']}:18080/stream",
+            cwd=project.cwd, env=project.env,
+        )
+        stream.expect_exact(second["token"] + ":2", timeout=10)
         # A truncated administrator edit adds a valid new IP before invalid data.
         damaged = f"{first['ip']}\n192.0.2.0/24\n".encode()
         policy.write_bytes(damaged)
-        for command in (
-            f"{zaigr} project firewall show",
+        stdout, stderr, rc = _run(
             f"{zaigr} project firewall allow {first['ip']}",
-            f"{zaigr} project vm exec -- printf SHOULD_NOT_ENTER",
-            f"{zaigr} project vm start",
-        ):
-            stdout, stderr, rc = _run(command, cwd=project.cwd, env=project.env, timeout=20)
-            assert rc != 0, err_msg(stdout, stderr)
-            assert "firewall" in stdout + stderr, err_msg(stdout, stderr)
-            assert "SHOULD_NOT_ENTER" not in stdout
-            assert policy.read_bytes() == damaged
-        assert_host_services(first, ip_endpoints["key"])
-        shell.sendline(
-            "curl --noproxy '*' -4fsS --connect-timeout 2 --max-time 4 "
-            f"http://{first['ip']}:18080/; printf 'PROBE_EXIT=%s\\n' \"$?\""
+            cwd=project.cwd, env=project.env, timeout=30,
         )
-        shell.expect(r"\r\nPROBE_EXIT=(7|28)\r\n", timeout=10)
-        assert first["token"] not in shell.before
-        shell.expect(USER_PROMPT)
-        shell.sendline(
-            "curl --noproxy '*' -4fsS --max-time 4 "
-            f"http://{second['ip']}:18080/"
-        )
-        shell.expect_exact(second["token"] + ":0", timeout=10)
-        shell.expect(USER_PROMPT)
+        diagnostic = stdout + stderr
+        assert rc != 0, diagnostic
+        assert "firewall" in diagnostic.lower(), diagnostic
+        assert policy.read_bytes() == damaged
+        _assert_stream_stops(stream)
+        with pytest.raises(pexpect.EOF):
+            shell.expect(USER_PROMPT, timeout=20)
     finally:
         policy.write_bytes(original)
+        if stream is not None and stream.isalive():
+            stream.close(force=True)
         if shell.isalive():
             shell.close(force=True)
-    assert run(f"{zaigr} project vm exec -- printf RECOVERED") == "RECOVERED"
+    deadline = time.monotonic() + 10
+    status = ""
+    while time.monotonic() < deadline:
+        status = run(f"{zaigr} project status")
+        if "status: not running" in status.lower():
+            break
+        time.sleep(0.5)
+    assert "status: not running" in status.lower(), status
+    run(f"{zaigr} project vm start", timeout=180)
+    assert run(
+        f"{zaigr} project vm exec -- curl --noproxy '*' -4fsS "
+        f"--max-time 4 http://{second['ip']}:18080/"
+    ).strip() == second["token"] + ":0"
+    _assert_blocked(*_run(
+        f"{zaigr} project vm exec -- curl --noproxy '*' -4fsS "
+        f"--connect-timeout 2 --max-time 4 http://{first['ip']}:18080/",
+        cwd=project.cwd, env=project.env, timeout=15,
+    ))
     run(f"{zaigr} project firewall allow {first['ip']}")
     assert run(
         f"{zaigr} project vm exec -- curl --noproxy '*' -4fsS "

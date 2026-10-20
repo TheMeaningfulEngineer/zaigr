@@ -52,12 +52,6 @@ mkdir -p /dev/shm
 ensure_mount /dev/shm -t tmpfs -o mode=1777,nosuid,nodev shm
 chmod 1777 /dev/shm
 
-# Host-owned project IP policy is reconciled after SSH becomes ready. Remove
-# image-carried copies before OpenSnitch starts so stale or captured rules can
-# never become active during boot. Capture tokens are likewise session-only.
-rm -f /etc/opensnitchd/rules/050-zaigr-project-ip-*.json
-rm -f /etc/opensnitchd/rules/000-zaigr-capture-allow-all-*.json
-
 mkdir -p /dev/mqueue
 ensure_mount /dev/mqueue -t mqueue mqueue
 

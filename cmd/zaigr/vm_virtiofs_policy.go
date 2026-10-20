@@ -10,12 +10,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const unsafeVirtiofsWarning = `WARNING: Without the file-sharing sandbox, a file-server exploit could
-compromise your host user account.
-
-An attacker in the VM could then read or change files outside the shared
-directories, steal credentials, or run commands as you.`
-
 // Set from the CLI command scope, never from a project's files or environment.
 // Global base-image operations must not inherit the current directory's choice.
 var projectSandboxContext bool
@@ -79,52 +73,33 @@ func selectVirtiofsSandbox(store projectStore) (string, error) {
 		return "", err
 	}
 	if mode == "none" {
-		fmt.Fprintln(os.Stderr, unsafeVirtiofsWarning)
-		return mode, nil
+		return "", virtiofsNamespaceRequiredError("the saved project setting is virtiofs-sandbox=none")
 	}
 	host := detectCheckHost()
 	check := checkVirtiofsMode(host, "namespace")
 	if check.passed {
 		return "namespace", nil
 	}
-	fmt.Fprint(os.Stderr, ":: File-sharing isolation is unavailable on this host.\n\n")
-	// Probe only an empty private export, without a VM, before offering an
-	// alternative that might also be unsupported on this host.
-	if fallback := checkVirtiofsMode(host, "none"); !fallback.passed {
-		return "", fmt.Errorf("unsandboxed virtiofs is also unavailable; no VM started:\n%s", fallback.detail)
-	}
-	fmt.Fprintln(os.Stderr, unsafeVirtiofsWarning)
-	if store.Path != "" {
-		fmt.Fprintln(os.Stderr, "\nIf you choose unsafe, Zaigr will remember it for this project, including\nfuture starts and rebuilds. Other projects keep their own settings.")
-	} else {
-		fmt.Fprintln(os.Stderr, "\nThis is a global image operation. Your choice applies only to this\noperation and will not be saved as a project setting.")
-	}
-	for {
-		fmt.Fprint(os.Stderr, "\n  cancel  Stop here and keep the current settings (default).\n  info    Show more information and setup instructions.\n  unsafe  Continue with the risk described above.\n\n")
-		fmt.Fprint(os.Stderr, "Your choice [cancel/info/unsafe] (default: cancel): ")
-		var answer string
-		if _, err := fmt.Scanln(&answer); err != nil {
-			return "", fmt.Errorf("cancelled: virtiofs namespace sandbox unavailable; no unsafe preference was saved")
-		}
-		if strings.EqualFold(answer, "info") {
-			fmt.Fprintf(os.Stderr, "\n%s\n\nFull diagnostics: zaigr misc check\n", virtiofsSandboxSetup(host))
-			continue
-		}
-		if !strings.EqualFold(answer, "unsafe") {
-			return "", fmt.Errorf("cancelled: virtiofs namespace sandbox unavailable; no unsafe preference was saved")
-		}
-		break
-	}
-	if store.Path != "" {
-		if err := store.writeVirtiofsSandbox("none"); err != nil {
-			return "", err
-		}
-		fmt.Fprintln(os.Stderr, "\n:: Saved for this project: file-sharing sandbox disabled.\n\nTo enable it again, stop the project VM and run:\n  zaigr project vm set-config --virtiofs-sandbox namespace")
-	}
-	return "none", nil
+	return "", fmt.Errorf("virtiofs namespace sandbox is required; no VM started\nHost check failed: could not start the required filesystem sandbox.\nRun 'zaigr misc check' for the full host report.\n\n%s", hostNamespaceGuidance(host))
 }
 
-func virtiofsSandboxSetup(host checkHost) string {
+func virtiofsNamespaceRequiredError(reason string) error {
+	return fmt.Errorf("%s; host-enforced VM networking requires the namespace file-sharing sandbox. Run 'zaigr project vm set-config --virtiofs-sandbox namespace' after resolving the host restriction with 'zaigr misc check'", reason)
+}
+
+// hostNamespaceGuidance is shared by the network and virtiofs probes so the
+// remediation text stays consistent across misc check and operation failures.
+func hostNamespaceGuidance(host checkHost) string {
+	if host.container {
+		return `Container setup
+───────────────
+
+Ask the host administrator to allow nested user, mount, PID and network
+namespaces and sandbox mounts in the container settings.
+
+Verify:
+  zaigr misc check`
+	}
 	if host.family("ubuntu") && host.policy["AppArmor user-namespace restriction"] == "1" {
 		return `Ubuntu setup
 ────────────
@@ -137,56 +112,59 @@ Install:
   sudo apparmor_parser -r /etc/apparmor.d/zaigr-virtiofsd
 
 Verify:
-  zaigr misc check`
-	}
-	if host.container {
-		return `Container setup
-───────────────
-
-Ask the host administrator to allow nested user, mount, PID and network
-namespaces and sandbox mounts in the container settings.
-
-Verify:
-  zaigr misc check`
-	}
-	return fmt.Sprintf("Setup for %s\n\nRun zaigr misc check to identify the host restriction and required change.", host.name)
-}
-
-func virtiofsSandboxGuidance(host checkHost) string {
-	setup := virtiofsSandboxSetup(host)
-	if host.family("ubuntu") && host.policy["AppArmor user-namespace restriction"] == "1" {
-		return setup + `
-
-If AppArmor is blocking sandbox creation, this rule may allow it.
-Review the generated policy before installing it. Verify as your normal user.
+  zaigr misc check
 
 What this permission allows:
-  The file server can use kernel features needed to create its sandbox.
-  Ubuntu's system-wide restriction stays enabled.
+  Zaigr and the file server can use user namespaces for network and
+  filesystem sandbox setup. Ubuntu's system-wide restriction stays enabled.
 
-  The permission applies to the executable's path. Your account can
-  replace that file, so other code running as you could replace it and
-  gain the same permission. Regenerate the policy after a daemon upgrade.
+  Permission follows executable paths, not verified code identities.
+  Subprocesses inherit the profile, and same-user code can replace either
+  executable at its path. Protect both paths from other local users and
+  regenerate the policy when either path changes.
 
 Ubuntu documentation:
   https://documentation.ubuntu.com/release-notes/24.04/#unprivileged-user-namespace-restrictions`
 	}
-	return setup
+	return fmt.Sprintf("Setup for %s\n\nRun zaigr misc check to identify the host restriction and required change.", host.name)
 }
 
 func newAppArmorProfileCommand() *cobra.Command {
 	return &cobra.Command{
-		Use: "apparmor-profile", Short: "Print an Ubuntu AppArmor user-namespace exception for the bundled daemon", Args: cobra.NoArgs,
+		Use: "apparmor-profile", Short: "Print an Ubuntu AppArmor user-namespace profile for Zaigr and its bundled daemon", Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			daemon, err := ensureVirtiofsdWithWriter(false, io.Discard)
 			if err != nil {
 				return err
 			}
-			// Never turn a literal executable path into a broader AppArmor glob.
-			if strings.ContainsAny(daemon, "\n\r\"\\*?[]{}@") {
-				return fmt.Errorf("daemon path contains AppArmor pattern characters; a host administrator must write the profile for %q", daemon)
+			executable, err := os.Executable()
+			if err != nil {
+				return fmt.Errorf("resolve Zaigr executable path: %w", err)
 			}
-			fmt.Printf("# Review before loading: this permits user namespaces for the executable path below.\n# The cached executable is user-writable; the path is not a verified code identity.\n# Regenerate after a daemon upgrade.\nabi <abi/4.0>,\nprofile zaigr-virtiofsd %q flags=(unconfined) {\n  userns,\n}\n", daemon)
+			executable, err = filepath.EvalSymlinks(executable)
+			if err != nil {
+				return fmt.Errorf("resolve Zaigr executable path: %w", err)
+			}
+			executable, err = filepath.Abs(executable)
+			if err != nil {
+				return fmt.Errorf("make Zaigr executable path absolute: %w", err)
+			}
+			daemon, err = filepath.EvalSymlinks(daemon)
+			if err != nil {
+				return fmt.Errorf("resolve cached virtiofs daemon path: %w", err)
+			}
+			daemon, err = filepath.Abs(daemon)
+			if err != nil {
+				return fmt.Errorf("make cached virtiofs daemon path absolute: %w", err)
+			}
+			paths := []string{executable, daemon}
+			for _, path := range paths {
+				// Never turn a literal executable path into a broader AppArmor glob.
+				if strings.ContainsAny(path, "\n\r\"\\*?[]{}@^!|,;:$&") {
+					return fmt.Errorf("executable path contains AppArmor pattern characters; a host administrator must write the profile for %q", path)
+				}
+			}
+			fmt.Printf("# Review before loading. These path-scoped rules are not verified code identities.\n# Processes and subprocesses under either profile can use user namespaces.\n# Same-user code may replace files at these paths; regenerate when either path changes.\nabi <abi/4.0>,\nprofile zaigr %q flags=(unconfined) {\n  userns,\n}\nprofile zaigr-virtiofsd %q flags=(unconfined) {\n  userns,\n}\n", executable, daemon)
 			return nil
 		},
 	}

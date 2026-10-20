@@ -149,7 +149,7 @@ def test_stopped_permissions_validate_and_preserve_configuration(project):
 
 @pytest.mark.timeout(360)
 def test_controlled_destination_fixture_has_real_guest_routes(project, ip_endpoints):
-    """Temporary root access proves both routes and all services before denial."""
+    """Guest root remains subject to policy; explicit IP grants enable services."""
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
     run(f"{zaigr} project vm start", input="y\n", timeout=180)
@@ -160,26 +160,50 @@ def test_controlled_destination_fixture_has_real_guest_routes(project, ip_endpoi
     run(f"{zaigr} project vm exec -- chmod 600 /tmp/ip-endpoint-key")
     for endpoint in (ip_endpoints["first"], ip_endpoints["second"]):
         for port in (18080, 18081):
-            output = run(
+            _assert_blocked(*_run(
                 f"{zaigr} project vm exec --root -- curl --noproxy '*' -4fsS "
-                f"--max-time 4 http://{endpoint['ip']}:{port}/", input="y\n",
-            )
-            assert output.strip() == endpoint["token"] + ":0"
-        output = run(
+                f"--connect-timeout 2 --max-time 4 http://{endpoint['ip']}:{port}/",
+                cwd=project.cwd, env=project.env, input="y\n", timeout=15,
+            ))
+        stdout, stderr, rc = _run(
             [zaigr, "project", "vm", "exec", "--root", "--"] + udp_probe(endpoint["ip"]),
-            input="y\n",
+            cwd=project.cwd, env=project.env, input="y\n", timeout=15,
         )
-        assert output.strip() == endpoint["token"] + ":probe"
-        output = run(
+        assert rc != 0, err_msg(stdout, stderr)
+        stdout, stderr, rc = _run(
             [zaigr, "project", "vm", "exec", "--root", "--"]
             + ssh_options("/tmp/ip-endpoint-key")
-            + [f"root@{endpoint['ip']}", "printf", endpoint["token"]], input="y\n",
+            + [f"root@{endpoint['ip']}", "printf", endpoint["token"]],
+            cwd=project.cwd, env=project.env, input="y\n", timeout=15,
         )
-        assert output.strip() == endpoint["token"]
+        assert rc != 0, err_msg(stdout, stderr)
+
+        run(f"{zaigr} project firewall allow {endpoint['ip']}", timeout=20)
+        root_access = _checked_run(
+            f"{zaigr} project vm exec --root -- curl --noproxy '*' -4fsS "
+            f"--max-time 4 http://{endpoint['ip']}:18080/",
+            cwd=project.cwd, env=project.env, input="y\n", timeout=15,
+        )
+        assert root_access.strip() == endpoint["token"] + ":0"
+        for port in (18080, 18081):
+            output = run(
+                f"{zaigr} project vm exec -- curl --noproxy '*' -4fsS "
+                f"--max-time 4 http://{endpoint['ip']}:{port}/",
+            )
+            assert output.strip() == endpoint["token"] + ":0"
+        assert run(
+            [zaigr, "project", "vm", "exec", "--"] + udp_probe(endpoint["ip"])
+        ).strip() == endpoint["token"] + ":probe"
+        assert run(
+            [zaigr, "project", "vm", "exec", "--"]
+            + ssh_options("/tmp/ip-endpoint-key")
+            + [f"root@{endpoint['ip']}", "printf", endpoint["token"]]
+        ).strip() == endpoint["token"]
+        run(f"{zaigr} project firewall remove {endpoint['ip']}", timeout=20)
         _assert_blocked(*_run(
-            f"{zaigr} project vm exec -- curl --noproxy '*' -4fsS "
+            f"{zaigr} project vm exec --root -- curl --noproxy '*' -4fsS "
             f"--connect-timeout 2 --max-time 4 http://{endpoint['ip']}:18080/",
-            cwd=project.cwd, env=project.env, timeout=15,
+            cwd=project.cwd, env=project.env, input="y\n", timeout=15,
         ))
 
 
@@ -194,20 +218,16 @@ def test_live_exact_ip_access_and_revocation_preserve_other_connections(
     run(f"{zaigr} project vm start", input="y\n", timeout=180)
     boot = run(f"{zaigr} project vm exec -- cat /proc/sys/kernel/random/boot_id")
     host_url = f"http://10.0.2.2:{host_endpoint['port']}/sentinel"
-    assert run(
+    _assert_blocked(*_run(
         f"{zaigr} project vm exec --root -- curl --noproxy '*' -4fsS "
-        f"--max-time 4 {host_url}", input="y\n",
-    ).strip() == host_endpoint["token"]
+        f"--connect-timeout 2 --max-time 4 {host_url}",
+        cwd=project.cwd, env=project.env, input="y\n", timeout=15,
+    ))
     for endpoint in (first, second):
-        output = run(
-            f"{zaigr} project vm exec --root -- curl --noproxy '*' -4fsS "
-            f"--max-time 4 http://{endpoint['ip']}:18080/", input="y\n",
-        )
-        assert output.strip() == endpoint["token"] + ":0"
         _assert_blocked(*_run(
-            f"{zaigr} project vm exec -- curl --noproxy '*' -4fsS "
+            f"{zaigr} project vm exec --root -- curl --noproxy '*' -4fsS "
             f"--connect-timeout 2 --max-time 4 http://{endpoint['ip']}:18080/",
-            cwd=project.cwd, env=project.env, timeout=15,
+            cwd=project.cwd, env=project.env, input="y\n", timeout=15,
         ))
     shell = spawn_interactive(f"{zaigr} shell", cwd=project.cwd, env=project.env)
     streams = []
@@ -688,7 +708,7 @@ def test_ip_mutations_preserve_existing_exact_domain_access(project, setup_facto
     run(f"{zaigr} project firewall allow 192.0.2.41")
     run(f"{zaigr} project firewall remove 192.0.2.41")
     shown = run(f"{zaigr} project firewall show")
-    assert "# project setups" in shown and "pypi.org" in shown
+    assert "# project setup permissions" in shown.lower() and "pypi.org" in shown
     assert "192.0.2.41" not in shown
     run(
         f"{zaigr} project vm exec -- curl --noproxy '*' -4fsS -o /dev/null "
