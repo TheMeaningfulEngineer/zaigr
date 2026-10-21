@@ -432,3 +432,55 @@ def test_domain_log_covers_tcp_udp_verdict_transitions_and_dns_without_payloads(
     slow_log.expect(pexpect.EOF, timeout=10)
     slow_log.close()
     assert slow_log.exitstatus == 0
+
+
+@pytest.mark.timeout(240)
+def test_domain_log_starts_empty_unless_history_is_requested(
+    project, host_network_dns, request
+):
+    """A new log follows only new traffic; --history replays earlier events."""
+    zaigr = project.zaigr_bin
+    earlier = "earlier-log-" + uuid.uuid4().hex[:12] + ".test"
+    later = "later-log-" + uuid.uuid4().hex[:12] + ".test"
+    checked_run(
+        [zaigr, "project", "vm", "start"], project, input="y\n", timeout=180
+    )
+
+    def blocked_lookup(name):
+        result = _run(
+            [zaigr, "project", "vm", "exec", "--", "curl", "--noproxy", "*",
+             "-sS", "--connect-timeout", "2", "--max-time", "10",
+             f"http://{name}/"],
+            cwd=project.cwd,
+            env=project.env,
+            timeout=20,
+        )
+        assert result[2] == 6, err_msg(result[0], result[1])
+
+    blocked_lookup(earlier)
+
+    def start_log(arguments):
+        log = spawn_interactive(
+            shlex.quote(str(zaigr)) + " project firewall domain-log" + arguments,
+            cwd=project.cwd,
+            env=project.env,
+            timeout=20,
+        )
+        request.addfinalizer(lambda: log.close(force=True) if log.isalive() else None)
+        log.expect("Firewall packet events coalesce", timeout=10)
+        return log
+
+    fresh_log = start_log("")
+    history_log = start_log(" --history")
+    history_log.expect(rf"DNS blocked\s+{re.escape(earlier)}", timeout=10)
+    time.sleep(0.2)
+
+    blocked_lookup(later)
+    fresh_log.expect(rf"DNS blocked\s+{re.escape(later)}", timeout=10)
+    history_log.expect(rf"DNS blocked\s+{re.escape(later)}", timeout=10)
+    assert earlier not in fresh_log.before, fresh_log.before
+
+    for log in (fresh_log, history_log):
+        log.sendintr()
+        log.expect(pexpect.EOF, timeout=10)
+        log.close()

@@ -194,21 +194,24 @@ func newProjectFirewallRemoveCommand() *cobra.Command {
 }
 
 func newProjectFirewallDomainLogCommand() *cobra.Command {
+	var history bool
 	cmd := &cobra.Command{
 		Use:   "domain-log",
 		Short: "Stream DNS and firewall packet outcomes observed by the running project VM",
 		Long: "Print DNS resolver outcomes and observed host firewall packet verdicts. " +
 			"Repeated DNS lines with the same name and verdict collapse for about two seconds; -v shows each query type and retry. " +
-			"Firewall allowed/blocked records describe packet decisions, not remote connection or application success.",
+			"Firewall allowed/blocked records describe packet decisions, not remote connection or application success. " +
+			"Only events after the command starts are shown; --history first replays what the running VM already recorded.",
 		Args: cobra.NoArgs,
 		RunE: func(c *cobra.Command, _ []string) error {
 			verbose, err := c.Root().PersistentFlags().GetCount("verbose")
 			if err != nil {
 				return err
 			}
-			return cmdProjectFirewallDomainLog(verbose > 0)
+			return cmdProjectFirewallDomainLog(verbose > 0, history)
 		},
 	}
+	cmd.Flags().BoolVar(&history, "history", false, "Replay events recorded since the VM started before following new ones")
 	return cmd
 }
 

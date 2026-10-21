@@ -16,7 +16,8 @@ import (
 	"zaigr/cmd/zaigr/hostnet"
 )
 
-func cmdProjectFirewallDomainLog(verbose bool) error {
+func cmdProjectFirewallDomainLog(verbose, history bool) error {
+	startedAt := time.Now()
 	lock, err := lockCurrentProject("project firewall domain-log")
 	if err != nil {
 		return err
@@ -57,11 +58,11 @@ func cmdProjectFirewallDomainLog(verbose bool) error {
 	results := make(chan domainLogStreamResult, 2)
 	go func() {
 		writer := domainNameLogWriter{output: output, verbose: verbose, recent: make(map[string]dnsLogDecision)}
-		results <- domainLogStreamResult{name: "DNS", err: streamHostNetworkDomainEvents(ctx, store.runtimeDir(), record.LaunchID, 0, &writer)}
+		results <- domainLogStreamResult{name: "DNS", err: streamHostNetworkDomainEvents(ctx, store.runtimeDir(), record.LaunchID, 0, newDomainLogHistoryFilter(&writer, history, startedAt))}
 	}()
 	go func() {
 		writer := firewallEventLogWriter{output: output}
-		results <- domainLogStreamResult{name: "firewall", err: streamHostNetworkFirewallEvents(ctx, store.runtimeDir(), record.LaunchID, 0, &writer)}
+		results <- domainLogStreamResult{name: "firewall", err: streamHostNetworkFirewallEvents(ctx, store.runtimeDir(), record.LaunchID, 0, newDomainLogHistoryFilter(&writer, history, startedAt))}
 	}()
 	select {
 	case <-signalCtx.Done():
@@ -80,6 +81,41 @@ func cmdProjectFirewallDomainLog(verbose bool) error {
 		}
 		return fmt.Errorf("host %s event stream failed: %w", result.name, result.err)
 	}
+}
+
+// domainLogHistoryFilter hides events the host recorded before the command
+// started, so the log follows only new traffic unless --history is given.
+// Both host streams replay their whole buffer to a reader starting at
+// sequence zero; a gap reported during that replay only means older history
+// was lost, so it is hidden too.
+type domainLogHistoryFilter struct {
+	next      io.Writer
+	startedAt time.Time
+	live      bool
+}
+
+func newDomainLogHistoryFilter(next io.Writer, history bool, startedAt time.Time) io.Writer {
+	if history {
+		return next
+	}
+	return &domainLogHistoryFilter{next: next, startedAt: startedAt}
+}
+
+func (f *domainLogHistoryFilter) Write(line []byte) (int, error) {
+	if !f.live {
+		var event struct {
+			Time time.Time
+			Gap  bool
+		}
+		if err := json.Unmarshal(line, &event); err != nil {
+			return 0, fmt.Errorf("decode host event time: %w", err)
+		}
+		if event.Gap || event.Time.Before(f.startedAt) {
+			return len(line), nil
+		}
+		f.live = true
+	}
+	return f.next.Write(line)
 }
 
 type domainLogStreamResult struct {
