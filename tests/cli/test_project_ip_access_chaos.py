@@ -438,7 +438,7 @@ def test_global_firewall_enumeration_failure_is_recoverable(project):
     finally:
         store_root.chmod(original_mode)
     assert "enumeration-recovery.example" in run(f"{zaigr} global firewall list")
-    effective = run(f"{zaigr} project firewall domain list")
+    effective = run(f"{zaigr} project firewall show")
     assert "enumeration-recovery.example" in effective, effective
     assert "enumeration-recovery.example" in run(
         f"{zaigr} global firewall allow enumeration-recovery.example"
@@ -448,7 +448,7 @@ def test_global_firewall_enumeration_failure_is_recoverable(project):
         f"{zaigr} global firewall remove enumeration-recovery.example"
     )
     assert "removed enumeration-recovery.example" in removed
-    assert "enumeration-recovery.example" not in run(f"{zaigr} project firewall domain list")
+    assert "enumeration-recovery.example" not in run(f"{zaigr} project firewall show")
     assert run(f"{zaigr} project vm exec -- printf LIVE_POLICY_REMOVED") == "LIVE_POLICY_REMOVED"
 
 

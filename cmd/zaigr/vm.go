@@ -132,12 +132,12 @@ func newProjectFirewallCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "firewall",
 		Short: "Manage persistent project firewall permissions",
-		Long: "Manage firewall permissions owned by this project. Exact IPv4 permissions " +
-			"apply to all ports, persist until removed, and do not require the target to be reachable.",
-		Example: "  zaigr project firewall allow 192.168.2.11\n" +
+		Long: "Manage firewall permissions owned by this project. Allow domain names, or exact IPv4 " +
+			"addresses on all ports. Permissions persist until removed.",
+		Example: "  zaigr project firewall allow huggingface.co hf.co\n" +
+			"  zaigr project firewall allow 192.168.2.11\n" +
 			"  zaigr project firewall show\n" +
-			"  # From an ordinary zaigr shell: ssh user@192.168.2.11\n" +
-			"  zaigr project firewall remove 192.168.2.11",
+			"  zaigr project firewall remove hf.co 192.168.2.11",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return cmd.Help()
@@ -146,49 +146,40 @@ func newProjectFirewallCommand() *cobra.Command {
 	cmd.AddCommand(newProjectFirewallAllowCommand())
 	cmd.AddCommand(newProjectFirewallRemoveCommand())
 	cmd.AddCommand(newProjectFirewallShowCommand())
-	cmd.AddCommand(newProjectFirewallDomainCommand())
 	cmd.AddCommand(newProjectFirewallDomainLogCommand())
-	return cmd
-}
-
-func newProjectFirewallDomainCommand() *cobra.Command {
-	cmd := &cobra.Command{Use: "domain", Short: "Manage exact DNS-name firewall permissions", Args: cobra.NoArgs, RunE: func(c *cobra.Command, _ []string) error { return c.Help() }}
-	cmd.AddCommand(&cobra.Command{Use: "allow <name>", Short: "Allow an exact DNS name persistently", Args: cobra.ExactArgs(1), RunE: func(_ *cobra.Command, args []string) error { return cmdProjectFirewallDomainChange(args[0], true) }})
-	cmd.AddCommand(&cobra.Command{Use: "remove <name>", Short: "Remove an exact DNS-name permission", Args: cobra.ExactArgs(1), RunE: func(_ *cobra.Command, args []string) error { return cmdProjectFirewallDomainChange(args[0], false) }})
-	cmd.AddCommand(&cobra.Command{Use: "list", Short: "List effective exact DNS-name permissions", Args: cobra.NoArgs, RunE: func(_ *cobra.Command, _ []string) error { return cmdProjectFirewallDomainList() }})
 	return cmd
 }
 
 func newProjectFirewallAllowCommand() *cobra.Command {
 	return &cobra.Command{
-		Use:   "allow <ipv4>",
-		Short: "Allow an exact IPv4 address on all ports for this project",
-		Long: "Allow an exact IPv4 address on all ports for this project until removed. " +
-			"The permission persists across VM restarts, clean, and rebuild. The target may be offline; " +
-			"connect normally afterward, for example: ssh user@192.168.2.11.",
-		Example: "  zaigr project firewall allow 192.168.2.11\n" +
-			"  zaigr project firewall show\n" +
+		Use:   "allow <domain|ipv4> [<domain|ipv4> ...]",
+		Short: "Allow domain names or exact IPv4 addresses for this project",
+		Long: "Allow each domain name or exact IPv4 address for this project until removed. " +
+			"A domain allows that exact name, not its subdomains. An IPv4 address is allowed on all ports " +
+			"and may be offline. Permissions persist across VM restarts, clean, and rebuild.",
+		Example: "  zaigr project firewall allow huggingface.co hf.co\n" +
+			"  zaigr project firewall allow 192.168.2.11\n" +
 			"  # From an ordinary zaigr shell: ssh user@192.168.2.11\n" +
-			"  zaigr project firewall remove 192.168.2.11",
-		Args: cobra.ExactArgs(1),
+			"  zaigr project firewall show",
+		Args: cobra.MinimumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			return cmdProjectFirewallIPChange(args[0], true)
+			return cmdProjectFirewallChange(args, true)
 		},
 	}
 }
 
 func newProjectFirewallRemoveCommand() *cobra.Command {
 	return &cobra.Command{
-		Use:   "remove <ipv4>",
-		Short: "Remove a project's exact IPv4 all-port permission",
-		Long: "Remove a persistent exact IPv4 permission from this project. " +
-			"Existing outbound TCP and UDP connections to that address are revoked when the VM is running.",
-		Example: "  zaigr project firewall allow 192.168.2.11\n" +
-			"  zaigr project firewall show\n" +
-			"  zaigr project firewall remove 192.168.2.11",
-		Args: cobra.ExactArgs(1),
+		Use:   "remove <domain|ipv4> [<domain|ipv4> ...]",
+		Short: "Remove domain names or exact IPv4 addresses from this project",
+		Long: "Remove each domain name or exact IPv4 permission from this project. " +
+			"Existing connections that only that permission allowed are cut when the VM is running.",
+		Example: "  zaigr project firewall remove hf.co\n" +
+			"  zaigr project firewall remove 192.168.2.11\n" +
+			"  zaigr project firewall show",
+		Args: cobra.MinimumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			return cmdProjectFirewallIPChange(args[0], false)
+			return cmdProjectFirewallChange(args, false)
 		},
 	}
 }

@@ -234,7 +234,7 @@ def test_domain_log_covers_tcp_udp_verdict_transitions_and_dns_without_payloads(
     expect_domain_event(log, r"DNS blocked\s+log-blocked\.test")
 
     checked_run(
-        [zaigr, "project", "firewall", "domain", "allow", "log-allowed.test"],
+        [zaigr, "project", "firewall", "allow", "log-allowed.test"],
         project,
         timeout=30,
     )
@@ -246,7 +246,7 @@ def test_domain_log_covers_tcp_udp_verdict_transitions_and_dns_without_payloads(
     assert "rcode=0" in allowed_dns and "a=93.184.216.34" in allowed_dns, allowed_dns
     expect_domain_event(log, r"DNS allowed\s+log-allowed\.test")
     checked_run(
-        [zaigr, "project", "firewall", "domain", "remove", "log-allowed.test"],
+        [zaigr, "project", "firewall", "remove", "log-allowed.test"],
         project,
         timeout=30,
     )

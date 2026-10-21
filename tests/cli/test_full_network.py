@@ -529,9 +529,9 @@ def test_exact_dns_grants_share_and_release_live_ip_references(
 
     checked_run([zaigr, "project", "vm", "start"], cwd=project.cwd, env=project.env,
                 input="y\n", timeout=180)
-    checked_run([zaigr, "project", "firewall", "domain", "allow", "lease-a.test"],
+    checked_run([zaigr, "project", "firewall", "allow", "lease-a.test"],
                 cwd=project.cwd, env=project.env, timeout=20)
-    checked_run([zaigr, "project", "firewall", "domain", "allow", "lease-b.test"],
+    checked_run([zaigr, "project", "firewall", "allow", "lease-b.test"],
                 cwd=project.cwd, env=project.env, timeout=20)
     if manual_ip_reference:
         checked_run([zaigr, "project", "firewall", "allow", public_ip],
@@ -585,7 +585,7 @@ def test_exact_dns_grants_share_and_release_live_ip_references(
              "http://lease-a.test/debian/dists/trixie/main/binary-amd64/Packages.xz"],
             cwd=project.cwd, env=project.env, timeout=20,
         )
-        checked_run([zaigr, "project", "firewall", "domain", "remove", "lease-a.test"],
+        checked_run([zaigr, "project", "firewall", "remove", "lease-a.test"],
                     cwd=project.cwd, env=project.env, timeout=20)
         time.sleep(0.5)
         before_remove_a = len(stream_a.read_bytes())
@@ -596,11 +596,11 @@ def test_exact_dns_grants_share_and_release_live_ip_references(
             "removing lease-a.test dropped an IP flow still referenced by lease-b.test"
         )
         assert "lease-b.test" in checked_run(
-            [zaigr, "project", "firewall", "domain", "list"],
+            [zaigr, "project", "firewall", "show"],
             cwd=project.cwd, env=project.env,
         )
 
-        checked_run([zaigr, "project", "firewall", "domain", "remove", "lease-b.test"],
+        checked_run([zaigr, "project", "firewall", "remove", "lease-b.test"],
                     cwd=project.cwd, env=project.env, timeout=20)
         if manual_ip_reference:
             direct_ip_access = checked_run(
@@ -649,7 +649,7 @@ def test_exact_dns_grants_share_and_release_live_ip_references(
                 break
         assert time.monotonic() - quiet_since >= 2, "revoked stream did not become quiet"
 
-        checked_run([zaigr, "project", "firewall", "domain", "allow", "lease-b.test"],
+        checked_run([zaigr, "project", "firewall", "allow", "lease-b.test"],
                     cwd=project.cwd, env=project.env, timeout=20)
         assert public_ip in checked_run(
             [zaigr, "project", "vm", "exec", "--", "getent", "ahostsv4", "lease-b.test"],
@@ -714,7 +714,7 @@ def test_dns_answer_change_keeps_established_flow_until_domain_removed(
 
     checked_run([zaigr, "project", "vm", "start"], cwd=project.cwd, env=project.env,
                 input="y\n", timeout=180)
-    checked_run([zaigr, "project", "firewall", "domain", "allow", "cdn.test"],
+    checked_run([zaigr, "project", "firewall", "allow", "cdn.test"],
                 cwd=project.cwd, env=project.env, timeout=20)
     normal = open_shell(shlex.quote(str(zaigr)) + " shell", project, request)
     stream = project.cwd / "cdn-rotation-stream.log"
@@ -765,7 +765,7 @@ def test_dns_answer_change_keeps_established_flow_until_domain_removed(
         assert stream_grows(stream, 4), "a blocked new connection disturbed the established flow"
 
         # Removing the domain is the explicit revocation: it ends the old flow too.
-        checked_run([zaigr, "project", "firewall", "domain", "remove", "cdn.test"],
+        checked_run([zaigr, "project", "firewall", "remove", "cdn.test"],
                     cwd=project.cwd, env=project.env, timeout=20)
         assert stream_goes_quiet(stream, 8), (
             "removing the domain left a connection opened under its earlier answer running"
@@ -792,13 +792,13 @@ def test_delayed_dns_answer_cannot_restore_removed_grant(
     resolver.set_answer("delayed.test", public_ip, 30)
     checked_run([zaigr, "project", "vm", "start"], cwd=project.cwd, env=project.env,
                 input="y\n", timeout=180)
-    checked_run([zaigr, "project", "firewall", "domain", "allow", "delayed.test"],
+    checked_run([zaigr, "project", "firewall", "allow", "delayed.test"],
                 cwd=project.cwd, env=project.env, timeout=20)
     normal = open_shell(shlex.quote(str(zaigr)) + " shell", project, request)
     try:
         normal.sendline("./dns_probe udp delayed.test")
         assert resolver.delayed_seen.wait(8), "guest did not issue delayed DNS query"
-        checked_run([zaigr, "project", "firewall", "domain", "remove", "delayed.test"],
+        checked_run([zaigr, "project", "firewall", "remove", "delayed.test"],
                     cwd=project.cwd, env=project.env, timeout=20)
         resolver.release_delayed.set()
         normal.expect(USER_PROMPT, timeout=12)

@@ -229,16 +229,19 @@ VM-wide grant, with no concurrent model session.
 
 ### I need the agent to access another domain
 
-Allow the exact hostname from the host:
+Allow the exact hostnames from the host:
 
 ```sh
-zaigr project firewall domain allow docs.python.org
+zaigr project firewall allow docs.python.org pypi.org
 zaigr project firewall show
 ```
 
+Each name is allowed exactly, not its subdomains. The same command also takes
+an IPv4 address, such as `zaigr project firewall allow 192.168.2.11`.
+
 The host enforces this permission for the entire VM, including root processes.
 The grant is saved outside the guest image and applies to the running VM.
-Remove it from the host with `zaigr project firewall domain remove docs.python.org`.
+Remove it from the host with `zaigr project firewall remove docs.python.org`.
 
 ### I need an unrestricted network shell
 

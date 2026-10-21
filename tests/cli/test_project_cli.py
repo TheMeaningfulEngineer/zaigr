@@ -296,6 +296,41 @@ def test_setup_firewall_is_shown_and_allows_host_access(project, setup_factory):
 
 
 @pytest.mark.timeout(240)
+def test_project_firewall_allow_takes_several_domains_and_ips(project):
+    """One allow/remove takes domains and IPv4 addresses; bad entries change nothing."""
+    run = partial(_checked_run, cwd=project.cwd, env=project.env)
+    zaigr = project.zaigr_bin
+    run(f"{zaigr} project vm start", input="y\n", timeout=180)
+    run(f"{zaigr} project vm stop", timeout=30)
+
+    stdout, stderr, rc = _run(
+        f"{zaigr} project firewall allow pypi.org https://github.com/ast-grep/ast-grep",
+        cwd=project.cwd, env=project.env, timeout=10,
+    )
+    assert rc != 0, err_msg(stdout, stderr)
+    message = stdout + stderr
+    assert "not a domain name or an IPv4 address" in message, message
+    assert "Did you mean: github.com" in message, message
+    assert "pypi.org" not in run(f"{zaigr} project firewall show", timeout=10)
+
+    run(f"{zaigr} project firewall allow huggingface.co hf.co 192.168.2.11", timeout=10)
+    firewall = run(f"{zaigr} project firewall show", timeout=10)
+    manual = _section_lines(
+        firewall, "# Project manual domain permissions", "# Project setup permissions"
+    )
+    assert manual == ["hf.co", "huggingface.co"], firewall
+    assert "192.168.2.11" in firewall, firewall
+
+    run(f"{zaigr} project firewall remove hf.co 192.168.2.11", timeout=10)
+    firewall = run(f"{zaigr} project firewall show", timeout=10)
+    manual = _section_lines(
+        firewall, "# Project manual domain permissions", "# Project setup permissions"
+    )
+    assert manual == ["huggingface.co"], firewall
+    assert "192.168.2.11" not in firewall, firewall
+
+
+@pytest.mark.timeout(240)
 def test_project_firewall_show_uses_host_managed_domain_policy(project):
     """Project firewall domains are managed and shown on the host while stopped."""
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
@@ -304,12 +339,12 @@ def test_project_firewall_show_uses_host_managed_domain_policy(project):
 
     run(f"{zaigr} project vm start", input="y\n", timeout=180)
     run(f"{zaigr} project vm stop", timeout=30)
-    run(f"{zaigr} project firewall domain allow {domain}", timeout=10)
+    run(f"{zaigr} project firewall allow {domain}", timeout=10)
     firewall = run(f"{zaigr} project firewall show", timeout=10)
     assert domain in firewall
     assert "project" in firewall.lower()
 
-    run(f"{zaigr} project firewall domain remove {domain}", timeout=10)
+    run(f"{zaigr} project firewall remove {domain}", timeout=10)
     firewall_after_remove = run(f"{zaigr} project firewall show", timeout=10)
     assert domain not in firewall_after_remove
     status = run(f"{zaigr} project status", timeout=10)
@@ -361,7 +396,7 @@ def test_project_firewall_domain_allow_remove_controls_vm_access(project):
     test_url = f"https://{test_domain}"
 
     run(f"{zaigr} project vm start", input="y\n", timeout=180)
-    run(f"{zaigr} project firewall domain allow {test_domain}", timeout=30)
+    run(f"{zaigr} project firewall allow {test_domain}", timeout=30)
 
     resolved = run(
         f"{zaigr} project vm exec -- getent ahostsv4 {test_domain}",
@@ -374,7 +409,7 @@ def test_project_firewall_domain_allow_remove_controls_vm_access(project):
         timeout=30,
     )
 
-    run(f"{zaigr} project firewall domain remove {test_domain}", timeout=30)
+    run(f"{zaigr} project firewall remove {test_domain}", timeout=30)
     firewall = run(f"{zaigr} project firewall show", timeout=10)
     assert test_domain not in firewall
     unresolved, stderr, rc = _run(
@@ -385,7 +420,7 @@ def test_project_firewall_domain_allow_remove_controls_vm_access(project):
     )
     assert rc != 0, err_msg(unresolved, stderr)
 
-    run(f"{zaigr} project firewall domain allow {test_domain}", timeout=30)
+    run(f"{zaigr} project firewall allow {test_domain}", timeout=30)
     resolved_again = run(
         f"{zaigr} project vm exec -- getent ahostsv4 {test_domain}",
         timeout=30,

@@ -229,25 +229,50 @@ func printDomainEntries(title string, entries []string) {
 	}
 }
 
-func exactFirewallTarget(raw string) (address string, domain string, isIP bool, err error) {
-	if _, parseErr := netip.ParseAddr(raw); parseErr == nil {
-		validated, validateErr := validateProjectFirewallIPv4(raw)
-		if validateErr != nil {
-			return "", "", true, validateErr
+// cmdProjectFirewallChange allows or removes each domain name or IPv4 address
+// in order. Every argument is checked first, so a typo changes nothing.
+func cmdProjectFirewallChange(rawTargets []string, allow bool) error {
+	for _, raw := range rawTargets {
+		if err := checkFirewallTarget(raw); err != nil {
+			return err
 		}
-		return validated, "", true, nil
 	}
-	domains, validateErr := normalizeFirewallDomains([]string{raw})
-	if validateErr != nil {
-		return "", "", false, validateErr
+	for _, raw := range rawTargets {
+		var err error
+		if _, parseErr := netip.ParseAddr(raw); parseErr == nil {
+			err = cmdProjectFirewallIPChange(raw, allow)
+		} else {
+			err = cmdProjectFirewallDomainChange(raw, allow)
+		}
+		if err != nil {
+			return err
+		}
 	}
-	return "", domains[0], false, nil
+	return nil
+}
+
+func checkFirewallTarget(raw string) error {
+	if _, err := netip.ParseAddr(raw); err == nil {
+		_, err := validateProjectFirewallIPv4(raw)
+		return err
+	}
+	if _, err := normalizeFirewallDomains([]string{raw}); err == nil {
+		return nil
+	}
+	message := fmt.Sprintf("%q is not a domain name or an IPv4 address. Use plain names like github.com.", raw)
+	if suggestion := suggestFirewallDomain(raw); suggestion != "" {
+		message += "\nDid you mean: " + suggestion
+		if strings.HasPrefix(strings.TrimSpace(raw), "*.") {
+			message += " (only that exact name is allowed, not its subdomains)"
+		}
+	}
+	return errors.New(message)
 }
 
 func cmdProjectFirewallDomainChange(raw string, allow bool) error {
-	operation := "project firewall domain remove"
+	operation := "project firewall remove"
 	if allow {
-		operation = "project firewall domain allow"
+		operation = "project firewall allow"
 	}
 	lock, err := lockCurrentProject(operation)
 	if err != nil {
@@ -316,22 +341,5 @@ func cmdProjectFirewallDomainChange(raw string, allow bool) error {
 	} else {
 		fmt.Printf(":: Exact DNS name %s removed from this project\n", name)
 	}
-	return nil
-}
-
-func cmdProjectFirewallDomainList() error {
-	lock, err := lockCurrentProject("project firewall domain list")
-	if err != nil {
-		return err
-	}
-	defer lock.releaseWithWarning()
-	if _, err := requireProject("project firewall domain list"); err != nil {
-		return err
-	}
-	manual, setups, global, err := projectFirewallDomainSources(currentProjectStore())
-	if err != nil {
-		return err
-	}
-	printDomainEntries("# Effective exact DNS-name permissions", effectiveProjectFirewallDomains(hostNetworkBuiltinDomains, manual, setups, global))
 	return nil
 }

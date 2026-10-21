@@ -29,7 +29,7 @@ def test_dns_refresh_outage_preserves_existing_flow_and_blocks_new_flows(
                 input="y\n", timeout=180)
     address = socket.gethostbyname("deb.debian.org")
     resolver.set_answer("outage.test", address, 5)
-    checked_run([zaigr, "project", "firewall", "domain", "allow", "outage.test"],
+    checked_run([zaigr, "project", "firewall", "allow", "outage.test"],
                 cwd=project.cwd, env=project.env)
     assert address in checked_run(
         [zaigr, "project", "vm", "exec", "--", "getent", "ahostsv4", "outage.test"],
@@ -62,12 +62,12 @@ def test_dns_refresh_outage_preserves_existing_flow_and_blocks_new_flows(
     )
     assert "NEW_FLOW_BLOCKED" in denied and "UNEXPECTED_ACCESS" not in denied
     assert stream_grows(stream, 4)
-    checked_run([zaigr, "project", "firewall", "domain", "remove", "outage.test"],
+    checked_run([zaigr, "project", "firewall", "remove", "outage.test"],
                 cwd=project.cwd, env=project.env)
     assert stream_goes_quiet(stream, 8)
     stopped_length = stream.stat().st_size
     resolver.drop_replies("outage.test", False)
-    checked_run([zaigr, "project", "firewall", "domain", "allow", "outage.test"],
+    checked_run([zaigr, "project", "firewall", "allow", "outage.test"],
                 cwd=project.cwd, env=project.env)
     assert address in checked_run(
         [zaigr, "project", "vm", "exec", "--", "getent", "ahostsv4", "outage.test"],
@@ -107,7 +107,7 @@ def test_manual_flow_can_transfer_to_a_later_dns_permission(
     while time.monotonic() < deadline and not (stream.exists() and stream.stat().st_size > 1024):
         time.sleep(0.05)
     assert stream.exists() and stream.read_bytes().startswith(b"HTTP/1.1 200 OK")
-    checked_run([zaigr, "project", "firewall", "domain", "allow", "handoff.test"],
+    checked_run([zaigr, "project", "firewall", "allow", "handoff.test"],
                 cwd=project.cwd, env=project.env)
     assert address in checked_run(
         [zaigr, "project", "vm", "exec", "--", "getent", "ahostsv4", "handoff.test"],
@@ -117,7 +117,7 @@ def test_manual_flow_can_transfer_to_a_later_dns_permission(
     checked_run([zaigr, "project", "firewall", "remove", address],
                 cwd=project.cwd, env=project.env)
     assert stream_grows(stream, 4), "removing the manual grant lost a live DNS reference"
-    checked_run([zaigr, "project", "firewall", "domain", "remove", "handoff.test"],
+    checked_run([zaigr, "project", "firewall", "remove", "handoff.test"],
                 cwd=project.cwd, env=project.env)
     assert stream_goes_quiet(stream, 8), "the final permission did not revoke the flow"
 
@@ -131,7 +131,7 @@ def test_dns_flow_does_not_resume_after_network_liveness_expires(
                 input="y\n", timeout=180)
     address = socket.gethostbyname("deb.debian.org")
     host_network_dns["resolver"].set_answer("liveness.test", address, 60)
-    checked_run([zaigr, "project", "firewall", "domain", "allow", "liveness.test"],
+    checked_run([zaigr, "project", "firewall", "allow", "liveness.test"],
                 cwd=project.cwd, env=project.env)
     assert address in checked_run(
         [zaigr, "project", "vm", "exec", "--", "getent", "ahostsv4", "liveness.test"],
