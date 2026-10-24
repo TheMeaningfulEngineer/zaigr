@@ -183,8 +183,9 @@ def _host_ram_mb():
 
 
 def _should_stream_transcripts():
+    options = [*sys.argv, *shlex.split(os.environ.get("PYTEST_ADDOPTS", ""))]
     return any(
-        opt in sys.argv
+        opt in options
         for opt in ("-s", "--capture=no", "--capture=tee-sys", "--interactive-transcript")
     )
 

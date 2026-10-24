@@ -6,8 +6,8 @@ LDFLAGS = -X main.version=$(VERSION) -X main.build=$(BUILD) -X main.commit=$(COM
 TAG = v$(VERSION)
 INSTALL_TEST_TIMEOUT ?= 1800
 PYTEST_XDIST_WORKERS ?= 8
-PYTEST_OVERLAP_WORKERS ?= 4
 PYTEST_BUILTIN_WORKERS ?= 2
+CLOUDVM_DISTROS ?=
 TEST_BINARY = $(if $(strip $(ZAIGR_TEST_BINARY)),$(abspath $(ZAIGR_TEST_BINARY)),$(CURDIR)/zaigr)
 
 .PHONY: build lint lint-golang lint-python test-all test-prepare test-cli test-cli-install test-builtin test-versioning test-install test-release test-logged clean base-rootfs base-kernel base-virtiofsd clean-kernel
@@ -49,7 +49,8 @@ test-builtin: test-prepare
 	ZAIGR_TEST_BINARY="$(TEST_BINARY)" pytest -c tests/pytest.ini tests/builtin -v -x -n $(PYTEST_BUILTIN_WORKERS) --maxschedchunk=1 --timeout=1800 -o timeout_func_only=true
 
 test-cli-install: test-prepare
-	$(MAKE) -j2 test-cli test-install PYTEST_XDIST_WORKERS=$(PYTEST_OVERLAP_WORKERS) ZAIGR_TEST_BINARY="$(TEST_BINARY)"
+	$(MAKE) test-cli ZAIGR_TEST_BINARY="$(TEST_BINARY)"
+	$(MAKE) test-install ZAIGR_TEST_BINARY="$(TEST_BINARY)" CLOUDVM_DISTROS="$(CLOUDVM_DISTROS)"
 
 # Keep versioning's embedded-input edits separate even under make -j.
 # Separate recipes also work with GNU Make versions before target-scoped .NOTPARALLEL.
@@ -74,7 +75,7 @@ test-versioning:
 	pytest -c tests/pytest.ini tests/versioning/test_versioning.py -v -x
 
 test-install:
-	pytest -c tests/pytest.ini tests/install -v -x --timeout=$(INSTALL_TEST_TIMEOUT) -o timeout_func_only=true
+	CLOUDVM_DISTROS="$(CLOUDVM_DISTROS)" pytest -c tests/pytest.ini tests/install -v -x --timeout=$(INSTALL_TEST_TIMEOUT) -o timeout_func_only=true
 
 clean-kernel:
 	rm -f cmd/zaigr/vm_data/bzImage

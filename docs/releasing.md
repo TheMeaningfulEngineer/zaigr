@@ -71,19 +71,26 @@ Inside the VM:
 
 After verification succeeds, run `exit` to return to the host.
 
-Verification runs release and versioning tests first, then overlaps the CLI
-tests at four workers with serial install tests. Builtin tests run afterward
-at two workers. Both overlapping groups must finish successfully before
-verification continues. Set `PYTEST_OVERLAP_WORKERS` to adjust CLI concurrency
-during verification; `PYTEST_XDIST_WORKERS` still controls standalone
-`make test-cli` runs (default eight).
+Verification runs release and versioning tests first, then runs the CLI suite at
+eight workers, the install suite serially, and builtin tests at two workers. The
+install suite boots official Ubuntu 22.04, 24.04, and 26.04 and Debian 12 and 13
+cloud images. It verifies each image checksum and prepares a package-equipped
+image cache; every test uses its own disposable overlay. Set
+`CLOUDVM_DISTROS=ubuntu-24.04,debian-13` to run a subset. Set
+`PYTEST_XDIST_WORKERS` to adjust CLI concurrency (default eight).
 
-`make test-all` uses the same schedule; `make test-cli-install` runs just the
-overlapping group. UID install tests prepare their system dependencies once per
-pytest session/worker in a temporary image. Each case still installs the selected
-zaigr binary and creates its own container, caller, and VMs. The image is removed
-after the session. Distro package and standalone installation tests continue to
-start from pristine distro images.
+`make test-all` uses this schedule; `make test-cli-install` runs the CLI and
+install suites in sequence. Install tests need KVM, QEMU, and `cloud-localds`;
+they fail clearly when a prerequisite is unavailable. The install suite also
+needs a matching `zaigr` binary and amd64 `.deb`: it uses the active candidate
+artifacts in `release/dist/` by default, or accepts explicit
+`ZAIGR_TEST_BINARY=/path/to/zaigr` and `ZAIGR_TEST_DEB=/path/to/package.deb`
+overrides. Cloud images, checksum manifests, and prepared-image caches live in
+`~/.zaigr/external-sources/cloud-images` by default; set
+`ZAIGR_EXTERNAL_SOURCES=/path/to/cache` to use another location. Disposable VM
+overlays and logs live under `.local/cloudvm-verification/harness`; set
+`ZAIGR_KEEP_CLOUDVM=1` to retain them for inspection. The image cache is retained
+automatically, so repeating a run with it warm avoids image preparation.
 
 ## Publish
 

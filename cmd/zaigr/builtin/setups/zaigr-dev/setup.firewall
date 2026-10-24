@@ -1,6 +1,9 @@
 archive.ubuntu.com
 auth.docker.io
 cdn.registry.fedoraproject.org
+chuangtzu.ftp.acc.umu.se
+cloud-images.ubuntu.com
+cloud.debian.org
 codeload.github.com
 crates.io
 deb.debian.org
@@ -14,6 +17,7 @@ github.com
 gitlab.com
 index.crates.io
 index.docker.io
+laotzu.ftp.acc.umu.se
 mirrors.fedoraproject.org
 objects.githubusercontent.com
 production.cloudflare.docker.com

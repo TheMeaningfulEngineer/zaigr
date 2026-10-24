@@ -22,6 +22,7 @@ apt-get install -y --no-install-recommends \
     bison \
     build-essential \
     ca-certificates \
+    cloud-image-utils \
     cpio \
     crun \
     curl \

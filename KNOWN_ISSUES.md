@@ -92,3 +92,32 @@ that the pending capture will be lost before clearing it.
 **Workaround:** before running `project rebuild`, explicitly run
 `project setup capture accept` or `project setup capture discard` so that
 captured commands are either saved or intentionally dropped.
+
+## Starting a project VM occasionally fails
+
+Sometimes `zaigr project vm start` stops with an error like:
+
+```
+host-enforced network transition failed: ... exit status 255
+```
+
+The VM started, but zaigr briefly couldn't connect to it. It's rare: seen twice
+in about 20 test starts, on Ubuntu 24.04 and 26.04. The cause isn't known yet.
+
+**Workaround:** run `zaigr project vm start` again. It has always worked on the
+second try.
+
+## Release tests: Debian 13 can't be tested yet
+
+Before testing on Debian 13, the release tests download its software packages.
+In our test environment those downloads keep failing, so Debian 13 hasn't been
+tested on a fresh install. Ubuntu 22.04, 24.04 and 26.04, and Debian 12, have.
+
+This doesn't mean zaigr is broken on Debian 13. It means we haven't confirmed
+that it works.
+
+## Release tests: no complete run yet
+
+All parts of the new release tests have passed, but in separate runs. They
+haven't yet passed together in one run, because Debian 13 is blocked (see
+above).
