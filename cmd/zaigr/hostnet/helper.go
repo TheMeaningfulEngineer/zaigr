@@ -723,13 +723,6 @@ func configureUplink() error {
 }
 
 func installDefaultPolicy(launchID string) error {
-	if err := os.WriteFile("/proc/sys/net/netfilter/nf_conntrack_tcp_loose", []byte("0"), 0644); err != nil {
-		return fmt.Errorf("disable loose TCP conntrack pickup: %w", err)
-	}
-	loose, err := os.ReadFile("/proc/sys/net/netfilter/nf_conntrack_tcp_loose")
-	if err != nil || strings.TrimSpace(string(loose)) != "0" {
-		return fmt.Errorf("loose TCP conntrack pickup is enabled")
-	}
 	conn, err := nftables.New()
 	if err != nil {
 		return err
@@ -948,7 +941,28 @@ func installDefaultPolicy(launchID string) error {
 	if err := conn.SetAddElements(&nftables.Set{Table: t, Name: "maintenance_aliases", KeyType: nftables.TypeIPAddr}, aliases); err != nil {
 		return err
 	}
-	return flushStartupRules()
+	if err := flushStartupRules(); err != nil {
+		return err
+	}
+	return disableLooseTCPConntrack()
+}
+
+// disableLooseTCPConntrack runs after the rules above: on distribution kernels
+// nf_conntrack is a module, and its sysctls exist only once the kernel has
+// loaded it for the ct rules. The TAP is not handed over before this returns.
+func disableLooseTCPConntrack() error {
+	const path = "/proc/sys/net/netfilter/nf_conntrack_tcp_loose"
+	if err := os.WriteFile(path, []byte("0"), 0644); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return errors.New("disable loose TCP conntrack pickup: the kernel's nf_conntrack module is not loaded and was not loaded automatically; load it with 'sudo modprobe nf_conntrack' and keep it loaded with 'echo nf_conntrack | sudo tee /etc/modules-load.d/zaigr.conf'")
+		}
+		return fmt.Errorf("disable loose TCP conntrack pickup: %w", err)
+	}
+	loose, err := os.ReadFile(path)
+	if err != nil || strings.TrimSpace(string(loose)) != "0" {
+		return fmt.Errorf("loose TCP conntrack pickup is enabled")
+	}
+	return nil
 }
 
 func matchIIF(name string) []expr.Any {
