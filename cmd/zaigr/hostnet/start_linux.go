@@ -254,15 +254,6 @@ func startLinux(ctx context.Context, opts Options) (Runtime, error) {
 	if err := r.applyPolicyLocked(ctx, PolicySnapshot{LaunchID: opts.LaunchID, Generation: targetGeneration, IPGrants: grants}); err != nil {
 		return nil, err
 	}
-	if opts.SSHHostPort > 0 {
-		g := opts.SSHGuestPort
-		if g == 0 {
-			g = 22
-		}
-		if err := r.changeForward(ctx, opts.LaunchID, targetGeneration, Forward{HostPort: opts.SSHHostPort, GuestPort: g, Protocol: "tcp"}, true); err != nil {
-			return nil, hostNetworkError("install SSH forwarding", err)
-		}
-	}
 	failed = false
 	keepEvents = true
 	return r, nil

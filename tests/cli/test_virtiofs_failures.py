@@ -23,15 +23,41 @@ def _checked_run(command, **kwargs):
     return stdout
 
 
+def _process_identity_live(identity):
+    if not identity or not identity.get("pid"):
+        return False
+    try:
+        with open(f"/proc/{identity['pid']}/stat", encoding="utf-8") as stream:
+            fields = stream.read().rsplit(")", 1)[1].split()
+        if fields[19] != identity["start_time"]:
+            return False
+        exe = os.stat(f"/proc/{identity['pid']}/exe")
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    return (exe.st_dev, exe.st_ino) == (identity["exe_device"], identity["exe_inode"])
+
+
 def _wait_clean(record, record_path, timeout=20):
     groups = [record[name]["process_group"] for name in ("qemu", "workspace_daemon", "agent_state_daemon") if record[name]["pid"]]
+    broker = record.get("ssh_broker")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if not record_path.exists() and all(not _live_group_members(group) for group in groups):
+        if (
+            not record_path.exists()
+            and all(not _live_group_members(group) for group in groups)
+            and not _process_identity_live(broker)
+        ):
             return
         time.sleep(0.05)
     assert not record_path.exists(), record_path
     assert all(not _live_group_members(group) for group in groups), groups
+    assert not _process_identity_live(broker), broker
+
+
+def _assert_record_processes_dead(record):
+    names = ("supervisor", "qemu", "workspace_daemon", "agent_state_daemon", "ssh_broker")
+    live = {name: record.get(name) for name in names if _process_identity_live(record.get(name))}
+    assert not live, live
 
 
 @pytest.mark.timeout(300)
@@ -39,6 +65,7 @@ def _wait_clean(record, record_path, timeout=20):
     ("supervisor-term", signal.SIGTERM),
     ("supervisor-int", signal.SIGINT),
     ("qemu-kill", signal.SIGKILL),
+    ("ssh-broker-kill", signal.SIGKILL),
     ("workspace-daemon-kill", signal.SIGKILL),
     ("agent-state-daemon-kill", signal.SIGKILL),
 ])
@@ -50,7 +77,8 @@ def test_owned_process_failure_cleans_both_exports_and_restarts(project, name, s
     record = json.loads(record_path.read_text())
     assert record["mode"] == "detached"
     assert all(_live_group_members(record[item]["process_group"]) for item in ("qemu", "workspace_daemon", "agent_state_daemon"))
-    target = {"supervisor-term": "supervisor", "supervisor-int": "supervisor", "qemu-kill": "qemu", "workspace-daemon-kill": "workspace_daemon", "agent-state-daemon-kill": "agent_state_daemon"}[name]
+    assert _process_identity_live(record["ssh_broker"])
+    target = {"supervisor-term": "supervisor", "supervisor-int": "supervisor", "qemu-kill": "qemu", "ssh-broker-kill": "ssh_broker", "workspace-daemon-kill": "workspace_daemon", "agent-state-daemon-kill": "agent_state_daemon"}[name]
     started = time.monotonic()
     _verified_signal(record[target], sig)
     _wait_clean(record, record_path, timeout=20)
@@ -184,29 +212,76 @@ def test_qemu_startup_failure_cleans_children_and_can_retry(project, test_root, 
     assert run([zaigr, "project", "vm", "exec", "--", "findmnt", "-n", "-o", "FSTYPE", "/home/user/workspace"], timeout=20).strip() == "virtiofs"
 
 
-@pytest.mark.timeout(300)
-def test_ssh_readiness_failure_cleans_live_qemu_and_both_daemons(project, test_root):
+@pytest.mark.timeout(360)
+def test_vsock_readiness_failure_cleans_live_qemu_and_both_daemons(project, test_root):
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
     run([zaigr, "project", "vm", "start"], input="y\n", timeout=180)
     run([zaigr, "project", "vm", "stop"], timeout=60)
-    fake_bin = test_root / "ssh-readiness-failure-bin"
+    fake_bin = test_root / "vsock-readiness-failure-bin"
     fake_bin.mkdir()
-    marker = test_root / "ssh-readiness-invoked"
-    wrapper = fake_bin / "ssh"
-    wrapper.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 255\n", encoding="utf-8")
+    marker = test_root / "vsock-ssh-socket-masked"
+    real_qemu = shutil.which("qemu-system-x86_64")
+    assert real_qemu is not None
+    wrapper = fake_bin / "qemu-system-x86_64"
+    wrapper.write_text(
+        "#!/usr/bin/python3\n"
+        "import os, sys\n"
+        f"real_qemu = {real_qemu!r}\n"
+        f"marker = {str(marker)!r}\n"
+        "args = sys.argv[1:]\n"
+        "vsock_device = any(argument.startswith('vhost-vsock-device,guest-cid=') for argument in args)\n"
+        "if not vsock_device:\n"
+        "    os.execv(real_qemu, [real_qemu, *args])\n"
+        "for index, argument in enumerate(args[:-1]):\n"
+        "    if argument == '-append':\n"
+        "        args[index + 1] += ' systemd.mask=ssh-vsock.socket'\n"
+        "        with open(marker, 'w', encoding='utf-8') as output:\n"
+        "            output.write(args[index + 1] + '\\n')\n"
+        "        break\n"
+        "else:\n"
+        "    raise SystemExit('product QEMU arguments did not contain a guest kernel append value')\n"
+        "os.execv(real_qemu, [real_qemu, *args])\n",
+        encoding="utf-8",
+    )
     wrapper.chmod(0o755)
     env = project.env
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
     started = time.monotonic()
-    stdout, stderr, code = _run([zaigr, "project", "vm", "start"], cwd=project.cwd, env=env, timeout=150)
+    record_path = project.store_dir / "vm-supervisor.json"
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        start = pool.submit(
+            _run,
+            [zaigr, "project", "vm", "start"],
+            cwd=project.cwd,
+            env=env,
+            timeout=330,
+        )
+        live_record = None
+        capture_deadline = time.monotonic() + 180
+        required = ("supervisor", "qemu", "workspace_daemon", "agent_state_daemon", "ssh_broker")
+        while time.monotonic() < capture_deadline and not start.done():
+            if record_path.exists():
+                try:
+                    candidate = json.loads(record_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    candidate = None
+                if candidate and all(_process_identity_live(candidate.get(key)) for key in required):
+                    live_record = candidate
+                    break
+            time.sleep(0.05)
+        stdout, stderr, code = start.result(timeout=330)
     assert code != 0, (stdout, stderr)
-    assert marker.exists()
-    assert "ssh and virtiofs mounts were not ready" in (stdout + stderr).lower(), (stdout, stderr)
-    assert 85 < time.monotonic() - started < 140
-    assert not (project.store_dir / "vm-supervisor.json").exists()
+    assert live_record is not None, "failed startup did not publish identities for the supervisor, QEMU, daemons, and broker"
+    assert "systemd.mask=ssh-vsock.socket" in marker.read_text(encoding="utf-8")
+    failure = (stdout + stderr).lower()
+    assert "guest ssh readiness: context deadline exceeded" in failure, (stdout, stderr)
+    assert time.monotonic() - started < 320
+    _wait_clean(live_record, record_path, timeout=20)
+    _assert_record_processes_dead(live_record)
     for name in ("virtiofsd-workspace.sock", "virtiofsd-agent-state.sock", "vm.sock"):
         assert not (project.store_dir / "runtime" / name).exists()
+    assert not (project.store_dir / "runtime" / "vsock-cid").exists()
     assert (project.store_dir / "vm-supervisor.log").exists()
     run([zaigr, "project", "vm", "start"], timeout=180)
     assert run([zaigr, "project", "vm", "exec", "--", "findmnt", "-n", "-o", "FSTYPE", "/home/user/workspace"], timeout=20).strip() == "virtiofs"

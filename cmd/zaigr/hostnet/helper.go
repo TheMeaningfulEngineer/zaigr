@@ -690,7 +690,7 @@ func installDefaultPolicy(launchID string) error {
 	addStartupRule(&nftables.Rule{Table: t, Chain: guard, Exprs: join(matchIIF(guestTapName), matchNFProto(unix.NFPROTO_IPV4), matchConntrackStateAny(expr.CtStateBitINVALID|expr.CtStateBitUNTRACKED), setNFTrace())})
 	addStartupRule(&nftables.Rule{Table: t, Chain: guard, Exprs: join(matchIIF(guestTapName), matchNFProto(unix.NFPROTO_IPV4), matchConntrackDirection(0), setNFTrace())})
 	addStartupRule(&nftables.Rule{Table: t, Chain: guard, Exprs: join(matchIIF(guestTapName), matchNFProto(unix.NFPROTO_IPV6), drop())})
-	// Replies to host-created management forwards leave through the guest TAP
+	// Replies to host-created published forwards leave through the guest TAP
 	// toward the slirp-side address. Admit only established conntrack tuples
 	// whose original destination was the host-forward address; the general
 	// direct-uplink drop below still blocks guest-created traffic.
@@ -711,7 +711,7 @@ func installDefaultPolicy(launchID string) error {
 	addStartupRule(&nftables.Rule{Table: t, Chain: guard, Exprs: join(matchIIF(guestTapName), matchNFProto(unix.NFPROTO_IPV4), matchIPv4Masked(16, "10.0.3.0", "255.255.255.0"), drop())})
 	addStartupRule(&nftables.Rule{Table: t, Chain: guard, Exprs: join(matchIIF(guestTapName), matchNFProto(unix.NFPROTO_IPV4), matchIPv4(16, netip.MustParseAddr(UplinkHost)), drop())})
 	// Guest packets with any source other than the assigned address are dropped
-	// before routing, including spoofed management source-port attempts.
+	// before routing, including packets that spoof a privileged-looking source port.
 	addStartupRule(&nftables.Rule{Table: t, Chain: guard, Exprs: join(matchIIF(guestTapName), matchNFProto(unix.NFPROTO_IPV4), matchIPv4Not(12, netip.MustParseAddr("10.0.2.15")), drop())})
 	addStartupRule(&nftables.Rule{Table: t, Chain: guard, Exprs: join(matchIIF(maintenanceTapName), matchNFProto(unix.NFPROTO_IPV4), matchIPv4(12, netip.MustParseAddr(MaintenanceGuestAddress)), matchIPv4Masked(16, "10.0.3.0", "255.255.255.0"), drop())})
 	if err := flushStartupRules(); err != nil {
@@ -720,7 +720,7 @@ func installDefaultPolicy(launchID string) error {
 	for _, reserved := range []struct{ addr, mask string }{{"127.0.0.0", "255.0.0.0"}, {"0.0.0.0", "255.0.0.0"}, {"169.254.0.0", "255.255.0.0"}, {"224.0.0.0", "240.0.0.0"}} {
 		addStartupRule(&nftables.Rule{Table: t, Chain: guard, Exprs: join(matchIIF(guestTapName), matchNFProto(unix.NFPROTO_IPV4), matchIPv4Masked(16, reserved.addr, reserved.mask), drop())})
 	}
-	// Management hostfwd arrives at the slirp-side address and is translated
+	// A published host forward arrives at the slirp-side address and is translated
 	// to the guest. Original-tuple checks below distinguish this host-created
 	// flow from a guest flow that merely chooses source port 22.
 	for _, proto := range []struct {

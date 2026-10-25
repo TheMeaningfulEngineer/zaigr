@@ -15,6 +15,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"zaigr/cmd/zaigr/vmssh"
 )
 
 const defaultVMRam = "512"
@@ -84,40 +86,23 @@ func resolveDisk(flagValue string) (string, string) {
 	return defaultDiskSize, "default"
 }
 
-// sshHostname returns the hostname of the running VM via SSH, or "" if unreachable.
-func sshHostname(port string) string {
-	logDebug("probing VM hostname over SSH", "port", port)
-	if err := ensureUserSSHAccess(port); err != nil {
-		logDebug("VM user SSH access preparation failed", "port", port, "err", err)
-		return ""
-	}
+// sshHostname returns the hostname of the running VM via its supervisor broker.
+func sshHostname(endpoint vmControlEndpoint) string {
+	logDebug("probing VM hostname over vsock broker", "vsock_cid", endpoint.VsockCID, "launch_id", endpoint.LaunchID)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	keyPath := userSSHKeyPath()
-	args := append(sshManagedOptions(),
-		"-o", "AddressFamily=inet",
-		"-o", sshConnectTimeoutOption,
-		"-o", "PasswordAuthentication=no",
-		"-o", "PubkeyAuthentication=yes",
-		"-o", "PreferredAuthentications=publickey",
-		"-o", "KbdInteractiveAuthentication=no",
-		"-o", "ChallengeResponseAuthentication=no",
-		"-o", "IdentitiesOnly=yes",
-		"-i", keyPath,
-		"-p", port,
-		"user@localhost", "hostname",
-	)
-	out, err := exec.CommandContext(ctx, "ssh", args...).Output()
+	var output strings.Builder
+	err := vmssh.Run(ctx, endpoint.SocketPath, vmssh.Request{User: "user", Command: "hostname"}, nil, &output, io.Discard)
 	if ctx.Err() != nil {
-		logWarn("VM hostname probe timed out", "port", port)
+		logWarn("VM hostname probe timed out", "vsock_cid", endpoint.VsockCID)
 		return ""
 	}
 	if err != nil {
-		logDebug("VM hostname probe failed", "port", port, "err", err)
+		logDebug("VM hostname probe failed", "vsock_cid", endpoint.VsockCID, "err", err)
 		return ""
 	}
-	hostname := strings.TrimSpace(string(out))
-	logDebug("VM hostname probe succeeded", "port", port, "hostname", hostname)
+	hostname := strings.TrimSpace(output.String())
+	logDebug("VM hostname probe succeeded", "vsock_cid", endpoint.VsockCID, "hostname", hostname)
 	return hostname
 }
 
@@ -180,9 +165,51 @@ func queryQMPImagePath(conn net.Conn) string {
 }
 
 type runningVMInfo struct {
-	Port      string
+	Endpoint  vmControlEndpoint
 	Hostname  string
 	ImagePath string
+}
+
+// vmControlEndpoint identifies the guest control broker for one VM launch.
+// The launch-specific socket name prevents an old endpoint from attaching to
+// a later VM that reuses the same project runtime directory.
+type vmControlEndpoint struct {
+	SocketPath string
+	LaunchID   string
+	VsockCID   uint32
+}
+
+func vmControlSocketPath(socketDir, launchID string) string {
+	if socketDir == "" {
+		socketDir = vmSocketDir(launchID)
+	}
+	return filepath.Join(socketDir, "ssh.sock")
+}
+
+func vmControlEndpointForRecord(record vmSupervisorRecord) (vmControlEndpoint, error) {
+	if record.LaunchID == "" || record.VsockCID < 3 || record.RuntimeDir == "" {
+		return vmControlEndpoint{}, errors.New("VM supervisor record lacks control endpoint identity")
+	}
+	endpoint := vmControlEndpoint{
+		SocketPath: vmControlSocketPath(record.SocketDir, record.LaunchID),
+		LaunchID:   record.LaunchID,
+		VsockCID:   record.VsockCID,
+	}
+	if len(endpoint.SocketPath) > 107 {
+		return vmControlEndpoint{}, fmt.Errorf("VM control socket path exceeds Linux's 107-byte limit: %s", endpoint.SocketPath)
+	}
+	return endpoint, nil
+}
+
+func vmControlEndpointForStore(store projectStore) (vmControlEndpoint, error) {
+	record, err := readVMSupervisorRecord(store)
+	if err != nil {
+		return vmControlEndpoint{}, fmt.Errorf("read VM control endpoint identity: %w", err)
+	}
+	if filepath.Clean(record.RuntimeDir) != filepath.Clean(store.runtimeDir()) {
+		return vmControlEndpoint{}, errors.New("VM control endpoint runtime directory does not match project store")
+	}
+	return vmControlEndpointForRecord(record)
 }
 
 func detectRunningProjectVM() (*runningVMInfo, bool) {
@@ -191,32 +218,72 @@ func detectRunningProjectVM() (*runningVMInfo, bool) {
 
 func detectRunningProjectVMInStore(store projectStore) (*runningVMInfo, bool) {
 	sockPath := store.monitorSockPath()
+	var endpoint vmControlEndpoint
 	if record, err := readVMSupervisorRecord(store); err == nil {
 		if !vmProcessIsLive(record.Supervisor) || !vmProcessIsLive(record.QEMU) {
+			return nil, true
+		}
+		endpoint, err = vmControlEndpointForRecord(record)
+		if err != nil {
+			logWarn("project VM control endpoint is invalid", "err", err)
 			return nil, true
 		}
 	} else if err != nil && !os.IsNotExist(err) {
 		return nil, true
 	}
 	logDebug("probing project VM monitor socket", "sock", sockPath)
-	conn, err := net.DialTimeout("unix", sockPath, time.Second)
+	conn, err := dialQMPMonitor(sockPath, time.Second)
 	if err == nil {
 		_ = conn.Close()
-		port, _ := store.sshPort()
-		if port == "" {
-			logWarn("project VM runtime state missing SSH port", "runtime_dir", store.runtimeDir())
+		if endpoint.SocketPath == "" {
+			logWarn("project VM runtime state missing control endpoint", "runtime_dir", store.runtimeDir())
+			return nil, true
 		}
-		logDebug("project VM monitor responded", "sock", sockPath, "port", port)
-		return &runningVMInfo{Port: port}, false
+		logDebug("project VM monitor responded", "sock", sockPath, "vsock_cid", endpoint.VsockCID, "launch_id", endpoint.LaunchID)
+		return &runningVMInfo{Endpoint: endpoint}, false
 	}
 
 	if _, statErr := os.Stat(sockPath); statErr == nil {
-		logDebug("project VM monitor socket exists but did not respond", "store", store.Hash, "sock", sockPath)
+		logDebug("project VM monitor socket exists but did not respond", "store", store.Hash, "sock", sockPath, "err", err)
 		return nil, true
 	}
 
 	logDebug("project VM monitor socket not present", "sock", sockPath)
 	return nil, false
+}
+
+// dialQMPMonitor retries only EAGAIN from a full Unix-socket accept queue.
+// Keep the original total probe bound so a paused or unresponsive QEMU does
+// not make status checks wait longer than before.
+func dialQMPMonitor(sockPath string, timeout time.Duration) (net.Conn, error) {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, os.ErrDeadlineExceeded
+		}
+		conn, err := net.DialTimeout("unix", sockPath, remaining)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		if !errors.Is(err, syscall.EAGAIN) && !errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, err
+		}
+		pause := 10 * time.Millisecond
+		remaining = time.Until(deadline)
+		if remaining <= 0 {
+			return nil, lastErr
+		}
+		if remaining < pause {
+			pause = remaining
+		}
+		time.Sleep(pause)
+	}
 }
 
 func detectRunningProjectVMWithMetadata() (*runningVMInfo, bool) {
@@ -229,14 +296,14 @@ func detectRunningProjectVMWithMetadataInStore(store projectStore) (*runningVMIn
 	if info == nil || stale {
 		return info, stale
 	}
-	info.Hostname = sshHostname(info.Port)
+	info.Hostname = sshHostname(info.Endpoint)
 
 	conn, err := net.DialTimeout("unix", store.monitorSockPath(), time.Second)
 	if err == nil {
 		info.ImagePath = queryQMPImagePath(conn)
 		_ = conn.Close()
 	}
-	logDebug("project VM metadata collected", "port", info.Port, "hostname", info.Hostname, "image", info.ImagePath)
+	logDebug("project VM metadata collected", "vsock_cid", info.Endpoint.VsockCID, "hostname", info.Hostname, "image", info.ImagePath)
 	return info, false
 }
 
@@ -322,8 +389,8 @@ func prepareProjectForVMStart(ram string, cpu string) (*runningVMInfo, error) {
 		if hasOverrides {
 			return nil, fmt.Errorf("project VM is already running; --ram and --cpu cannot be changed on a running VM")
 		}
-		logInfo("reusing running project VM", "port", running.Port)
-		if err := syncAppliedSetupFirewallToVM(running.Port); err != nil {
+		logInfo("reusing running project VM", "vsock_cid", running.Endpoint.VsockCID, "launch_id", running.Endpoint.LaunchID)
+		if err := syncAppliedSetupFirewallToVM(running.Endpoint); err != nil {
 			return nil, err
 		}
 		return running, nil
@@ -385,7 +452,7 @@ func runningHostNetworkRecord(store projectStore) (bool, vmSupervisorRecord, err
 	return record.NetworkBackend == vmNetworkBackendHost, record, nil
 }
 
-func startPreparedProjectVM(ram string, cpu string) (port string, returnErr error) {
+func startPreparedProjectVM(ram string, cpu string) (endpoint vmControlEndpoint, returnErr error) {
 	store := currentProjectStore()
 	hostLock := &projectMutationLock{}
 	defer hostLock.releaseWithWarning()
@@ -393,24 +460,25 @@ func startPreparedProjectVM(ram string, cpu string) (port string, returnErr erro
 	// Capture-only VMs use an image override and must not receive project grants.
 	if projectImagePathOverrideForNextBoot == "" {
 		if err := hostLock.lockHostAccess(store, "project host-access startup"); err != nil {
-			return "", err
+			return vmControlEndpoint{}, err
 		}
 		var err error
 		grants, err = store.hostAccess()
 		if err != nil {
-			return "", err
+			return vmControlEndpoint{}, err
 		}
 	}
 	ramValue, _ := resolveRAM(ram)
 	cpuValue, _, err := resolveCPU(cpu)
 	if err != nil {
-		return "", err
+		return vmControlEndpoint{}, err
 	}
 	logInfo("starting prepared project VM", "ram", ramValue, "cpu", cpuValue)
 	backend := vmNetworkBackendHost
-	imagePort, launch, err := bootProjectVM(ramValue, cpuValue, grants)
+	var launch *vmLaunchHandle
+	endpoint, launch, err = bootProjectVM(ramValue, cpuValue, grants)
 	if err != nil {
-		return "", err
+		return vmControlEndpoint{}, err
 	}
 	committed := false
 	defer func() {
@@ -418,37 +486,37 @@ func startPreparedProjectVM(ram string, cpu string) (port string, returnErr erro
 			returnErr = errors.Join(returnErr, launch.cancel())
 		}
 	}()
-	logDebug("waiting for project VM guest readiness", "port", imagePort, "timeout_sec", 90)
+	logDebug("waiting for project VM guest readiness", "vsock_cid", endpoint.VsockCID, "timeout_sec", 90)
 	if err := waitForVMGuestReady(launch, 90*time.Second); err != nil {
-		return "", err
+		return vmControlEndpoint{}, err
 	}
 	startupCtx, cancelStartup := launch.precommitContext()
 	defer cancelStartup()
-	logInfo("project VM is reachable over SSH", "port", imagePort)
+	logInfo("project VM control broker is ready", "vsock_cid", endpoint.VsockCID, "launch_id", endpoint.LaunchID)
 	if backend == vmNetworkBackendHost {
-		if err := applyHostNetworkGuestTransition(startupCtx, imagePort); err != nil {
-			return "", hostTransitionError(err)
+		if err := applyHostNetworkGuestTransition(startupCtx, endpoint); err != nil {
+			return vmControlEndpoint{}, hostTransitionError(err)
 		}
 	}
-	if err := ensureUserSSHAccessContext(startupCtx, imagePort); err != nil {
-		return "", err
+	if err := ensureUserSSHAccessContext(startupCtx, endpoint); err != nil {
+		return vmControlEndpoint{}, err
 	}
-	if err := syncAppliedSetupFirewallToVMContext(startupCtx, imagePort); err != nil {
-		return "", err
+	if err := syncAppliedSetupFirewallToVMContext(startupCtx, endpoint); err != nil {
+		return vmControlEndpoint{}, err
 	}
 	if err := startupCtx.Err(); err != nil {
-		return "", fmt.Errorf("VM precommit startup deadline or supervisor exit: %w", err)
+		return vmControlEndpoint{}, fmt.Errorf("VM precommit startup deadline or supervisor exit: %w", err)
 	}
 	if err := launch.commit(); err != nil {
-		return "", err
+		return vmControlEndpoint{}, err
 	}
 	committed = true
 	if projectImagePathOverrideForNextBoot == "" {
-		if err := activateHostAccess(store, imagePort, grants, hostLock); err != nil {
+		if err := activateHostAccess(store, endpoint, grants, hostLock); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: VM started, but saved host-access activation is incomplete: %v; inspect with 'zaigr project host-access show'\n", err)
 		}
 	}
-	return imagePort, nil
+	return endpoint, nil
 }
 
 func cmdVMShell(ram string, cpu string, preset string, setups []string, root bool, fullNetwork bool) error {
@@ -507,24 +575,24 @@ func cmdVMShell(ram string, cpu string, preset string, setups []string, root boo
 	}
 
 	if running != nil {
-		logDebug("shell will attach to existing project VM", "port", running.Port)
+		logDebug("shell will attach to existing project VM", "vsock_cid", running.Endpoint.VsockCID, "launch_id", running.Endpoint.LaunchID)
 		filteredSetupDefs, skippedApplied, err := filterSetupDefinitionsByStoredState(setupDefs)
 		if err != nil {
 			return err
 		}
 		printSkippedAppliedSetups(skippedApplied)
 		run := func() error {
-			return cmdVMShellRunning(running.Port, presetDef, runScript, filteredSetupDefs, root, lock)
+			return cmdVMShellRunning(running.Endpoint, presetDef, runScript, filteredSetupDefs, root, lock)
 		}
 		if fullNetwork {
 			if err := markCurrentProjectImageDirty("root-shell", "zaigr shell --root --full-network"); err != nil {
 				return err
 			}
-			return withMaintenanceNetworkSession(currentProjectStore(), running.Port, "zaigr shell --root --full-network", func(namespace string) error {
+			return withMaintenanceNetworkSession(currentProjectStore(), running.Endpoint, "zaigr shell --root --full-network", func(namespace string) error {
 				if err := lock.release(); err != nil {
 					return fmt.Errorf("release project lock before maintenance shell: %w", err)
 				}
-				return runMaintenanceProjectSSH(running.Port, namespace)
+				return runMaintenanceProjectSSH(running.Endpoint, namespace)
 			})
 		}
 		return run()
@@ -542,7 +610,7 @@ func cmdVMShell(ram string, cpu string, preset string, setups []string, root boo
 		}
 	}
 
-	imagePort, err := startPreparedProjectVM(ram, cpu)
+	endpoint, err := startPreparedProjectVM(ram, cpu)
 	if err != nil {
 		return err
 	}
@@ -552,22 +620,22 @@ func cmdVMShell(ram string, cpu string, preset string, setups []string, root boo
 	run := func() error {
 		if len(runScript) > 0 {
 			logDebug("running preset script in project VM", "root", root)
-			return runPresetInVM(imagePort, presetDef.Name, runScript)
+			return runPresetInVM(endpoint, presetDef.Name, runScript)
 		}
 		if err := lock.release(); err != nil {
 			return fmt.Errorf("release project startup lock before interactive shell: %w", err)
 		}
-		return execProjectShell(imagePort, root)
+		return execProjectShell(endpoint, root)
 	}
 	if fullNetwork {
 		if err := markCurrentProjectImageDirty("root-shell", "zaigr shell --root --full-network"); err != nil {
 			return err
 		}
-		return withMaintenanceNetworkSession(currentProjectStore(), imagePort, "zaigr shell --root --full-network", func(namespace string) error {
+		return withMaintenanceNetworkSession(currentProjectStore(), endpoint, "zaigr shell --root --full-network", func(namespace string) error {
 			if err := lock.release(); err != nil {
 				return fmt.Errorf("release project lock before maintenance shell: %w", err)
 			}
-			return runMaintenanceProjectSSH(imagePort, namespace)
+			return runMaintenanceProjectSSH(endpoint, namespace)
 		})
 	}
 	return run()
@@ -681,9 +749,9 @@ func confirmRootAccessMarksDirtyProjectImage(action string) bool {
 	return strings.EqualFold(strings.TrimSpace(answer), "y") || strings.EqualFold(strings.TrimSpace(answer), "yes")
 }
 
-func cmdVMShellRunning(port string, presetDef *presetDefinition, runScript []byte, setupDefs []setupDefinition, root bool, lock *projectMutationLock) error {
+func cmdVMShellRunning(endpoint vmControlEndpoint, presetDef *presetDefinition, runScript []byte, setupDefs []setupDefinition, root bool, lock *projectMutationLock) error {
 	if len(setupDefs) > 0 {
-		if err := applySetupDefinitionsToVM(port, setupDefs); err != nil {
+		if err := applySetupDefinitionsToVM(endpoint, setupDefs); err != nil {
 			return err
 		}
 	}
@@ -692,19 +760,19 @@ func cmdVMShellRunning(port string, presetDef *presetDefinition, runScript []byt
 	}
 
 	if len(runScript) > 0 {
-		return runPresetInVM(port, presetDef.Name, runScript)
+		return runPresetInVM(endpoint, presetDef.Name, runScript)
 	}
 	if lock != nil {
 		if err := lock.release(); err != nil {
 			return fmt.Errorf("release project startup lock before interactive shell: %w", err)
 		}
 	}
-	return execProjectShell(port, root)
+	return execProjectShell(endpoint, root)
 }
 
-func execProjectShell(port string, root bool) error {
+func execProjectShell(endpoint vmControlEndpoint, root bool) error {
 	if !root {
-		return runProjectSSH(port, false)
+		return runProjectSSH(endpoint, false)
 	}
 
 	_, _, err := ensureRootSSHKey()
@@ -717,12 +785,12 @@ func execProjectShell(port string, root bool) error {
 		if err := markCurrentProjectImageDirty("root-shell", "zaigr shell --root"); err != nil {
 			return err
 		}
-		return runProjectSSH(port, true)
+		return runProjectSSH(endpoint, true)
 	}
 	if err := markCurrentProjectImageDirty("root-shell", "zaigr shell --root"); err != nil {
 		return err
 	}
-	return runProjectSSH(port, true)
+	return runProjectSSH(endpoint, true)
 }
 
 func syncPresetSelection(presetDef *presetDefinition) error {
@@ -732,20 +800,20 @@ func syncPresetSelection(presetDef *presetDefinition) error {
 	return currentProjectStore().writePresetSelection(presetDef.Name, presetDef.Version)
 }
 
-func bootProjectVM(ram string, cpu string, grants hostAccessGrants) (string, *vmLaunchHandle, error) {
+func bootProjectVM(ram string, cpu string, grants hostAccessGrants) (vmControlEndpoint, *vmLaunchHandle, error) {
 	store := currentProjectStore()
 	logDebug("booting project VM", "store", store.Path, "ram", ram, "cpu", cpu)
 	if err := requireKVMAccess(); err != nil {
-		return "", nil, err
+		return vmControlEndpoint{}, nil, err
 	}
 
 	kernelPath, err := ensureKernel(false)
 	if err != nil {
-		return "", nil, err
+		return vmControlEndpoint{}, nil, err
 	}
 
 	if err := os.MkdirAll(store.Path, 0755); err != nil {
-		return "", nil, fmt.Errorf("create store dir: %w", err)
+		return vmControlEndpoint{}, nil, fmt.Errorf("create store dir: %w", err)
 	}
 
 	disk := store.disk()
@@ -753,7 +821,7 @@ func bootProjectVM(ram string, cpu string, grants hostAccessGrants) (string, *vm
 		disk = defaultDiskSize
 	}
 	if err := os.WriteFile(store.configPath(), []byte(fmt.Sprintf("disk=%s\n", disk)), 0644); err != nil {
-		return "", nil, fmt.Errorf("store default disk: %w", err)
+		return vmControlEndpoint{}, nil, fmt.Errorf("store default disk: %w", err)
 	}
 
 	imgPath := store.authoritativeImagePath()
@@ -762,58 +830,40 @@ func bootProjectVM(ram string, cpu string, grants hostAccessGrants) (string, *vm
 			logInfo("using project image override for VM boot", "expected", imgPath, "image", projectImagePathOverrideForNextBoot)
 			imgPath = projectImagePathOverrideForNextBoot
 		} else if !os.IsNotExist(overrideErr) {
-			return "", nil, fmt.Errorf("stat project image override: %w", overrideErr)
+			return vmControlEndpoint{}, nil, fmt.Errorf("stat project image override: %w", overrideErr)
 		}
 	}
 	if _, err := os.Stat(imgPath); err != nil {
-		return "", nil, fmt.Errorf("project image cannot be found: %s", filepath.Base(imgPath))
+		return vmControlEndpoint{}, nil, fmt.Errorf("project image cannot be found: %s", filepath.Base(imgPath))
 	}
-
-	sshPort := ""
-	for attempt := 0; attempt < 32; attempt++ {
-		ln, err := net.Listen("tcp4", "127.0.0.1:0")
-		if err != nil {
-			return "", nil, fmt.Errorf("allocate SSH port: %w", err)
-		}
-		port := ln.Addr().(*net.TCPAddr).Port
-		_ = ln.Close()
-		if !hostAccessPortReserved(grants, port) {
-			sshPort = fmt.Sprint(port)
-			break
-		}
-	}
-	if sshPort == "" {
-		return "", nil, fmt.Errorf("cannot allocate management port outside saved host-access ports")
-	}
-	logDebug("project VM SSH port is available", "port", sshPort)
 	if err := store.ensureAgentStateDir(); err != nil {
-		return "", nil, err
+		return vmControlEndpoint{}, nil, err
 	}
 
 	_, rootPubKey, err := ensureRootSSHKey()
 	if err != nil {
-		return "", nil, fmt.Errorf("ensure root SSH key: %w", err)
+		return vmControlEndpoint{}, nil, fmt.Errorf("ensure root SSH key: %w", err)
 	}
-	userKeyPath, userPubKey, err := ensureUserSSHKey()
+	_, userPubKey, err := ensureUserSSHKey()
 	if err != nil {
-		return "", nil, fmt.Errorf("ensure user SSH key: %w", err)
+		return vmControlEndpoint{}, nil, fmt.Errorf("ensure user SSH key: %w", err)
 	}
 
 	qemuPath, err := exec.LookPath("qemu-system-x86_64")
 	if err != nil {
-		return "", nil, fmt.Errorf("qemu not found: %w", err)
+		return vmControlEndpoint{}, nil, fmt.Errorf("qemu not found: %w", err)
 	}
 	virtiofsdPath, err := ensureVirtiofsdWithWriter(false, io.Discard)
 	if err != nil {
-		return "", nil, fmt.Errorf("extract virtiofsd: %w", err)
+		return vmControlEndpoint{}, nil, fmt.Errorf("extract virtiofsd: %w", err)
 	}
 	workspace, err := os.Getwd()
 	if err != nil {
-		return "", nil, fmt.Errorf("resolve workspace export: %w", err)
+		return vmControlEndpoint{}, nil, fmt.Errorf("resolve workspace export: %w", err)
 	}
 	launchID, err := newVMLaunchID()
 	if err != nil {
-		return "", nil, err
+		return vmControlEndpoint{}, nil, err
 	}
 
 	format := "qcow2"
@@ -821,15 +871,13 @@ func bootProjectVM(ram string, cpu string, grants hostAccessGrants) (string, *vm
 	workspaceSock := filepath.Join(socketDir, "workspace.sock")
 	agentStateSock := filepath.Join(socketDir, "agent-state.sock")
 	if err := validateHostNetworkExport(workspace, store.agentStateDir(), store.Path, zaigDir(), store.runtimeDir()); err != nil {
-		return "", nil, err
+		return vmControlEndpoint{}, nil, err
 	}
-	args := buildQEMUArgsWithContext(imgPath, kernelPath, format, false, ram, cpu, sshPort, rootPubKey, userPubKey, store.hostname(), store.monitorSockPath(), store.agentStateDir(), workspace, store.serialLogPath(), workspaceSock, agentStateSock)
-	args = append(args, hostAccessQEMUDevices(grants)...)
 	diskSize := store.disk()
 
 	guestUID, guestGID, err := readGuestIdentityFromImage(imgPath)
 	if err != nil {
-		return "", nil, err
+		return vmControlEndpoint{}, nil, err
 	}
 	spec := vmLaunchSpec{
 		Store: store.Path, LogRoot: store.Path, RuntimeDir: store.runtimeDir(),
@@ -845,123 +893,55 @@ func bootProjectVM(ram string, cpu string, grants hostAccessGrants) (string, *vm
 		SocketDir:           socketDir,
 		Workspace:           workspace,
 		AgentState:          store.agentStateDir(), Virtiofsd: virtiofsdPath,
-		SerialLog: store.serialLogPath(), SSHPort: sshPort, Mode: "detached",
+		SerialLog: store.serialLogPath(), RootSSHKeyPath: rootSSHKeyPath(), UserSSHKeyPath: userSSHKeyPath(), Mode: "detached",
 		LaunchID: launchID, NetworkBackend: vmNetworkBackendHost, GuestUID: guestUID, GuestGID: guestGID,
-		QEMUPath: qemuPath, QEMUArgs: args[1:],
+		QEMUPath: qemuPath,
 	}
-	launch, err := launchSupervisedVM(spec)
+	args := buildQEMUArgsWithContext(imgPath, kernelPath, format, false, ram, cpu, 3, rootPubKey, userPubKey, store.hostname(), store.monitorSockPath(), store.agentStateDir(), workspace, store.serialLogPath(), workspaceSock, agentStateSock)
+	args = append(args, hostAccessQEMUDevices(grants)...)
+	spec.QEMUArgs = args[1:]
+	endpoint, launch, err := launchSupervisedVMWithCIDRetry(spec)
 	if err != nil {
-		return "", nil, err
+		return vmControlEndpoint{}, nil, err
 	}
 	fmt.Printf(":: Booting VM (kernel=%s, rootfs=%s, ram=%sMB, cpu=%s, disk=%s)\n",
 		filepath.Base(kernelPath), filepath.Base(imgPath), ram, cpu, diskSize)
-	fmt.Printf(":: SSH: ssh -i %s -p %s user@localhost\n", userKeyPath, sshPort)
-	logInfo("starting qemu", "kernel", kernelPath, "image", imgPath, "port", sshPort, "monitor_sock", store.monitorSockPath())
-	return sshPort, launch, nil
+	logInfo("starting qemu", "kernel", kernelPath, "image", imgPath, "vsock_cid", endpoint.VsockCID, "launch_id", launchID, "monitor_sock", store.monitorSockPath())
+	return endpoint, launch, nil
 }
 
-// execProjectSSH connects to the running VM over SSH.
-func execProjectSSH(port string, root bool) error {
-	args, err := projectSSHArgs(port, root)
-	if err != nil {
-		return err
-	}
-	sshPath, err := exec.LookPath("ssh")
-	if err != nil {
-		return fmt.Errorf("ssh not found: %w", err)
-	}
-	cleanup, err := writeShellSessionMarker(currentProjectStore(), os.Getpid(), root, port)
-	if err != nil {
-		return fmt.Errorf("track shell session: %w", err)
-	}
-	if err := syscall.Exec(sshPath, args, os.Environ()); err != nil {
-		cleanup()
-		return err
-	}
-	return nil
+// execProjectSSH attaches an interactive shell through the launch-owned broker.
+func execProjectSSH(endpoint vmControlEndpoint, root bool) error {
+	return runProjectSSH(endpoint, root)
 }
 
-func runProjectSSH(port string, root bool) error {
-	args, err := projectSSHArgs(port, root)
-	if err != nil {
-		return err
+func runProjectSSH(endpoint vmControlEndpoint, root bool) error {
+	user := "user"
+	if root {
+		user = "root"
 	}
-
-	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	cleanup, err := writeShellSessionMarker(currentProjectStore(), cmd.Process.Pid, root, port)
+	cleanup, err := writeShellSessionMarker(currentProjectStore(), os.Getpid(), root, endpoint)
 	if err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
 		return fmt.Errorf("track shell session: %w", err)
 	}
 	defer cleanup()
-	return cmd.Wait()
+	return vmssh.RunInteractive(context.Background(), endpoint.SocketPath, user, "", os.Stdin, os.Stdout, os.Stderr)
 }
 
-func runMaintenanceProjectSSH(port, namespace string) error {
-	args, err := projectSSHArgs(port, true)
-	if err != nil {
-		return err
-	}
+func runMaintenanceProjectSSH(endpoint vmControlEndpoint, namespace string) error {
 	if !validHostPolicyScopeID(strings.TrimPrefix(namespace, "zaigr-maint-")) {
 		return errors.New("invalid maintenance network namespace")
 	}
-	destination := args[len(args)-1]
-	args = append(args[:len(args)-1], "-t", destination, "ip netns exec "+singleQuotedArg(namespace)+" bash --login")
-	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	cleanup, err := writeShellSessionMarker(currentProjectStore(), cmd.Process.Pid, true, port)
+	cleanup, err := writeShellSessionMarker(currentProjectStore(), os.Getpid(), true, endpoint)
 	if err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
 		return fmt.Errorf("track maintenance shell session: %w", err)
 	}
 	defer cleanup()
-	return cmd.Wait()
+	command := "ip netns exec " + singleQuotedArg(namespace) + " bash --login"
+	return vmssh.RunInteractive(context.Background(), endpoint.SocketPath, "root", command, os.Stdin, os.Stdout, os.Stderr)
 }
 
-func projectSSHArgs(port string, root bool) ([]string, error) {
-	user := "user"
-	keyPath := userSSHKeyPath()
-	if root {
-		user = "root"
-		keyPath = rootSSHKeyPath()
-	} else if err := ensureUserSSHAccess(port); err != nil {
-		return nil, err
-	}
-	if _, err := os.Stat(keyPath); err != nil {
-		return nil, fmt.Errorf("%s SSH key not found: %s", user, keyPath)
-	}
-	logInfo("executing interactive SSH session", "port", port, "user", user)
-
-	args := append([]string{"ssh"},
-		sshManagedOptions()...,
-	)
-	args = append(args,
-		"-o", "AddressFamily=inet",
-		"-o", sshConnectTimeoutOption,
-		"-o", "PasswordAuthentication=no",
-		"-o", "PubkeyAuthentication=yes",
-		"-o", "PreferredAuthentications=publickey",
-		"-o", "KbdInteractiveAuthentication=no",
-		"-o", "ChallengeResponseAuthentication=no",
-		"-o", "IdentitiesOnly=yes",
-		"-i", keyPath,
-	)
-	args = append(args, "-p", port, fmt.Sprintf("%s@localhost", user))
-	return args, nil
-}
-
-func buildQEMUArgsWithContext(imagePath, kernelPath, format string, snapshot bool, ram string, cpus string, sshPort string, rootPubKey string, userPubKey string, vmHostname string, monitorSock string, agentStateDir string, workspace string, serialLog string, workspaceSock string, agentStateSock string) []string {
+func buildQEMUArgsWithContext(imagePath, kernelPath, format string, snapshot bool, ram string, cpus string, vsockCID uint32, rootPubKey string, userPubKey string, vmHostname string, monitorSock string, agentStateDir string, workspace string, serialLog string, workspaceSock string, agentStateSock string) []string {
 	hostLaunchEpoch := time.Now().Unix()
 	appendParts := []string{
 		"console=ttyS0",
@@ -969,6 +949,7 @@ func buildQEMUArgsWithContext(imagePath, kernelPath, format string, snapshot boo
 		"rw",
 		"init=/usr/lib/systemd/systemd",
 		"systemd.unit=multi-user.target",
+		"systemd.ssh_auto=no",
 		"panic=-1",
 		"quiet",
 		fmt.Sprintf("zaigr.host-epoch=%d", hostLaunchEpoch),
@@ -1012,6 +993,7 @@ func buildQEMUArgsWithContext(imagePath, kernelPath, format string, snapshot boo
 		"-device", "virtio-net-device,netdev=net0",
 		"-netdev", maintenanceNetdev,
 		"-device", "virtio-net-device,netdev=maintenance,mac=52:54:00:5a:47:52",
+		"-device", fmt.Sprintf("vhost-vsock-device,guest-cid=%d", vsockCID),
 	}
 
 	if snapshot {

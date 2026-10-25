@@ -66,6 +66,9 @@ DISTROS = {
 
 # Baseline packages in prepared distro images. slirp4netns remains installed
 # here so acceptance tests can cover both system-package states by removing it.
+# This is the prepared outer test VM's baseline package set, not Zaigr's
+# install prerequisites. The controller's SSH/scp/keygen live outside that VM;
+# product commands inside it use a restricted PATH without host OpenSSH tools.
 GUEST_PACKAGES = (
     "coreutils", "e2fsprogs", "openssh-client", "qemu-system-x86",
     "qemu-utils", "slirp4netns", "util-linux",
@@ -597,6 +600,27 @@ ssh_pwauth: false
         except subprocess.TimeoutExpired:
             pytest.fail(f"Timed out after {timeout}s running in {self.distro}: {command}\nserial log tail:\n{_tail(self.serial_log)}")
 
+    def zaigr_path_without_host_tools(self, user="user"):
+        """Prepare a product PATH without host SSH or privilege helper tools."""
+        path = "/tmp/zaigr-product-path-" + uuid.uuid4().hex
+        setup = (
+            "set -eu; restricted=" + shlex.quote(path) + "; mkdir -m 0755 \"$restricted\"; "
+            "for directory in /home/user/.local/bin /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do "
+            "[ -d \"$directory\" ] || continue; for executable in \"$directory\"/*; do "
+            "[ -x \"$executable\" ] || continue; name=${executable##*/}; "
+            "case \"$name\" in ssh|ssh-keygen|truncate|setpriv|unshare|slirp4netns) continue;; esac; "
+            "ln -s \"$executable\" \"$restricted/$name\" 2>/dev/null || true; done; done; "
+            "for tool in ssh ssh-keygen truncate setpriv; do "
+            "if PATH=\"$restricted\" command -v \"$tool\" >/dev/null 2>&1; then "
+            "printf 'unexpected product host tool: %s\\n' \"$tool\" >&2; exit 1; fi; done; "
+            "printf '%s\\n' \"$restricted\""
+        )
+        stdout, stderr, rc = self.run(setup, timeout=45, user=user)
+        assert rc == 0, f"could not prepare restricted product PATH:\n{stdout}{stderr}"
+        restricted_path = stdout.strip()
+        assert restricted_path == path
+        return restricted_path
+
     def ssh_command(self, command="bash -l", timeout=120, user=None, cwd=None, env=None):
         """Run a raw interactive SSH command for tests that explicitly need a live shell."""
         remote = self._remote_command(command, cwd=cwd, env=env, user=user)
@@ -664,47 +688,40 @@ done
         except OSError as error:
             return f"could not save guest diagnostics before SSH probe ({error})"
 
-        # Probe only the first candidate nested project VM, after the useful
-        # guest logs have been saved by the command above. Keep this to one
-        # probe and bound it independently so a wedged nested SSH cannot hide
-        # the diagnostic output or extend failure reporting indefinitely.
+        # Use the public CLI for failure-only nested-VM observations. The two
+        # known project directories cover the install acceptance workflows;
+        # neither probe runs on the success path. Keep the guest command and
+        # firewall status query within the remaining diagnostic time budget.
         probe_script = r"""
 set +e
-port_file=$(find /home/user/.zaigr /home/uid-host/.zaigr /tmp/zaigr-home/.zaigr \
-  -type f -name ssh-port -printf '%T@ %p\n' 2>/dev/null \
-  | sort -rn | head -n 1 | cut -d' ' -f2-)
-if [ -n "$port_file" ]; then
-  case "$port_file" in
-    /home/user/.zaigr/*) base=/home/user/.zaigr ;;
-    /home/uid-host/.zaigr/*) base=/home/uid-host/.zaigr ;;
-    /tmp/zaigr-home/.zaigr/*) base=/tmp/zaigr-home/.zaigr ;;
-    *) printf 'unexpected nested SSH port path: %s\n' "$port_file"; exit 0 ;;
-  esac
-  [ -f "$base/root-ssh.key" ] || { printf 'root SSH key missing under %s\n' "$base"; exit 0; }
-  port=$(cat "$port_file" 2>/dev/null)
-  case "$port" in ''|*[!0-9]*) printf 'invalid nested SSH port in %s\n' "$port_file"; exit 0 ;; esac
-  printf 'probing nested project SSH on 127.0.0.1:%s using key path %s/root-ssh.key\n' "$port" "$base"
-  timeout 8s ssh -vv -F /dev/null -o AddressFamily=inet -o BatchMode=yes \
-    -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null -i "$base/root-ssh.key" \
-    -p "$port" root@127.0.0.1 true
-  printf 'nested SSH probe exit: %s\n' "$?"
-else
-  printf '%s\n' 'no nested project SSH port found in known product bases'
-fi
+product=/home/user/.local/bin/zaigr
+[ -x "$product" ] || product=/usr/bin/zaigr
+for project in /home/user/project /home/user/zaigr-install-project; do
+  [ -x "$product" ] && [ -d "$project" ] || continue
+  printf '=== public project vm exec from %s ===\n' "$project"
+  cd "$project" || continue
+  printf '%s\n' '=== public project firewall show ==='
+  timeout 2s "$product" project firewall show 2>&1
+  printf 'project firewall show exit: %s\n' "$?"
+  timeout 6s "$product" project vm exec -- sh -c \
+    'echo "--- guest addresses ---"; ip -brief address; echo "--- guest routes ---"; ip route; echo "--- resolver ---"; cat /etc/resolv.conf; echo "--- deb.debian.org lookup ---"; timeout 2s getent ahostsv4 deb.debian.org; echo "--- guest TCP sockets ---"; ss -tnpi' 2>&1
+  printf 'project vm exec exit: %s\n' "$?"
+  exit 0
+done
+printf '%s\n' 'no known install-test project directory is available for public CLI diagnostics'
 """
         try:
             probe_timeout = max(0.1, min(9, 25 - (time.monotonic() - diagnostics_started)))
             probe_out, probe_err, probe_rc = run(
-                self.ssh + ["sudo sh -c " + shlex.quote(probe_script)],
+                self.ssh + ["sh -c " + shlex.quote(probe_script)],
                 timeout=probe_timeout,
-                context=f"cloudvm probe nested project SSH ({self.distro})",
+                context=f"cloudvm probe public project CLI ({self.distro})",
             )
-            content += f"\n=== nested project SSH probe (outer exit {probe_rc}) ===\n{probe_out}\n{probe_err}"
+            content += f"\n=== public project CLI diagnostics (outer exit {probe_rc}) ===\n{probe_out}\n{probe_err}"
         except subprocess.TimeoutExpired as error:
-            content += f"\n=== nested project SSH probe timed out after {probe_timeout:.1f} seconds ===\n{error.stdout or ''}\n{error.stderr or ''}"
+            content += f"\n=== public project CLI diagnostics timed out after {probe_timeout:.1f} seconds ===\n{error.stdout or ''}\n{error.stderr or ''}"
         except OSError as error:
-            content += f"\n=== nested project SSH probe unavailable ===\n{error}\n"
+            content += f"\n=== public project CLI diagnostics unavailable ===\n{error}\n"
         try:
             path.write_text(content, encoding="utf-8")
             path.chmod(0o600)

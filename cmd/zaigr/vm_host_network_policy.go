@@ -447,17 +447,13 @@ func buildCaplessHostDNSFrontend(ctx context.Context, executable, ipcPath string
 	if executable == "" {
 		return nil, nil, nil, errors.New("host DNS: executable path is required")
 	}
-	setpriv, err := exec.LookPath("setpriv")
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("host DNS: setpriv is required to drop frontend capabilities: %w", err)
-	}
 	readyRead, readyWrite, err := os.Pipe()
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("host DNS: create frontend readiness pipe: %w", err)
 	}
-	cmd := exec.CommandContext(ctx, setpriv,
-		"--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all", "--no-new-privs", "--",
-		executable, "__host-dns-frontend", "--ipc", ipcPath, "--udp-fd", "3", "--tcp-fd", "4", "--ready-fd", "5")
+	cmd := exec.CommandContext(ctx, executable,
+		"__host-dns-frontend", "--bootstrap-privileges", "--ipc", ipcPath,
+		"--udp-fd", "3", "--tcp-fd", "4", "--ready-fd", "5")
 	cmd.ExtraFiles = []*os.File{udp, tcp, readyWrite}
 	cmd.Stdin = nil
 	cmd.Stdout = nil

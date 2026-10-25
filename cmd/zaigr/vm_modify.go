@@ -17,33 +17,12 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"zaigr/cmd/zaigr/vmssh"
 )
 
-const sshConnectTimeoutOption = "ConnectTimeout=5"
 const setupExecutionTimeout = 30 * time.Minute
 const setupExecutionStartedMarker = "__ZAIGR_SETUP_EXECUTION_STARTED__\n"
-
-func sshManagedOptions() []string {
-	return []string{
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "LogLevel=ERROR",
-	}
-}
-
-func sshPresetOptions() []string {
-	return []string{
-		"-F", "/dev/null",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "LogLevel=ERROR",
-		"-o", "ForwardAgent=no",
-		"-o", "ForwardX11=no",
-		"-o", "ClearAllForwardings=yes",
-		"-o", "Tunnel=no",
-		"-o", "PermitLocalCommand=no",
-	}
-}
 
 type guestSetupExecutionError struct {
 	stepName string
@@ -66,46 +45,28 @@ func guestSetupExecutionStep(err error) string {
 	return ""
 }
 
-func allocateEphemeralSSHPort() (string, error) {
-	ln, err := net.Listen("tcp", ":0")
-	if err != nil {
-		return "", fmt.Errorf("allocate SSH port: %w", err)
-	}
-	port := fmt.Sprintf("%d", ln.Addr().(*net.TCPAddr).Port)
-	_ = ln.Close()
-	return port, nil
+func applyStepsViaSSHWithIntent(imagePath string, steps []string, ram string, cpus string, rootFullNetwork bool, intent *directSetupExecutionIntent) error {
+	return applyStepsViaSSHWithIntentAndAgentState(imagePath, steps, ram, cpus, rootFullNetwork, intent, "")
 }
 
-func applyStepsViaSSHWithIntent(imagePath string, steps []string, ram string, cpus string, sshPort string, rootFullNetwork bool, intent *directSetupExecutionIntent) error {
-	return applyStepsViaSSHWithIntentAndAgentState(imagePath, steps, ram, cpus, sshPort, rootFullNetwork, intent, "")
-}
-
-func applyStepsViaSSHWithIntentAndAgentState(imagePath string, steps []string, ram string, cpus string, sshPort string, rootFullNetwork bool, intent *directSetupExecutionIntent, agentStateDir string) error {
+func applyStepsViaSSHWithIntentAndAgentState(imagePath string, steps []string, ram string, cpus string, rootFullNetwork bool, intent *directSetupExecutionIntent, agentStateDir string) error {
 	store := currentProjectStore()
 	workspace, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("resolve workspace for image modification: %w", err)
 	}
-	return applyStepsViaSSHInContextWithIntent(imagePath, steps, ram, cpus, sshPort, rootFullNetwork, intent, agentStateDir, workspace, store, store.Path)
+	return applyStepsViaSSHInContextWithIntent(imagePath, steps, ram, cpus, rootFullNetwork, intent, agentStateDir, workspace, store, store.Path)
 }
 
-func applyStepsViaSSHInContext(imagePath string, steps []string, ram string, cpus string, sshPort string, rootFullNetwork bool, agentStateDir string, workspace string, store projectStore, logRoot string) error {
-	return applyStepsViaSSHInContextWithIntent(imagePath, steps, ram, cpus, sshPort, rootFullNetwork, nil, agentStateDir, workspace, store, logRoot)
+func applyStepsViaSSHInContext(imagePath string, steps []string, ram string, cpus string, rootFullNetwork bool, agentStateDir string, workspace string, store projectStore, logRoot string) error {
+	return applyStepsViaSSHInContextWithIntent(imagePath, steps, ram, cpus, rootFullNetwork, nil, agentStateDir, workspace, store, logRoot)
 }
 
-func applyStepsViaSSHInContextWithIntent(imagePath string, steps []string, ram string, cpus string, sshPort string, rootFullNetwork bool, intent *directSetupExecutionIntent, agentStateDir string, workspace string, store projectStore, logRoot string) (returnErr error) {
-	logInfo("booting temporary VM to apply image steps", "image", imagePath, "step_count", len(steps), "port", sshPort)
+func applyStepsViaSSHInContextWithIntent(imagePath string, steps []string, ram string, cpus string, rootFullNetwork bool, intent *directSetupExecutionIntent, agentStateDir string, workspace string, store projectStore, logRoot string) (returnErr error) {
+	logInfo("booting temporary VM to apply image steps", "image", imagePath, "step_count", len(steps))
 	kernelPath, err := ensureKernel(false)
 	if err != nil {
 		return err
-	}
-
-	if ln, err := net.Listen("tcp", ":"+sshPort); err != nil {
-		return fmt.Errorf("SSH port %s already in use — another VM is likely running", sshPort)
-	} else {
-		if err := ln.Close(); err != nil {
-			return fmt.Errorf("release SSH port probe: %w", err)
-		}
 	}
 
 	_, rootPubKey, err := ensureRootSSHKey()
@@ -183,10 +144,10 @@ func applyStepsViaSSHInContextWithIntent(imagePath string, steps []string, ram s
 		}
 	}
 	monitorSock := filepath.Join(runtimeDir, "vm.sock")
-	workspaceSock := filepath.Join(runtimeDir, "workspace.sock")
-	agentStateSock := filepath.Join(runtimeDir, "state.sock")
+	var workspaceSock string
+	var agentStateSock string
 	serialLog := filepath.Join(logRoot, "vm-serial.log")
-	args := buildQEMUArgsWithContext(imagePath, kernelPath, "qcow2", false, ram, cpus, sshPort, rootPubKey, userPubKey, store.hostname(), monitorSock, agentStateDir, workspace, serialLog, workspaceSock, agentStateSock)
+	vsockCID := uint32(3) // launchSupervisedVMWithCIDRetry selects the actual CID.
 	qemuPath, err := exec.LookPath("qemu-system-x86_64")
 	if err != nil {
 		return fmt.Errorf("qemu not found: %w", err)
@@ -199,21 +160,27 @@ func applyStepsViaSSHInContextWithIntent(imagePath string, steps []string, ram s
 	if err != nil {
 		return err
 	}
+	socketDir := vmSocketDir(launchID)
+	workspaceSock = filepath.Join(socketDir, "workspace.sock")
+	agentStateSock = filepath.Join(socketDir, "agent-state.sock")
+	args := buildQEMUArgsWithContext(imagePath, kernelPath, "qcow2", false, ram, cpus, vsockCID, rootPubKey, userPubKey, store.hostname(), monitorSock, agentStateDir, workspace, serialLog, workspaceSock, agentStateSock)
 	guestUID, guestGID, err := readGuestIdentityFromImage(imagePath)
 	if err != nil {
 		return err
 	}
 	spec := vmLaunchSpec{
-		Store: runtimeStore.Path, LogRoot: logRoot, RuntimeDir: runtimeDir,
+		Store: runtimeStore.Path, LogRoot: logRoot, RuntimeDir: runtimeDir, SocketDir: socketDir,
 		MonitorSock: monitorSock, WorkspaceSock: workspaceSock, AgentStateSock: agentStateSock,
 		Workspace: workspace, AgentState: agentStateDir, Virtiofsd: virtiofsdPath,
-		SerialLog: serialLog, SSHPort: sshPort, Mode: "attached", LaunchID: launchID,
+		SerialLog: serialLog, VsockCID: vsockCID, RootSSHKeyPath: rootKeyPath, UserSSHKeyPath: userSSHKeyPath(), Mode: "attached", LaunchID: launchID,
 		NetworkBackend: vmNetworkBackendHost, GuestUID: guestUID, GuestGID: guestGID, QEMUPath: qemuPath, QEMUArgs: args[1:],
 	}
 
 	fmt.Println(":: Booting image for modification ...")
 	logDebug("starting qemu for image modification", "kernel", kernelPath, "image", imagePath, "monitor_sock", monitorSock)
-	launch, err := launchSupervisedVM(spec)
+	var endpoint vmControlEndpoint
+	var launch *vmLaunchHandle
+	endpoint, launch, err = launchSupervisedVMWithCIDRetry(spec)
 	if err != nil {
 		return err
 	}
@@ -236,7 +203,7 @@ func applyStepsViaSSHInContextWithIntent(imagePath string, steps []string, ram s
 	defer func() {
 		if committed {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			returnErr = errors.Join(returnErr, sshSyncContext(ctx, sshPort, rootKeyPath))
+			returnErr = errors.Join(returnErr, sshSyncContext(ctx, endpoint))
 			cancel()
 			qmpQuit(monitorSock)
 			returnErr = errors.Join(returnErr, launch.stop())
@@ -248,8 +215,8 @@ func applyStepsViaSSHInContextWithIntent(imagePath string, steps []string, ram s
 		}
 	}()
 
-	fmt.Println(":: Waiting for SSH ...")
-	logDebug("waiting for image-modification VM SSH readiness", "port", sshPort, "timeout_sec", 60)
+	fmt.Println(":: Waiting for guest vsock ...")
+	logDebug("waiting for image-modification VM SSH readiness", "vsock_cid", endpoint.VsockCID, "timeout_sec", 60)
 	if err := waitForVMGuestReady(launch, 60*time.Second); err != nil {
 		return err
 	}
@@ -276,7 +243,7 @@ func applyStepsViaSSHInContextWithIntent(imagePath string, steps []string, ram s
 			if executionStarted {
 				stepIntent = nil
 			}
-			started, err := sshRunSetupScriptUntil(sshPort, rootKeyPath, string(data), executionDeadline, stepIntent)
+			started, err := sshRunSetupScriptUntil(endpoint, string(data), executionDeadline, stepIntent)
 			if started {
 				executionStarted = true
 			}
@@ -318,7 +285,7 @@ func applyStepsViaSSHInContextWithIntent(imagePath string, steps []string, ram s
 			return err
 		}
 	}
-	if err := sshSync(sshPort, rootKeyPath); err != nil {
+	if err := sshSync(endpoint); err != nil {
 		stepName := ""
 		if len(steps) > 0 {
 			stepName = filepath.Base(steps[len(steps)-1])
@@ -335,9 +302,8 @@ func applyStepsViaSSHInContextWithIntent(imagePath string, steps []string, ram s
 	return nil
 }
 
-func waitForStableSSHContext(ctx context.Context, port string, consecutiveSuccesses int) bool {
-	rootKeyPath := filepath.Join(zaigDir(), "root-ssh.key")
-	logDebug("beginning stable SSH wait loop", "port", port, "consecutive_successes", consecutiveSuccesses)
+func waitForStableSSHContext(ctx context.Context, endpoint vmControlEndpoint, consecutiveSuccesses int) bool {
+	logDebug("beginning stable SSH wait loop", "vsock_cid", endpoint.VsockCID, "consecutive_successes", consecutiveSuccesses)
 	successes := 0
 	for i := 0; ctx.Err() == nil; i++ {
 		select {
@@ -345,40 +311,26 @@ func waitForStableSSHContext(ctx context.Context, port string, consecutiveSucces
 			return false
 		case <-time.After(time.Second):
 		}
-		args := append(
-			sshManagedOptions(),
-			"-o", sshConnectTimeoutOption,
-			"-i", rootKeyPath,
-			"-p", port,
-			"root@localhost", "true",
-		)
-		cmd := exec.CommandContext(ctx, "ssh", args...)
-		if cmd.Run() != nil {
+		if runVMGuestCommand(ctx, endpoint, "root", "true", nil, io.Discard, io.Discard) != nil {
 			successes = 0
 			continue
 		}
 		successes++
 		if successes >= consecutiveSuccesses {
-			logDebug("stable SSH wait loop succeeded", "port", port, "attempt", i+1)
+			logDebug("stable SSH wait loop succeeded", "vsock_cid", endpoint.VsockCID, "attempt", i+1)
 			return true
 		}
 	}
-	logWarn("stable SSH wait loop timed out", "port", port)
+	logWarn("stable SSH wait loop timed out", "vsock_cid", endpoint.VsockCID)
 	return false
 }
 
-func sshRunScript(port string, keyPath string, script string) error {
-	cmd := sshRunScriptCommand(port, keyPath, "root", script)
-	return cmd.Run()
+func sshRunScript(endpoint vmControlEndpoint, script string) error {
+	return runVMGuestCommand(context.Background(), endpoint, "root", "bash -eu", strings.NewReader(script), os.Stdout, os.Stderr)
 }
 
-func sshRunControlScriptContext(ctx context.Context, port string, keyPath string, script string) error {
-	cmd := sshRunScriptCommandWithOptions(sshPresetOptions(), port, keyPath, "root", script)
-	cmd = exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
-	cmd.Stdin = strings.NewReader(script)
-	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-	cmd.Env = presetSSHEnvironment()
-	return cmd.Run()
+func sshRunControlScriptContext(ctx context.Context, endpoint vmControlEndpoint, script string) error {
+	return runVMGuestCommand(ctx, endpoint, "root", "bash -eu", strings.NewReader(script), os.Stdout, os.Stderr)
 }
 
 type setupExecutionStartWriter struct {
@@ -430,11 +382,11 @@ func (writer *setupExecutionStartWriter) flush() error {
 	return err
 }
 
-func sshRunSetupScriptUntil(port string, keyPath string, script string, deadline time.Time, intent *directSetupExecutionIntent) (bool, error) {
-	return sshRunSetupScriptInNamespaceUntil(port, keyPath, "", script, deadline, intent)
+func sshRunSetupScriptUntil(endpoint vmControlEndpoint, script string, deadline time.Time, intent *directSetupExecutionIntent) (bool, error) {
+	return sshRunSetupScriptInNamespaceUntil(endpoint, "", script, deadline, intent)
 }
 
-func sshRunSetupScriptInNamespaceUntil(port string, keyPath string, namespace string, script string, deadline time.Time, intent *directSetupExecutionIntent) (bool, error) {
+func sshRunSetupScriptInNamespaceUntil(endpoint vmControlEndpoint, namespace string, script string, deadline time.Time, intent *directSetupExecutionIntent) (bool, error) {
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
 		return false, fmt.Errorf("setup execution timed out after %s", setupExecutionTimeout)
@@ -451,25 +403,15 @@ func sshRunSetupScriptInNamespaceUntil(port string, keyPath string, namespace st
 	remoteSeconds := int64((remaining + time.Second - 1) / time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), remaining+15*time.Second)
 	defer cancel()
-	args := append(sshManagedOptions(), "-o", sshConnectTimeoutOption)
-	if keyPath != "" {
-		args = append(args, "-i", keyPath)
-	}
-	remote := []string{"timeout", "--signal=TERM", "--kill-after=10s", strconv.FormatInt(remoteSeconds, 10) + "s", "bash", "-eu"}
+	remote := "timeout --signal=TERM --kill-after=10s " + strconv.FormatInt(remoteSeconds, 10) + "s bash -eu"
 	if namespace != "" {
 		if !validHostPolicyScopeID(strings.TrimPrefix(namespace, "zaigr-maint-")) {
 			return false, errors.New("invalid maintenance namespace")
 		}
-		remote = append([]string{"ip", "netns", "exec", namespace}, remote...)
+		remote = "ip netns exec " + singleQuotedArg(namespace) + " " + remote
 	}
-	args = append(args, "-p", port, "root@localhost")
-	args = append(args, remote...)
-	cmd := exec.CommandContext(ctx, "ssh", args...)
-	cmd.Stdin = strings.NewReader(script)
 	startWriter := &setupExecutionStartWriter{destination: os.Stdout}
-	cmd.Stdout = startWriter
-	cmd.Stderr = os.Stderr
-	err := cmd.Run()
+	err := runVMGuestCommand(ctx, endpoint, "root", remote, strings.NewReader(script), startWriter, os.Stderr)
 	flushErr := startWriter.flush()
 	started := startWriter.started.Load()
 	if err == nil && flushErr != nil {
@@ -478,11 +420,12 @@ func sshRunSetupScriptInNamespaceUntil(port string, keyPath string, namespace st
 	if ctx.Err() != nil {
 		return started, fmt.Errorf("setup execution timed out after %s", setupExecutionTimeout)
 	}
-	if exitErr, ok := err.(*exec.ExitError); ok {
-		if exitErr.ExitCode() == 124 || (exitErr.ExitCode() == 137 && !time.Now().Before(deadline)) {
+	var exitErr *vmssh.ExitError
+	if errors.As(err, &exitErr) {
+		if exitErr.Status == 124 || (exitErr.Status == 137 && !time.Now().Before(deadline)) {
 			return started, fmt.Errorf("setup execution timed out after %s", setupExecutionTimeout)
 		}
-		if exitErr.ExitCode() == 137 {
+		if exitErr.Status == 137 {
 			return started, fmt.Errorf(
 				"setup execution exited with status 137 before the %s timeout elapsed; the guest may have killed it due to low memory: %w",
 				setupExecutionTimeout,
@@ -493,222 +436,56 @@ func sshRunSetupScriptInNamespaceUntil(port string, keyPath string, namespace st
 	return started, err
 }
 
-func sshSync(port string, keyPath string) error {
+func sshSync(endpoint vmControlEndpoint) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return sshSyncContext(ctx, port, keyPath)
+	return sshSyncContext(ctx, endpoint)
 }
 
-func sshSyncContext(ctx context.Context, port string, keyPath string) error {
-	args := append(
-		sshManagedOptions(),
-		"-o", sshConnectTimeoutOption,
-		"-i", keyPath,
-		"-p", port,
-		"root@localhost", "sync",
-	)
-	cmd := exec.CommandContext(ctx, "ssh", args...)
-	return cmd.Run()
+func sshSyncContext(ctx context.Context, endpoint vmControlEndpoint) error {
+	return runVMGuestCommand(ctx, endpoint, "root", "sync", nil, io.Discard, io.Discard)
 }
 
-func sshRunScriptCommand(port string, keyPath string, user string, script string) *exec.Cmd {
-	return sshRunScriptCommandWithOptions(sshManagedOptions(), port, keyPath, user, script)
+func sshRunCommandWithExitStatus(endpoint vmControlEndpoint, user string, command string) error {
+	return sshRunCommandWithExitStatusContext(context.Background(), endpoint, user, command)
 }
 
-func sshRunScriptCommandWithOptions(options []string, port string, keyPath string, user string, script string) *exec.Cmd {
-	args := append([]string{}, options...)
-	args = append(args, "-o", sshConnectTimeoutOption)
-	keyPath = sshKeyPathForUser(keyPath, user)
-	if keyPath != "" {
-		args = append(args, "-o", "IdentitiesOnly=yes", "-i", keyPath)
-	}
-	args = append(args, "-p", port, user+"@localhost", "bash", "-eu")
-
-	cmd := exec.Command("ssh", args...)
-	cmd.Stdin = strings.NewReader(script)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd
+func sshRunCommandWithExitStatusContext(ctx context.Context, endpoint vmControlEndpoint, user string, command string) error {
+	err := runVMGuestCommand(ctx, endpoint, user, "bash -eu -c "+singleQuotedArg(command), os.Stdin, os.Stdout, os.Stderr)
+	return vmSSHExitError(err)
 }
 
-func sshRunCommandWithExitStatus(port string, keyPath string, user string, command string) error {
-	return sshRunCommandWithExitStatusContext(context.Background(), port, keyPath, user, command)
+func ensureUserSSHAccess(endpoint vmControlEndpoint) error {
+	return ensureUserSSHAccessContext(context.Background(), endpoint)
 }
 
-func sshRunCommandWithExitStatusContext(ctx context.Context, port string, keyPath string, user string, command string) error {
-	if user == "user" {
-		if err := ensureUserSSHAccessContext(ctx, port); err != nil {
-			return err
-		}
-	}
-	cmd := sshRunCommandCommand(port, keyPath, user, command)
-	cmd = exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if err := cmd.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			if code := exitErr.ExitCode(); code >= 0 {
-				return exitError(code)
-			}
-		}
-		return err
+func ensureUserSSHAccessContext(ctx context.Context, endpoint vmControlEndpoint) error {
+	if err := runVMGuestCommand(ctx, endpoint, "user", "true", nil, io.Discard, io.Discard); err != nil {
+		return fmt.Errorf("user SSH identity is unavailable; stop the VM and run 'zaigr project rebuild': %w", err)
 	}
 	return nil
 }
 
-func ensureUserSSHAccess(port string) error {
-	return ensureUserSSHAccessContext(context.Background(), port)
+func sshReadCommand(endpoint vmControlEndpoint, user string, command string) ([]byte, error) {
+	return sshReadCommandContext(context.Background(), endpoint, user, command)
 }
 
-func ensureUserSSHAccessContext(ctx context.Context, port string) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	userKeyPath, userPubKey, err := ensureUserSSHKey()
-	if err != nil {
-		return fmt.Errorf("prepare user SSH key: %w", err)
-	}
-	if userSSHKeyWorksContext(ctx, port, userKeyPath) {
-		return nil
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	rootKeyPath, _, err := ensureRootSSHKey()
-	if err != nil {
-		return fmt.Errorf("prepare root SSH key for legacy user access: %w", err)
-	}
-	runtimeKind, err := sshReadCommandContext(
-		ctx,
-		port,
-		rootKeyPath,
-		"root",
-		"if test -x /usr/local/lib/zaigr/run-preset-isolated; then printf current; else printf legacy; fi",
-	)
-	if err != nil {
-		return fmt.Errorf("inspect VM runtime for user SSH access: %w", err)
-	}
-	if strings.TrimSpace(string(runtimeKind)) != "legacy" {
-		return fmt.Errorf("VM rejected the managed user SSH key")
-	}
-
-	encodedKey := base64.StdEncoding.EncodeToString([]byte(userPubKey))
-	installCommand := "" +
-		"for path in /etc/zaigr /etc/zaigr/ssh; do\n" +
-		"  if test -L \"$path\" || { test -e \"$path\" && ! test -d \"$path\"; }; then\n" +
-		"    printf 'unsafe legacy SSH migration path: %s\\n' \"$path\" >&2\n" +
-		"    exit 1\n" +
-		"  fi\n" +
-		"done\n" +
-		"install -d -o root -g root -m 0755 /etc/zaigr /etc/zaigr/ssh\n" +
-		"key_tmp=\"$(mktemp /etc/zaigr/ssh/.user-authorized-keys.XXXXXX)\"\n" +
-		"config_tmp=\"$(mktemp /etc/ssh/sshd_config.d/.00-zaigr-managed-keys.XXXXXX)\"\n" +
-		"trap 'rm -f \"$key_tmp\" \"$config_tmp\"' EXIT\n" +
-		"printf '%s' " + singleQuotedArg(encodedKey) + " | base64 -d > \"$key_tmp\"\n" +
-		"chown root:root \"$key_tmp\"\n" +
-		"chmod 0644 \"$key_tmp\"\n" +
-		"mv -fT -- \"$key_tmp\" /etc/zaigr/ssh/user-authorized-keys\n" +
-		"printf '%s\\n' " + singleQuotedArg(
-		"AuthorizedKeysFile /etc/zaigr/ssh/%u-authorized-keys .ssh/authorized_keys .ssh/authorized_keys2",
-	) + " > \"$config_tmp\"\n" +
-		"chown root:root \"$config_tmp\"\n" +
-		"chmod 0644 \"$config_tmp\"\n" +
-		"mv -fT -- \"$config_tmp\" /etc/ssh/sshd_config.d/00-zaigr-managed-keys.conf\n" +
-		"sshd -t\n" +
-		"systemctl reload ssh\n" +
-		"trap - EXIT"
-	if err := sshRunCommandWithExitStatusContext(ctx, port, rootKeyPath, "root", installCommand); err != nil {
-		return fmt.Errorf("install managed user SSH key in legacy VM: %w", err)
-	}
-	if !userSSHKeyWorksContext(ctx, port, userKeyPath) {
-		return fmt.Errorf("legacy VM rejected the installed managed user SSH key")
-	}
-	logInfo("installed managed user SSH key in legacy project VM", "port", port)
-	return nil
+func sshReadCommandContext(ctx context.Context, endpoint vmControlEndpoint, user string, command string) ([]byte, error) {
+	var output bytes.Buffer
+	err := runVMGuestCommand(ctx, endpoint, user, "bash -eu -c "+singleQuotedArg(command), nil, &output, io.Discard)
+	return output.Bytes(), err
 }
 
-func userSSHKeyWorksContext(ctx context.Context, port string, keyPath string) bool {
-	args := append(
-		sshManagedOptions(),
-		"-o", sshConnectTimeoutOption,
-		"-o", "BatchMode=yes",
-		"-o", "IdentitiesOnly=yes",
-		"-i", keyPath,
-		"-p", port,
-		"user@localhost", "true",
-	)
-	return exec.CommandContext(ctx, "ssh", args...).Run() == nil
+func sshReadPresetCommand(endpoint vmControlEndpoint, command string) ([]byte, error) {
+	return sshReadCommand(endpoint, "root", command)
 }
 
-func sshRunCommandCommand(port string, keyPath string, user string, command string) *exec.Cmd {
-	args := append(sshManagedOptions(), "-o", sshConnectTimeoutOption)
-	keyPath = sshKeyPathForUser(keyPath, user)
-	if keyPath != "" {
-		args = append(args, "-o", "IdentitiesOnly=yes", "-i", keyPath)
-	}
-	args = append(args, "-p", port, user+"@localhost", "bash -eu -c "+singleQuotedArg(command))
-
-	cmd := exec.Command("ssh", args...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd
-}
-
-func sshReadCommand(port string, keyPath string, user string, command string) ([]byte, error) {
-	return sshReadCommandContext(context.Background(), port, keyPath, user, command)
-}
-
-func sshReadCommandContext(ctx context.Context, port string, keyPath string, user string, command string) ([]byte, error) {
-	args := append(sshManagedOptions(), "-o", sshConnectTimeoutOption)
-	keyPath = sshKeyPathForUser(keyPath, user)
-	if keyPath != "" {
-		args = append(args, "-o", "IdentitiesOnly=yes", "-i", keyPath)
-	}
-	ssArgs := append(args, "-p", port, user+"@localhost", "bash -eu -c "+singleQuotedArg(command))
-	cmd := exec.CommandContext(ctx, "ssh", ssArgs...)
-	return cmd.Output()
-}
-
-func sshReadPresetCommand(port string, keyPath string, command string) ([]byte, error) {
-	args := append(sshPresetOptions(), "-o", sshConnectTimeoutOption)
-	args = append(args, "-o", "IdentitiesOnly=yes", "-i", keyPath)
-	args = append(args, "-p", port, "root@localhost", "bash -eu -c "+singleQuotedArg(command))
-	cmd := exec.Command("ssh", args...)
-	cmd.Env = presetSSHEnvironment()
-	return cmd.Output()
-}
-
-func presetSSHEnvironment() []string {
-	path := os.Getenv("PATH")
-	if path == "" {
-		path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-	}
-	terminal := os.Getenv("TERM")
-	if terminal == "" {
-		terminal = "xterm-256color"
-	}
-	return []string{"PATH=" + path, "TERM=" + terminal}
-}
-
-func sshRunPresetCommand(port string, keyPath string, presetName string, script string) error {
+func sshRunPresetCommand(endpoint vmControlEndpoint, presetName string, script string) error {
 	command, err := isolatedPresetCommand(presetName, script)
 	if err != nil {
 		return err
 	}
-	args := []string{
-		"-tt",
-	}
-	args = append(args, sshPresetOptions()...)
-	args = append(args, "-o", sshConnectTimeoutOption, "-o", "IdentitiesOnly=yes", "-i", keyPath)
-	args = append(args, "-p", port, "root@localhost", command)
-
-	cmd := exec.Command("ssh", args...)
-	cmd.Env = presetSSHEnvironment()
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	return runVMGuestInteractive(context.Background(), endpoint, "root", command, os.Stdin)
 }
 
 func isolatedPresetCommand(presetName string, script string) (string, error) {
@@ -766,13 +543,6 @@ func encodedOptionalArgument(value string) string {
 		return "-"
 	}
 	return base64.StdEncoding.EncodeToString([]byte(value))
-}
-
-func sshKeyPathForUser(keyPath string, user string) string {
-	if keyPath == "" && user == "user" {
-		return userSSHKeyPath()
-	}
-	return keyPath
 }
 
 func singleQuotedArg(text string) string {

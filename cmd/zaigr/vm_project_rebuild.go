@@ -1256,15 +1256,11 @@ func buildRebuildCandidate(store projectStore, sourceStore projectStore, definit
 			ram = "4096"
 		}
 		cpus, _ := resolveCPUs("")
-		port, err := allocateEphemeralSSHPort()
-		if err != nil {
-			return nil, err
-		}
 		workspace, err := os.Getwd()
 		if err != nil {
 			return nil, err
 		}
-		if err := applyStepsViaSSHInContext(candidate, scripts, ram, cpus, port, true, agentStateDir, workspace, store, sourceStore.Path); err != nil {
+		if err := applyStepsViaSSHInContext(candidate, scripts, ram, cpus, true, agentStateDir, workspace, store, sourceStore.Path); err != nil {
 			if isGuestSetupExecutionError(err) {
 				step := guestSetupExecutionStep(err)
 				for index, path := range scripts {

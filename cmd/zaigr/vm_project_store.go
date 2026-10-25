@@ -21,6 +21,8 @@ type projectStore struct {
 
 const baseImageVersionFileName = "base-image-version"
 
+const legacyVMUpgradeGuidance = "project VM uses the previous TCP management transport; stop it with the Zaigr version that started it, then run 'zaigr project rebuild' before starting it with this version"
+
 type storedPresetSelection struct {
 	Name    string
 	Version string
@@ -136,14 +138,14 @@ func projectBaseRuntimeVersionsForStore(store projectStore) projectBaseRuntimeVe
 	return versions
 }
 
-func projectBaseRuntimeVersionsForRunningVM(store projectStore, port string, rootKeyPath string) projectBaseRuntimeVersions {
+func projectBaseRuntimeVersionsForRunningVM(store projectStore, endpoint vmControlEndpoint) projectBaseRuntimeVersions {
 	versions := projectBaseRuntimeVersionsForStore(store)
-	if port == "" || rootKeyPath == "" {
+	if endpoint.SocketPath == "" {
 		return versions
 	}
-	body, err := sshReadPresetCommand(port, rootKeyPath, "cat /etc/base-image-version")
+	body, err := sshReadPresetCommand(endpoint, "cat /etc/base-image-version")
 	if err != nil {
-		logDebug("could not read running VM base runtime version", "port", port, "err", err)
+		logDebug("could not read running VM base runtime version", "vsock_cid", endpoint.VsockCID, "err", err)
 		return versions
 	}
 	running := strings.TrimSpace(string(body))
@@ -293,6 +295,18 @@ func (store projectStore) ensureAgentStateDir() error {
 func (store projectStore) clearRuntimeState() error {
 	// Keep probes side-effect free for fresh/legacy stores, but inspect the
 	// ownership record even if the lock pathname has been removed.
+	if record, err := readVMSupervisorRecord(store); err == nil && record.FormatVersion == 1 {
+		supervisorLive, supervisorErr := vmProcessLive(record.Supervisor)
+		qemuLive, qemuErr := vmProcessLive(record.QEMU)
+		if supervisorErr != nil || qemuErr != nil {
+			return errors.Join(supervisorErr, qemuErr)
+		}
+		if supervisorLive || qemuLive {
+			return errors.New(legacyVMUpgradeGuidance)
+		}
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	lock, err := os.OpenFile(store.vmSupervisorLockPath(), os.O_RDWR, 0600)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("open VM lifetime lock: %w", err)
@@ -317,10 +331,6 @@ func (store projectStore) clearRuntimeState() error {
 		return fmt.Errorf("remove runtime state: %w", err)
 	}
 	return nil
-}
-
-func (store projectStore) sshPortPath() string {
-	return filepath.Join(store.runtimeDir(), "ssh-port")
 }
 
 func (store projectStore) serialLogPath() string {
@@ -424,14 +434,6 @@ func (store projectStore) appliedGlobalFirewallEntries() ([]string, error) {
 
 func (store projectStore) writeAppliedGlobalFirewallEntries(entries []string) error {
 	return writeFirewallListFile(store.appliedGlobalFirewallPath(), entries, "applied global firewall metadata")
-}
-
-func (store projectStore) sshPort() (string, error) {
-	data, err := os.ReadFile(store.sshPortPath())
-	if err != nil {
-		return "", fmt.Errorf("no SSH port configured")
-	}
-	return strings.TrimSpace(string(data)), nil
 }
 
 func (store projectStore) monitorSockPath() string {

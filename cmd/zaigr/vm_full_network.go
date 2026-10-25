@@ -135,7 +135,7 @@ func fullNetworkLeaseLaunchStopped(runtimeDir, launchID string) bool {
 // withMaintenanceNetworkSession grants access through the launch's shared
 // maintenance namespace and the separately leased maintenance NIC. Ordinary
 // guest interfaces and firewall grants are unchanged.
-func withMaintenanceNetworkSession(store projectStore, port, operation string, run func(string) error) (retErr error) {
+func withMaintenanceNetworkSession(store projectStore, endpoint vmControlEndpoint, operation string, run func(string) error) (retErr error) {
 	if err := ensureMaintenanceNetworkProjectSafe(store); err != nil {
 		return err
 	}
@@ -145,10 +145,6 @@ func withMaintenanceNetworkSession(store projectStore, port, operation string, r
 	}
 	if !host {
 		return fmt.Errorf("%s requires a running VM with host-enforced networking; restart the project VM", operation)
-	}
-	keyPath, _, err := ensureRootSSHKey()
-	if err != nil {
-		return fmt.Errorf("prepare root SSH key for maintenance network: %w", err)
 	}
 	sessionID, err := newVMLaunchID()
 	if err != nil {
@@ -212,7 +208,7 @@ func withMaintenanceNetworkSession(store projectStore, port, operation string, r
 		}
 		retErr = errors.Join(retErr, stopErr)
 	}()
-	if err := prepareMaintenanceNamespace(port, keyPath, name, record.LaunchID, session); err != nil {
+	if err := prepareMaintenanceNamespace(endpoint, name, record.LaunchID, session); err != nil {
 		return fmt.Errorf("prepare shared maintenance namespace: %w", err)
 	}
 	fmt.Fprintln(os.Stderr, maintenanceOperationWarning(operation))
@@ -220,11 +216,11 @@ func withMaintenanceNetworkSession(store projectStore, port, operation string, r
 	return retErr
 }
 
-func withMaintenanceNetworkSessionForSetups(store projectStore, port, operation string, definitions []setupDefinition, run func(string) error) error {
+func withMaintenanceNetworkSessionForSetups(store projectStore, endpoint vmControlEndpoint, operation string, definitions []setupDefinition, run func(string) error) error {
 	if names := rootEquivalentSetupNames(definitions); len(names) > 0 {
 		return fmt.Errorf("cannot attach setup execution with maintenance network access while installing root-equivalent runtime setup(s): %s; use a clean dedicated image without these runtimes or exact host firewall grants", strings.Join(names, ", "))
 	}
-	return withMaintenanceNetworkSession(store, port, operation, run)
+	return withMaintenanceNetworkSession(store, endpoint, operation, run)
 }
 
 func ensureMaintenanceNetworkProjectSafe(store projectStore) error {
@@ -313,7 +309,7 @@ func maintenanceNamespaceName(launchID string) (string, error) {
 	return "zaigr-maint-" + launchID, nil
 }
 
-func prepareMaintenanceNamespace(port, keyPath, name, launchID string, session hostnet.MaintenanceSession) error {
+func prepareMaintenanceNamespace(endpoint vmControlEndpoint, name, launchID string, session hostnet.MaintenanceSession) error {
 	if !validHostPolicyScopeID(launchID) || name != "zaigr-maint-"+launchID {
 		return errors.New("invalid maintenance namespace identity")
 	}
@@ -349,5 +345,5 @@ func prepareMaintenanceNamespace(port, keyPath, name, launchID string, session h
 	command := "install -d -o root -g root -m 0700 /run/zaigr && flock -x " + singleQuotedArg(lockPath) + " sh -eu -c " + singleQuotedArg(setup)
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	return sshRunCommandWithExitStatusContext(ctx, port, keyPath, "root", command)
+	return sshRunCommandWithExitStatusContext(ctx, endpoint, "root", command)
 }

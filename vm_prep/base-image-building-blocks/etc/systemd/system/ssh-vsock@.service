@@ -1,0 +1,10 @@
+[Unit]
+Description=OpenSSH server connection over virtio-vsock
+After=zaigr-runtime-ready.service
+Requires=zaigr-runtime-ready.service
+
+[Service]
+ExecStart=/usr/sbin/sshd -i
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal

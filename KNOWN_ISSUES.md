@@ -93,20 +93,6 @@ that the pending capture will be lost before clearing it.
 `project setup capture accept` or `project setup capture discard` so that
 captured commands are either saved or intentionally dropped.
 
-## Starting a project VM occasionally fails
-
-Sometimes `zaigr project vm start` stops with an error like:
-
-```
-host-enforced network transition failed: ... exit status 255
-```
-
-The VM started, but zaigr briefly couldn't connect to it. It's rare: seen twice
-in about 20 test starts, on Ubuntu 24.04 and 26.04. The cause isn't known yet.
-
-**Workaround:** run `zaigr project vm start` again. It has always worked on the
-second try.
-
 ## Release tests: Debian 13 can't be tested yet
 
 Before testing on Debian 13, the release tests download its software packages.

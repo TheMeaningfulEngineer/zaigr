@@ -54,7 +54,7 @@ def _path_without_unshare(test_root):
         if not directory or not Path(directory).is_dir():
             continue
         for executable in Path(directory).iterdir():
-            if executable.name in {"unshare", "slirp4netns"} or executable.name in linked_names:
+            if executable.name in {"unshare", "slirp4netns", "ssh", "ssh-keygen", "setpriv"} or executable.name in linked_names:
                 continue
             if not executable.is_file() or not os.access(executable, os.X_OK):
                 continue
@@ -72,16 +72,14 @@ def _is_debian_family():
 
 def _assert_aggregate_host_preflight(output, operation):
     assert f"Host preflight failed before {operation}" in output
-    assert (
-        "Host-enforced networking needs these tools on the host, including when upgrading from the guest firewall."
-        in output
-    )
-    assert "Bundled slirp4netns version:" in output
-    assert "setpriv" in output
+    assert "qemu-system-x86_64" in output
+    assert "Run 'zaigr misc check' for the full host report." in output
+    assert "setpriv" not in output
     assert "unshare" not in output
     if _is_debian_family():
         assert "sudo apt install" in output
-        assert "util-linux" in output
+        assert "openssh-client" not in output
+        assert "util-linux" not in output
 
 
 def _sha256(path):
@@ -107,10 +105,11 @@ def test_host_check_probes_sandbox_without_project_state(zaigr_bin, zaigr_home, 
     assert stdout.startswith("Host: ")
     assert "(kernel " in stdout
     assert "QEMU virtiofs support" in stdout
+    assert "vhost-vsock available" in stdout
     assert "host tools" in stdout
     assert "virtiofs sandbox" in stdout
     assert "answered a vhost-user request" in stdout
-    assert "6/6 checks passed" in stdout
+    assert "7/7 checks passed" in stdout
     assert list(workspace.iterdir()) == [canary]
     assert canary.read_text() == "unchanged\n"
     assert not (zaigr_home / ".zaigr/store").exists()
@@ -131,32 +130,31 @@ def test_host_check_reports_missing_tools_and_still_probes_sandbox(
     )
     assert rc == 1, err_msg(stdout, stderr)
     assert "qemu-system-x86_64 not found in PATH" in stdout
-    assert "missing host tools: ssh, ssh-keygen" in stdout
-    assert (
-        "Host-enforced networking needs these tools on the host, including when upgrading from the guest firewall."
-        in stdout
-    )
+    assert "missing host tools: ssh" not in stdout
+    assert "missing host tools: ssh-keygen" not in stdout
     if _is_debian_family():
         install_line = next(
             line for line in stdout.splitlines() if line.startswith("Install missing packages:")
         )
         assert install_line == (
-            "Install missing packages: sudo apt install qemu-system-x86 "
-            "openssh-client util-linux"
+            "Install missing packages: sudo apt install qemu-system-x86"
         )
         assert "qemu-utils" not in install_line
         assert "e2fsprogs" not in install_line
         assert "conntrack" not in install_line
         assert "slirp4netns" not in install_line
-        assert "util-linux" in install_line
+        assert "openssh-client" not in install_line
+        assert "util-linux" not in install_line
     else:
         assert "Missing tool names are listed above" in stdout
-    assert "Bundled slirp4netns version:" in stdout
-    assert "setpriv" in stdout
     assert "unshare" not in stdout
     # No newuidmap/newgidmap helpers are needed for the production mapping.
+    assert "vhost-vsock available" in stdout
+    assert "host-enforced networking" in stdout
+    assert "slirp4netns 1.3.4" in stdout
+    assert "start/stop probe passed" in stdout
     assert "answered a vhost-user request" in stdout
-    assert "3/6 checks passed" in stdout
+    assert "6/7 checks passed" in stdout
     assert not (zaigr_home / ".zaigr/store").exists()
 
 
@@ -274,7 +272,10 @@ def test_running_vm_survives_batch_rebuild_preflight_and_reuses_without_qemu(
 
     restricted_path = _path_with_real_tools(
         test_root,
-        ("ssh", "ssh-keygen", "unshare", "setpriv", "true"),
+        (
+            "qemu-system-x86_64", "qemu-img", "debugfs", "e2fsck",
+            "resize2fs", "dumpe2fs", "true",
+        ),
     )
     restricted_env = {**project.env, "PATH": str(restricted_path)}
 
@@ -316,14 +317,19 @@ def _ubuntu_guidance(output):
 
 
 @pytest.mark.timeout(720)
-def test_namespace_policy_guidance_matches_and_vm_networking_needs_no_unshare(
+def test_namespace_policy_guidance_matches_and_vm_networking_needs_no_host_ssh_tools(
     project, test_root
 ):
-    """Bundled networking works without system slirp4netns or unshare."""
+    """Networking and VM commands work without host SSH, setpriv, or unshare."""
     zaigr = project.zaigr_bin.resolve()
     commands_without_unshare = _path_without_unshare(test_root)
     assert not (commands_without_unshare / "unshare").exists()
     assert not (commands_without_unshare / "slirp4netns").exists()
+    assert not (commands_without_unshare / "ssh").exists()
+    assert not (commands_without_unshare / "ssh-keygen").exists()
+    assert not (commands_without_unshare / "setpriv").exists()
+    assert shutil.which("ssh", path=str(commands_without_unshare)) is None
+    assert shutil.which("ssh-keygen", path=str(commands_without_unshare)) is None
     no_unshare_env = {**project.env, "PATH": str(commands_without_unshare)}
 
     stdout, stderr, rc = _run(
@@ -331,7 +337,7 @@ def test_namespace_policy_guidance_matches_and_vm_networking_needs_no_unshare(
     )
     assert rc == 0, err_msg(stdout, stderr)
     assert "Bundled slirp4netns version:" in stdout
-    assert "6/6 checks passed" in stdout
+    assert "7/7 checks passed" in stdout
     assert "disposable host namespace, TAP, nftables controller and slirp start/stop probe passed" in stdout
 
     stdout, stderr, rc = _run(

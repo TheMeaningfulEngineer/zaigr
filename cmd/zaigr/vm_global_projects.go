@@ -565,8 +565,12 @@ func inspectGlobalProjectVM(store projectStore) globalProjectVM {
 		return vm
 	}
 	vm.pid = pids[0]
-	port, _ := store.sshPort()
-	vm.running = &runningVMInfo{Port: port}
+	endpoint, endpointErr := vmControlEndpointForStore(store)
+	if endpointErr != nil {
+		warnGlobalProject(store, endpointErr)
+	} else {
+		vm.running = &runningVMInfo{Endpoint: endpoint}
+	}
 	vm.cpu, vm.ram = "", ""
 	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(vm.pid), "cmdline"))
 	if err != nil {

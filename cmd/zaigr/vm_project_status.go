@@ -53,7 +53,7 @@ func printProjectStatus(render projectStatusRender) {
 	case render.Stale:
 		fmt.Printf("  status: stale session marker found; not running\n")
 	case render.Running != nil:
-		fmt.Printf("  status: running on port %s\n", render.Running.Port)
+		fmt.Printf("  status: running (vsock CID %d)\n", render.Running.Endpoint.VsockCID)
 	default:
 		fmt.Printf("  status: not running\n")
 	}

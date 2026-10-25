@@ -29,8 +29,6 @@ type Options struct {
 	RuntimeDir        string
 	Executable        string
 	SlirpPath         string
-	SSHHostPort       uint16
-	SSHGuestPort      uint16
 	InitialIPGrants   []netip.Addr
 	InitialGeneration uint64
 }

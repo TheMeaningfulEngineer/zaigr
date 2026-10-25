@@ -24,25 +24,19 @@ overrides:
       - coreutils
       - conntrack
       - e2fsprogs
-      - openssh-client
       - qemu-system-x86
       - qemu-utils
-      - util-linux
   rpm:
     depends:
       - coreutils
       - conntrack-tools
       - e2fsprogs
-      - openssh-clients
       - qemu-img
       - qemu-system-x86-core
-      - util-linux
   archlinux:
     depends:
       - coreutils
       - conntrack-tools
       - e2fsprogs
-      - openssh
       - qemu-img
       - qemu-system-x86
-      - util-linux

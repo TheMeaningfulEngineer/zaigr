@@ -108,9 +108,9 @@ func cmdSetupRun(names []string, ram string, cpu string, force bool) error {
 		if ram != "" || cpu != "" {
 			return fmt.Errorf("project VM is already running; --ram and --cpu cannot be changed on a running VM")
 		}
-		logInfo("project setup run will apply to running VM", "port", running.Port, "count", len(definitions))
-		return withMaintenanceNetworkSessionForSetups(store, running.Port, "project setup run", definitions, func(namespace string) error {
-			return applySetupDefinitionsToVMInNamespace(running.Port, namespace, definitions)
+		logInfo("project setup run will apply to running VM", "vsock_cid", running.Endpoint.VsockCID, "count", len(definitions))
+		return withMaintenanceNetworkSessionForSetups(store, running.Endpoint, "project setup run", definitions, func(namespace string) error {
+			return applySetupDefinitionsToVMInNamespace(running.Endpoint, namespace, definitions)
 		})
 	}
 
@@ -123,12 +123,12 @@ func cmdSetupRun(names []string, ram string, cpu string, force bool) error {
 			return err
 		}
 		logInfo("starting project VM after blank-slate project setup run")
-		port, err := startPreparedProjectVM(ram, cpu)
+		endpoint, err := startPreparedProjectVM(ram, cpu)
 		if err != nil {
 			return err
 		}
-		logInfo("project VM started after project setup run", "port", port)
-		fmt.Printf(":: Project VM started on port %s\n", port)
+		logInfo("project VM started after project setup run", "vsock_cid", endpoint.VsockCID)
+		fmt.Printf(":: Project VM started (vsock CID %d)\n", endpoint.VsockCID)
 	}
 	return nil
 }
@@ -166,7 +166,7 @@ func printSkippedAppliedSetups(skippedApplied []string) {
 	}
 }
 
-func applySetupDefinitionsToVM(port string, definitions []setupDefinition) error {
+func applySetupDefinitionsToVM(endpoint vmControlEndpoint, definitions []setupDefinition) error {
 	if err := confirmSetupAptCommands(definitions, "setup execution"); err != nil {
 		return err
 	}
@@ -176,14 +176,14 @@ func applySetupDefinitionsToVM(port string, definitions []setupDefinition) error
 			return err
 		}
 
-		if err := applySetupDirectlyToRunningVM(port, def, payload); err != nil {
+		if err := applySetupDirectlyToRunningVM(endpoint, def, payload); err != nil {
 			return fmt.Errorf("failed to run setup %s: %w", displaySetupName(def.Name, def.ProjectLocal), err)
 		}
 	}
 	return nil
 }
 
-func applySetupDefinitionsToVMInNamespace(port, namespace string, definitions []setupDefinition) error {
+func applySetupDefinitionsToVMInNamespace(endpoint vmControlEndpoint, namespace string, definitions []setupDefinition) error {
 	if err := confirmSetupAptCommands(definitions, "setup execution"); err != nil {
 		return err
 	}
@@ -192,7 +192,7 @@ func applySetupDefinitionsToVMInNamespace(port, namespace string, definitions []
 		if err != nil {
 			return err
 		}
-		if err := applySetupDirectlyToRunningVMInNamespace(port, def, payload, namespace); err != nil {
+		if err := applySetupDirectlyToRunningVMInNamespace(endpoint, def, payload, namespace); err != nil {
 			return fmt.Errorf("failed to run setup %s: %w", displaySetupName(def.Name, def.ProjectLocal), err)
 		}
 	}
@@ -254,20 +254,15 @@ func loadPresetPlan(preset string, extraSetups []string) (*presetDefinition, []b
 	return nil, nil, defs, nil
 }
 
-func runPresetInVM(port string, presetName string, script []byte) error {
+func runPresetInVM(endpoint vmControlEndpoint, presetName string, script []byte) error {
 	if !isValidResourceName(presetName) {
 		return fmt.Errorf("invalid preset name: %s", presetName)
 	}
-	rootKeyPath, _, err := ensureRootSSHKey()
-	if err != nil {
-		return fmt.Errorf("prepare trusted preset launcher: %w", err)
-	}
 	if _, err := sshReadPresetCommand(
-		port,
-		rootKeyPath,
+		endpoint,
 		"test -x /usr/local/lib/zaigr/run-preset-isolated",
 	); err != nil {
-		versions := projectBaseRuntimeVersionsForRunningVM(currentProjectStore(), port, rootKeyPath)
+		versions := projectBaseRuntimeVersionsForRunningVM(currentProjectStore(), endpoint)
 		return fmt.Errorf(
 			"project VM cannot start isolated presets because its runtime is outdated or missing preset-isolation support\n"+
 				"  running VM base runtime: %s\n"+
@@ -284,7 +279,7 @@ func runPresetInVM(port string, presetName string, script []byte) error {
 	if err := rejectHardLinkedPresetState(presetName); err != nil {
 		return err
 	}
-	return sshRunPresetCommand(port, rootKeyPath, presetName, string(script))
+	return sshRunPresetCommand(endpoint, presetName, string(script))
 }
 
 func ensurePresetAgentStateDir(presetName string) error {

@@ -62,6 +62,7 @@ func cmdCheck() error {
 func collectHostPreflight(host checkHost) []checkResult {
 	return []checkResult{
 		checkKVM(),
+		checkVhostVSock(),
 		checkQEMU(),
 		checkHostTools(host),
 		checkVirtiofs(host),
@@ -127,9 +128,6 @@ func formatHostPreflightFailure(operation string, host checkHost, failed []check
 	}
 	packages := hostPreflightPackageGuidance(host, missingTools)
 	if packages != "" {
-		if missingNetworkTool(missingTools) {
-			message += "\n\nHost-enforced networking needs these tools on the host, including when upgrading from the guest firewall."
-		}
 		message += "\n\n" + packages
 	}
 	return errors.New(message)
@@ -138,10 +136,6 @@ func formatHostPreflightFailure(operation string, host checkHost, failed []check
 func shortPreflightDetail(detail string) string {
 	line, _, _ := strings.Cut(detail, "\n")
 	return strings.TrimSpace(line)
-}
-
-func missingNetworkTool(missing map[string]bool) bool {
-	return missing["setpriv"]
 }
 
 func hostPreflightPackageGuidance(host checkHost, missing map[string]bool) string {
@@ -158,16 +152,12 @@ func hostPreflightPackageGuidance(host checkHost, missing map[string]bool) strin
 			packages["qemu-system-x86"] = true
 		case "qemu-img":
 			packages["qemu-utils"] = true
-		case "ssh", "ssh-keygen":
-			packages["openssh-client"] = true
 		case "debugfs", "e2fsck", "resize2fs", "dumpe2fs":
 			packages["e2fsprogs"] = true
-		case "setpriv":
-			packages["util-linux"] = true
 		}
 	}
 	var ordered []string
-	for _, name := range []string{"qemu-system-x86", "qemu-utils", "openssh-client", "e2fsprogs", "util-linux"} {
+	for _, name := range []string{"qemu-system-x86", "qemu-utils", "e2fsprogs"} {
 		if packages[name] {
 			ordered = append(ordered, name)
 		}
@@ -187,9 +177,6 @@ func printHostPreflightAdvice(host checkHost, checks []checkResult) {
 				missing[tool] = true
 			}
 		}
-	}
-	if missingNetworkTool(missing) {
-		fmt.Println("Host-enforced networking needs these tools on the host, including when upgrading from the guest firewall.")
 	}
 	if message := hostPreflightPackageGuidance(host, missing); message != "" {
 		fmt.Println(message)
@@ -215,22 +202,11 @@ func printHostPreflightGuidance(checks []checkResult) {
 }
 
 func checkHostNetworking(host checkHost) checkResult {
-	var missing []string
 	var details []string
 	var summary []string
 	var guidance string
 	failed := false
 	runtimeCanRun := true
-	for _, tool := range []string{"setpriv"} {
-		if _, err := checkHostToolPath(tool); err != nil {
-			failed = true
-			missing = append(missing, tool)
-			details = append(details, fmt.Sprintf("%s: %v", tool, err))
-		}
-	}
-	if len(missing) > 0 {
-		summary = append(summary, "missing tools: "+strings.Join(missing, ", "))
-	}
 	if st, err := os.Stat("/dev/net/tun"); err != nil || st.Mode()&os.ModeDevice == 0 || st.Mode()&os.ModeCharDevice == 0 {
 		failed = true
 		runtimeCanRun = false
@@ -277,16 +253,13 @@ func checkHostNetworking(host checkHost) checkResult {
 			summary = append(summary, "could not start the disposable host network runtime: "+boundedPreflightCause(err))
 			details = append(details, "Disposable host-network namespace probe:\n  operation: Zaigr-created user/network namespace followed by a no-VM TAP/nftables/slirp start/stop\n  result: "+err.Error()+"\n  diagnosis: "+networkRuntimeDiagnosis(host, err))
 		} else if failed {
-			details = append(details, "Bundled slirp4netns "+strings.TrimSpace(embeddedSlirp4netnsVersion)+" started and stopped; setpriv is still required by the DNS frontend.")
+			details = append(details, "Bundled slirp4netns "+strings.TrimSpace(embeddedSlirp4netnsVersion)+" started and stopped.")
 		}
 	}
 	if failed {
 		report := []string{"Bundled slirp4netns version: " + strings.TrimSpace(embeddedSlirp4netnsVersion)}
-		if len(missing) > 0 {
-			report = append(report, "Missing tools/devices: "+strings.Join(missing, ", "))
-		}
 		report = append(report, details...)
-		return checkResult{name: "host-enforced networking", detail: strings.Join(report, "\n"), summary: strings.Join(summary, "; "), guidance: guidance, missingTools: strings.Join(missing, ", ")}
+		return checkResult{name: "host-enforced networking", detail: strings.Join(report, "\n"), summary: strings.Join(summary, "; "), guidance: guidance}
 	}
 	return checkResult{name: "host-enforced networking", detail: "bundled slirp4netns " + strings.TrimSpace(embeddedSlirp4netnsVersion) + "; disposable host namespace, TAP, nftables controller and slirp start/stop probe passed; this does not verify outbound traffic or every later runtime condition", passed: true}
 }
@@ -398,6 +371,29 @@ func requireKVMAccess() error {
 	return nil
 }
 
+func checkVhostVSock() checkResult {
+	info, err := os.Stat("/dev/vhost-vsock")
+	if err != nil || info.Mode()&os.ModeDevice == 0 || info.Mode()&os.ModeCharDevice == 0 {
+		return checkResult{
+			name:   "vhost-vsock available",
+			detail: "/dev/vhost-vsock is missing or not a character device; enable the host vhost-vsock device for SSH access to project VMs",
+			passed: false,
+		}
+	}
+	device, err := os.OpenFile("/dev/vhost-vsock", os.O_RDWR, 0)
+	if err != nil {
+		return checkResult{
+			name:   "vhost-vsock available",
+			detail: "/dev/vhost-vsock is not readable and writable by this user; add the user to the kvm group",
+			passed: false,
+		}
+	}
+	if err := device.Close(); err != nil {
+		return checkResult{name: "vhost-vsock available", detail: "close /dev/vhost-vsock: " + err.Error(), passed: false}
+	}
+	return checkResult{name: "vhost-vsock available", detail: "/dev/vhost-vsock", passed: true}
+}
+
 func checkQEMU() checkResult {
 	path, err := exec.LookPath("qemu-system-x86_64")
 	if err != nil {
@@ -434,7 +430,7 @@ func checkCommandOutput(path string, args ...string) ([]byte, error) {
 func checkHostTools(host checkHost) checkResult {
 	var missing []string
 	for _, tool := range []struct{ name, fallback string }{
-		{"qemu-img", "/usr/bin/qemu-img"}, {"ssh", ""}, {"ssh-keygen", ""},
+		{"qemu-img", "/usr/bin/qemu-img"},
 		{"debugfs", "/usr/sbin/debugfs"}, {"e2fsck", "/sbin/e2fsck"},
 		{"resize2fs", "/sbin/resize2fs"}, {"dumpe2fs", "/sbin/dumpe2fs"},
 	} {
@@ -449,7 +445,7 @@ func checkHostTools(host checkHost) checkResult {
 	if len(missing) > 0 {
 		return checkResult{name: "host tools", detail: "missing host tools: " + strings.Join(missing, ", "), missingTools: strings.Join(missing, ", ")}
 	}
-	return checkResult{name: "host tools", detail: "qemu-img, ssh, ssh-keygen, debugfs, e2fsck, resize2fs, dumpe2fs", passed: true}
+	return checkResult{name: "host tools", detail: "qemu-img, debugfs, e2fsck, resize2fs, dumpe2fs", passed: true}
 }
 
 func checkDiskSpace() checkResult {

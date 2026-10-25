@@ -9,8 +9,7 @@ import (
 // dependency graph only after the host policy is active and SSH is ready. The
 // drop-ins live under /run, so the legacy guest firewall dependencies return
 // on the next boot unless that boot also selects the host backend.
-func applyHostNetworkGuestTransition(ctx context.Context, port string) error {
-	rootKey := rootSSHKeyPath()
+func applyHostNetworkGuestTransition(ctx context.Context, endpoint vmControlEndpoint) error {
 	const script = `set -eu
 # Fresh images have no guest firewall unit or dependency chain to transition.
 if ! systemctl cat opensnitch.service >/dev/null 2>&1; then
@@ -38,7 +37,7 @@ if systemctl is-active --quiet opensnitch.service; then
   exit 1
 fi
 `
-	if err := sshRunControlScriptContext(ctx, port, rootKey, script); err != nil {
+	if err := sshRunControlScriptContext(ctx, endpoint, script); err != nil {
 		return fmt.Errorf("disable guest OpenSnitch after host policy activation: %w", err)
 	}
 	return nil

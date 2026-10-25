@@ -1,14 +1,18 @@
 """Public CLI acceptance for host-enforced VM networking."""
 
 import json
+import os
+import re
+import shlex
 import signal
 import socket
 import time
 from functools import partial
 
+import pexpect
 import pytest
 
-from ..conftest import err_msg
+from ..conftest import err_msg, spawn_interactive
 from ..conftest import run as _run
 from .host_access_endpoints import http_body, unused_port, wait_text
 from .host_network_fixture.processes import signal_recorded_process
@@ -70,13 +74,54 @@ def test_guest_resolves_localhost_to_loopback(project):
 
 
 @pytest.mark.timeout(420)
-def test_host_network_keeps_ssh_and_project_forwarding_available(project, endpoint_binary):
-    """Use the normal VM SSH command path and a real loopback host forward."""
+def test_host_network_keeps_ssh_and_project_forwarding_available(project, endpoint_binary, request):
+    """Use normal VM control and a real loopback host forward."""
     run = partial(checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
     host_port = unused_port()
     run([zaigr, "project", "vm", "start"],
         input="y\n", timeout=180)
+
+    record = json.loads((project.store_dir / "vm-supervisor.json").read_text())
+    frontend = record["network_processes"]["host-dns-frontend"]
+    frontend_pid = frontend["pid"]
+    with open(f"/proc/{frontend_pid}/stat", encoding="utf-8") as stat_file:
+        frontend_stat = stat_file.read()
+    frontend_fields = frontend_stat.rsplit(")", 1)[1].split()
+    assert frontend_fields[19] == str(frontend["start_time"]), frontend
+    frontend_exe = os.stat(f"/proc/{frontend_pid}/exe")
+    assert frontend_exe.st_dev == frontend["exe_device"], frontend
+    assert frontend_exe.st_ino == frontend["exe_inode"], frontend
+    with open(f"/proc/{frontend_pid}/status", encoding="utf-8") as status_file:
+        frontend_status = dict(
+            line.split(":", 1) for line in status_file if ":" in line
+        )
+    for capability in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"):
+        assert int(frontend_status[capability].strip(), 16) == 0, frontend_status
+    assert frontend_status["NoNewPrivs"].strip() == "1", frontend_status
+
+    firewall_log = spawn_interactive(
+        shlex.quote(str(zaigr)) + " project firewall domain-log",
+        cwd=project.cwd,
+        env=project.env,
+        timeout=20,
+    )
+    request.addfinalizer(
+        lambda: firewall_log.close(force=True) if firewall_log.isalive() else None
+    )
+    firewall_log.expect("Firewall packet events coalesce", timeout=10)
+    assert run(
+        [zaigr, "project", "vm", "exec", "--", "printf", "vsock-control-ok"],
+        timeout=30,
+    ) == "vsock-control-ok"
+    firewall_log.sendintr()
+    firewall_log.expect(pexpect.EOF, timeout=10)
+    firewall_log.close()
+    assert firewall_log.exitstatus == 0
+    firewall_transcript = firewall_log.transcript.getvalue()
+    assert not re.search(
+        r"(?m)^FIREWALL .*TCP .*:22(?:\s|$)", firewall_transcript
+    ), firewall_transcript
 
     runtime_components = run([
         zaigr, "project", "vm", "exec", "--", "bash", "-c",

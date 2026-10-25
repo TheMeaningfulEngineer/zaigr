@@ -73,6 +73,10 @@ if [ -e /dev/kvm ]; then
     chgrp kvm /dev/kvm
     chmod 0660 /dev/kvm
 fi
+if [ -e /dev/vhost-vsock ]; then
+    chgrp kvm /dev/vhost-vsock
+    chmod 0660 /dev/vhost-vsock
+fi
 
 vm_hostname="$(cmdline_value 'zaigr\.hostname')"
 vm_hostname="${vm_hostname:-zaigr}"

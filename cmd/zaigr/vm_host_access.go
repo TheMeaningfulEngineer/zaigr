@@ -131,9 +131,6 @@ func cmdHostAccessChange(resource, vmPort string, override, allow bool) error {
 			return fmt.Errorf("--vm-port: %w", err)
 		}
 	}
-	if allow && running != nil && strconv.Itoa(host) == running.Port {
-		return fmt.Errorf("host port %d is reserved for VM SSH management", host)
-	}
 	return changeHostAccessPort(store, g, running, hostAccessPort{Host: host, VM: vm}, allow)
 }
 
@@ -179,7 +176,7 @@ func changeHostAccessPort(store projectStore, g hostAccessGrants, running *runni
 			q, qerr := openHostAccessQMP(store)
 			if qerr == nil {
 				defer func() { _ = q.conn.Close() }()
-				qerr = q.applyPort(p, running.Port, !allow)
+				qerr = q.applyPort(p, !allow)
 			}
 			runtimeErr = qerr
 		}
@@ -414,7 +411,7 @@ func inspectHostAccess(store projectStore, g hostAccessGrants) (map[int]hostAcce
 	}
 	args := []string{"observe"}
 	for _, p := range g.Ports {
-		if forwards[p.Host] != p.VM || strconv.Itoa(p.Host) == running.Port {
+		if forwards[p.Host] != p.VM {
 			ports[p.Host] = hostAccessRow{"Unavailable", "forward is inactive; retry allow or restart"}
 			continue
 		}
@@ -464,7 +461,7 @@ func inspectHostAccess(store projectStore, g hostAccessGrants) (map[int]hostAcce
 	if len(args) == 1 {
 		return ports, devices, nil
 	}
-	out, err := hostAccessGuestCommand(running.Port, args...)
+	out, err := hostAccessGuestCommand(running.Endpoint, args...)
 	observed := map[string]string{}
 	if err == nil {
 		lines := strings.Split(strings.TrimSpace(string(out)), "\n")

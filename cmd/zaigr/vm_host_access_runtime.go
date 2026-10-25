@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -60,24 +59,22 @@ func (store projectStore) writeHostAccessRuntime(r hostAccessRuntime) error {
 	return writeFileAtomically(filepath.Join(store.runtimeDir(), "host-access.json"), append(data, '\n'), 0600)
 }
 
-func hostAccessGuestCommand(port string, args ...string) ([]byte, error) {
+func hostAccessGuestCommand(endpoint vmControlEndpoint, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	quoted := []string{singleQuotedArg(hostAccessGuestHelper)}
 	for _, arg := range args {
 		quoted = append(quoted, singleQuotedArg(arg))
 	}
-	ssh := append(sshPresetOptions(), "-o", sshConnectTimeoutOption, "-o", "IdentitiesOnly=yes", "-i", rootSSHKeyPath(), "-p", port, "root@localhost", strings.Join(quoted, " "))
-	cmd := exec.CommandContext(ctx, "ssh", ssh...)
-	cmd.Env = presetSSHEnvironment()
-	out, err := cmd.CombinedOutput()
+	var out strings.Builder
+	err := runVMGuestCommand(ctx, endpoint, "root", "bash -eu -c "+singleQuotedArg(strings.Join(quoted, " ")), nil, &out, &out)
 	if ctx.Err() != nil {
 		return nil, fmt.Errorf("guest host-access inspection timed out")
 	}
 	if err != nil {
-		return nil, fmt.Errorf("guest host-access helper failed: %s (%w); rebuild an outdated project with 'zaigr project rebuild'", strings.TrimSpace(string(out)), err)
+		return nil, fmt.Errorf("guest host-access helper failed: %s (%w); rebuild an outdated project with 'zaigr project rebuild'", strings.TrimSpace(out.String()), err)
 	}
-	return out, nil
+	return []byte(out.String()), nil
 }
 
 func hostAccessQEMUDevices(g hostAccessGrants) []string {
@@ -90,7 +87,7 @@ func hostAccessQEMUDevices(g hostAccessGrants) []string {
 }
 
 // Called only by normal project startup, never by setup/image/rebuild VMs.
-func activateHostAccess(store projectStore, port string, grants hostAccessGrants, lock *projectMutationLock) error {
+func activateHostAccess(store projectStore, endpoint vmControlEndpoint, grants hostAccessGrants, lock *projectMutationLock) error {
 	hostBackend, record, err := runningHostNetworkRecord(store)
 	if err != nil {
 		return err
@@ -110,7 +107,7 @@ func activateHostAccess(store projectStore, port string, grants hostAccessGrants
 			_, forwardErr = hostNetworkControl(ctx, store.runtimeDir(), record.LaunchID, "forward-add", hostnet.Forward{HostPort: uint16(p.Host), GuestPort: uint16(p.VM), Protocol: "tcp"})
 			cancel()
 		} else {
-			forwardErr = q.applyPort(p, port, false)
+			forwardErr = q.applyPort(p, false)
 		}
 		if forwardErr != nil {
 			fmt.Fprintf(os.Stderr, "warning: saved host port %d is Unavailable: %v%s\n", p.Host, forwardErr, hostPortOwnerHint(store, p.Host))
@@ -132,7 +129,7 @@ func activateHostAccess(store projectStore, port string, grants hostAccessGrants
 	for i, d := range grants.Devices {
 		err := ownershipErr
 		if err == nil {
-			err = activateHostAccessDevice(q, store, port, d, &r.Devices[i])
+			err = activateHostAccessDevice(q, store, endpoint, d, &r.Devices[i])
 		}
 		r.Devices[i].Active = err == nil
 		r.Devices[i].Error = ""
@@ -147,7 +144,7 @@ func activateHostAccess(store projectStore, port string, grants hostAccessGrants
 	return nil
 }
 
-func activateHostAccessDevice(q *hostAccessQMP, store projectStore, port string, saved hostAccessDevice, runtime *hostAccessRuntimeDevice) error {
+func activateHostAccessDevice(q *hostAccessQMP, store projectStore, endpoint vmControlEndpoint, saved hostAccessDevice, runtime *hostAccessRuntimeDevice) error {
 	d, f, err := openHostAccessDevice(store, saved.Path, &saved.Identity)
 	if err != nil {
 		return err
@@ -159,7 +156,7 @@ func activateHostAccessDevice(q *hostAccessQMP, store projectStore, port string,
 	if _, err := q.command("chardev-change", map[string]any{"id": runtime.Backend, "backend": backend}); err != nil {
 		return err
 	}
-	if _, err := hostAccessGuestCommand(port, "attach", saved.Path, runtime.Target); err != nil {
+	if _, err := hostAccessGuestCommand(endpoint, "attach", saved.Path, runtime.Target); err != nil {
 		_, detachErr := q.command("chardev-change", map[string]any{"id": runtime.Backend, "backend": map[string]any{"type": "null", "data": map[string]any{}}})
 		if detachErr != nil {
 			return fmt.Errorf("%w; backend could not be detached: %v; stop the VM before removal", err, detachErr)

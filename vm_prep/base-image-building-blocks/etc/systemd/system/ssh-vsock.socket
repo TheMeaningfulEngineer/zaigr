@@ -1,0 +1,9 @@
+[Unit]
+Description=OpenSSH server over virtio-vsock
+
+[Socket]
+ListenStream=vsock::22
+Accept=yes
+
+[Install]
+WantedBy=sockets.target

@@ -60,7 +60,7 @@ func cmdProjectFirewallIPChange(rawAddress string, allow bool) error {
 				return attemptedErr
 			}
 			if (known && containsString(applied, address)) || (attemptedKnown && containsString(attempted, address)) {
-				if err := syncProjectFirewallIPsToVM(running.Port, addresses, []string{address}); err != nil {
+				if err := syncProjectFirewallIPsToVM(running.Endpoint, addresses, []string{address}); err != nil {
 					return fmt.Errorf("project firewall permission is absent from saved state, but could not be removed from the running VM: %w; restart the project VM to reconcile it", err)
 				}
 				fmt.Printf(":: Exact IPv4 address %s was already absent from saved permissions; removal applied to the running project VM\n", address)
@@ -91,7 +91,7 @@ func cmdProjectFirewallIPChange(rawAddress string, allow bool) error {
 				fmt.Printf(":: Exact IPv4 address %s is already allowed for this project on all ports; applied to the running project VM\n", address)
 				return nil
 			}
-			if err := syncProjectFirewallIPsToVM(running.Port, addresses, nil); err != nil {
+			if err := syncProjectFirewallIPsToVM(running.Endpoint, addresses, nil); err != nil {
 				return fmt.Errorf("project firewall permission is saved, but could not be reapplied to the running VM: %w; restart the project VM to reconcile it", err)
 			}
 			fmt.Printf(":: Exact IPv4 address %s is already allowed for this project on all ports; applied to the running project VM\n", address)
@@ -137,7 +137,7 @@ func cmdProjectFirewallIPChange(rawAddress string, allow bool) error {
 	if !allow {
 		revoked = []string{address}
 	}
-	if err := syncProjectFirewallIPsToVM(running.Port, updated, revoked); err != nil {
+	if err := syncProjectFirewallIPsToVM(running.Endpoint, updated, revoked); err != nil {
 		return fmt.Errorf(
 			"project firewall permission was saved, but could not be applied to the running VM: %w; retry the command or restart the project VM",
 			err,
@@ -174,16 +174,16 @@ func printProjectFirewallIPs(addresses []string, running bool) {
 	fmt.Println("# Domain permissions")
 }
 
-func syncProjectFirewallIPsToVM(port string, addresses []string, revoked []string) error {
-	return syncProjectFirewallIPsToVMContext(context.Background(), port, addresses, revoked)
+func syncProjectFirewallIPsToVM(endpoint vmControlEndpoint, addresses []string, revoked []string) error {
+	return syncProjectFirewallIPsToVMContext(context.Background(), endpoint, addresses, revoked)
 }
 
-func syncProjectFirewallIPsToVMContext(ctx context.Context, port string, addresses []string, revoked []string) error {
+func syncProjectFirewallIPsToVMContext(ctx context.Context, endpoint vmControlEndpoint, addresses []string, revoked []string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	store := currentProjectStore()
-	_ = port
+	_ = endpoint
 	_ = revoked
 	host, record, err := runningHostNetworkRecord(store)
 	if err != nil {
@@ -204,7 +204,7 @@ func syncProjectFirewallIPsToVMContext(ctx context.Context, port string, address
 	return nil
 }
 
-func syncSavedProjectFirewallIPsToVMContext(ctx context.Context, port string) error {
+func syncSavedProjectFirewallIPsToVMContext(ctx context.Context, endpoint vmControlEndpoint) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -219,13 +219,13 @@ func syncSavedProjectFirewallIPsToVMContext(ctx context.Context, port string) er
 	if err != nil {
 		return err
 	}
-	return syncProjectFirewallIPsToVMContext(ctx, port, addresses, nil)
+	return syncProjectFirewallIPsToVMContext(ctx, endpoint, addresses, nil)
 }
 
 // reconcileSavedProjectFirewallIPsToVM blocks ordinary guest entry until a
 // prior partial live mutation has been repaired. The clean cache avoids
 // republishing rules for every project vm exec.
-func reconcileSavedProjectFirewallIPsToVM(port string) error {
+func reconcileSavedProjectFirewallIPsToVM(endpoint vmControlEndpoint) error {
 	store := currentProjectStore()
 	held, err := acquireProjectFileLock(store, ".firewall-ips", "project firewall entry sync", true)
 	if err != nil {
@@ -249,7 +249,7 @@ func reconcileSavedProjectFirewallIPsToVM(port string) error {
 	if known && !attempted && equalStrings(applied, addresses) {
 		return nil
 	}
-	return syncProjectFirewallIPsToVM(port, addresses, nil)
+	return syncProjectFirewallIPsToVM(endpoint, addresses, nil)
 }
 
 func containsString(values []string, wanted string) bool {

@@ -12,7 +12,8 @@ type shellSession struct {
 	PID        int
 	StartTime  string
 	User       string
-	Port       string
+	LaunchID   string
+	VsockCID   uint32
 	MarkerPath string
 }
 
@@ -20,7 +21,7 @@ func (store projectStore) shellSessionsDir() string {
 	return filepath.Join(store.runtimeDir(), "shells")
 }
 
-func writeShellSessionMarker(store projectStore, pid int, root bool, port string) (func(), error) {
+func writeShellSessionMarker(store projectStore, pid int, root bool, endpoint vmControlEndpoint) (func(), error) {
 	startTime, err := processStartTime(pid)
 	if err != nil {
 		return nil, err
@@ -33,7 +34,7 @@ func writeShellSessionMarker(store projectStore, pid int, root bool, port string
 		user = "root"
 	}
 	markerPath := filepath.Join(store.shellSessionsDir(), strconv.Itoa(pid))
-	content := fmt.Sprintf("pid=%d\nstarttime=%s\nuser=%s\nport=%s\n", pid, startTime, user, port)
+	content := fmt.Sprintf("pid=%d\nstarttime=%s\nuser=%s\nlaunch_id=%s\nvsock_cid=%d\n", pid, startTime, user, endpoint.LaunchID, endpoint.VsockCID)
 	if err := os.WriteFile(markerPath, []byte(content), 0644); err != nil {
 		return nil, fmt.Errorf("write shell session marker: %w", err)
 	}
@@ -113,11 +114,17 @@ func readShellSessionMarker(path string) (shellSession, error) {
 			session.StartTime = value
 		case "user":
 			session.User = value
-		case "port":
-			session.Port = value
+		case "launch_id":
+			session.LaunchID = value
+		case "vsock_cid":
+			cid, err := strconv.ParseUint(value, 10, 32)
+			if err != nil {
+				return shellSession{}, err
+			}
+			session.VsockCID = uint32(cid)
 		}
 	}
-	if session.PID == 0 || session.StartTime == "" {
+	if session.PID == 0 || session.StartTime == "" || session.LaunchID == "" || session.VsockCID < 3 {
 		return shellSession{}, fmt.Errorf("incomplete shell session marker: %s", path)
 	}
 	return session, nil

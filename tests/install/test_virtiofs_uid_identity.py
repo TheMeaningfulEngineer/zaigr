@@ -130,7 +130,7 @@ def test_restricted_userns_fails_closed_until_profile_is_loaded(cloudvm_factory,
         user="user",
     )
     checked(vm, "sudo apparmor_parser -r /etc/apparmor.d/zaigr-virtiofsd", user="user")
-    assert "6/6 checks passed" in checked(vm, "zaigr misc check", user="user", env=env, timeout=90)
+    assert "7/7 checks passed" in checked(vm, "zaigr misc check", user="user", env=env, timeout=90)
     started = vm.run(
         "zaigr project vm start --ram 512 --cpu 1", cwd="/home/user/project",
         user="user", env=env, input="y\n", timeout=240,

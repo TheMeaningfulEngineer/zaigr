@@ -82,9 +82,12 @@ fakeroot sh -c "
     chown root:root \"$ROOTFS_DIR/usr/local/lib/zaigr/run-preset-isolated\"
     chmod 0700 \"$ROOTFS_DIR/usr/local/lib/zaigr/run-preset-isolated\"
 
-    mkdir -p \"$ROOTFS_DIR/etc/systemd/system/multi-user.target.wants\"
+    mkdir -p \"$ROOTFS_DIR/etc/systemd/system/sockets.target.wants\"
+    mkdir -p \"$ROOTFS_DIR/etc/systemd/system\"
 
-    ln -sfn /usr/lib/systemd/system/ssh.service \"$ROOTFS_DIR/etc/systemd/system/multi-user.target.wants/ssh.service\"
+    ln -sfn /dev/null \"$ROOTFS_DIR/etc/systemd/system/ssh.service\"
+    ln -sfn /dev/null \"$ROOTFS_DIR/etc/systemd/system/ssh.socket\"
+    ln -sfn /etc/systemd/system/ssh-vsock.socket \"$ROOTFS_DIR/etc/systemd/system/sockets.target.wants/ssh-vsock.socket\"
 
     echo \"base-image:$BASE_VERSION\" > \"$ROOTFS_DIR/etc/base-image-version\"
     chmod 644 \"$ROOTFS_DIR/etc/base-image-version\"
@@ -100,4 +103,4 @@ zstd -1 --rm -f -o "$ROOTFS_ZST" "$ROOTFS_IMG"
 
 SIZE=$(ls -lh "$ROOTFS_ZST" | awk '{print $5}')
 echo ":: base-rootfs.img.zst ready ($SIZE, version: $BASE_VERSION)"
-echo ":: Root password set (use 'zaigr ssh --root' for access)"
+echo ":: Guest SSH is available only through zaigr's vsock control channel"

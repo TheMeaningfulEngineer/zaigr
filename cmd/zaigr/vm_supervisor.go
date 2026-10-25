@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -24,6 +25,7 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/sys/unix"
 	"zaigr/cmd/zaigr/hostnet"
+	"zaigr/cmd/zaigr/vmssh"
 )
 
 type vmOwnedProcess struct {
@@ -34,9 +36,15 @@ type vmOwnedProcess struct {
 	ExeInode     uint64 `json:"exe_inode"`
 }
 
+type vmExecutableIdentity struct {
+	Device uint64
+	Inode  uint64
+}
+
 type vmSupervisorRecord struct {
 	VirtiofsSandbox      string                    `json:"virtiofs_sandbox,omitempty"`
 	FormatVersion        int                       `json:"format_version"`
+	VsockCID             uint32                    `json:"vsock_cid,omitempty"`
 	LaunchID             string                    `json:"launch_id"`
 	Mode                 string                    `json:"mode"`
 	NetworkBackend       string                    `json:"network_backend,omitempty"`
@@ -48,38 +56,60 @@ type vmSupervisorRecord struct {
 	AgentStateDaemon     vmOwnedProcess            `json:"agent_state_daemon,omitempty"`
 	WorkspaceDescendant  vmOwnedProcess            `json:"workspace_descendant,omitempty"`
 	AgentStateDescendant vmOwnedProcess            `json:"agent_state_descendant,omitempty"`
+	SSHBroker            vmOwnedProcess            `json:"ssh_broker,omitempty"`
 	NetworkGeneration    uint64                    `json:"network_generation,omitempty"`
 	NetworkProcesses     map[string]vmOwnedProcess `json:"network_processes,omitempty"`
 }
 
 type vmLaunchSpec struct {
-	VirtiofsSandbox     string
-	Store               string
-	LogRoot             string
-	RuntimeDir          string
-	MonitorSock         string
-	WorkspaceSock       string
-	AgentStateSock      string
-	WorkspaceSockAlias  string
-	AgentStateSockAlias string
-	SocketDir           string
-	Workspace           string
-	AgentState          string
-	Virtiofsd           string
-	SerialLog           string
-	SSHPort             string
-	Mode                string
-	NetworkBackend      string
-	LaunchID            string
-	GuestUID            int
-	GuestGID            int
-	QEMUPath            string
-	QEMUArgs            []string
+	PrecommitDeadlineUnixNano int64
+	VirtiofsSandbox           string
+	Store                     string
+	LogRoot                   string
+	RuntimeDir                string
+	MonitorSock               string
+	WorkspaceSock             string
+	AgentStateSock            string
+	WorkspaceSockAlias        string
+	AgentStateSockAlias       string
+	SocketDir                 string
+	Workspace                 string
+	AgentState                string
+	Virtiofsd                 string
+	SerialLog                 string
+	VsockCID                  uint32
+	RootSSHKeyPath            string
+	UserSSHKeyPath            string
+	Mode                      string
+	NetworkBackend            string
+	LaunchID                  string
+	GuestUID                  int
+	GuestGID                  int
+	QEMUPath                  string
+	QEMUArgs                  []string
 }
 
 type vmLaunchMessage struct {
 	State   string `json:"state"`
 	Message string `json:"message,omitempty"`
+}
+
+const vmGuestCIDCollisionState = "cid-collision"
+
+const vmSupervisorPrecommitTimeout = 150 * time.Second
+const vmSupervisorReplyGrace = time.Second
+
+type vmGuestCIDCollisionError struct {
+	CID       uint32
+	Retryable bool
+	Detail    string
+}
+
+func (err *vmGuestCIDCollisionError) Error() string {
+	if err.Detail != "" {
+		return fmt.Sprintf("QEMU vhost-vsock guest CID %d is already in use: %s", err.CID, err.Detail)
+	}
+	return fmt.Sprintf("QEMU vhost-vsock guest CID %d is already in use", err.CID)
 }
 
 type vmLaunchHandle struct {
@@ -123,12 +153,15 @@ func newVMSupervisorCommand() *cobra.Command {
 	f.StringVar(&spec.AgentState, "agent-state", "", "agent-state export")
 	f.StringVar(&spec.Virtiofsd, "virtiofsd", "", "static virtiofsd executable")
 	f.StringVar(&spec.SerialLog, "serial-log", "", "durable QEMU serial log")
-	f.StringVar(&spec.SSHPort, "ssh-port", "", "SSH forwarding port")
+	f.Uint32Var(&spec.VsockCID, "vsock-cid", 0, "guest vsock CID")
+	f.StringVar(&spec.RootSSHKeyPath, "root-ssh-key", "", "protected root SSH private key")
+	f.StringVar(&spec.UserSSHKeyPath, "user-ssh-key", "", "protected user SSH private key")
 	f.StringVar(&spec.Mode, "mode", "", "attached or detached")
 	spec.NetworkBackend = vmNetworkBackendHost
 	f.StringVar(&spec.LaunchID, "launch-id", "", "launch identity")
 	f.IntVar(&spec.GuestUID, "guest-uid", 0, "guest user UID")
 	f.IntVar(&spec.GuestGID, "guest-gid", 0, "guest user primary GID")
+	f.Int64Var(&spec.PrecommitDeadlineUnixNano, "precommit-deadline-unix-ns", 0, "internal supervisor startup deadline")
 	return command
 }
 
@@ -142,7 +175,7 @@ func validateVMLaunchSpec(spec vmLaunchSpec) error {
 	if spec.VirtiofsSandbox != "namespace" {
 		return virtiofsNamespaceRequiredError("the requested VM launch does not use virtiofs-sandbox=namespace")
 	}
-	if spec.SocketDir != "" && (spec.SocketDir != vmSocketDir(spec.LaunchID) || spec.WorkspaceSock != filepath.Join(spec.SocketDir, "workspace.sock") || spec.AgentStateSock != filepath.Join(spec.SocketDir, "agent-state.sock")) {
+	if spec.SocketDir == "" || spec.SocketDir != vmSocketDir(spec.LaunchID) || spec.WorkspaceSock != filepath.Join(spec.SocketDir, "workspace.sock") || spec.AgentStateSock != filepath.Join(spec.SocketDir, "agent-state.sock") {
 		return fmt.Errorf("invalid VM socket directory")
 	}
 	for label, path := range map[string]string{
@@ -161,8 +194,17 @@ func validateVMLaunchSpec(spec vmLaunchSpec) error {
 			return fmt.Errorf("%s Unix socket path exceeds Linux's 107-byte limit: %s", label, path)
 		}
 	}
-	if spec.LaunchID == "" || spec.SSHPort == "" || (spec.Mode != "attached" && spec.Mode != "detached") {
-		return fmt.Errorf("invalid VM launch identity, port, or mode")
+	sshSocket := vmControlSocketPath(spec.SocketDir, spec.LaunchID)
+	if len(sshSocket) > 107 {
+		return fmt.Errorf("SSH broker Unix socket path exceeds Linux's 107-byte limit: %s", sshSocket)
+	}
+	if spec.LaunchID == "" || spec.VsockCID < 3 || (spec.Mode != "attached" && spec.Mode != "detached") {
+		return fmt.Errorf("invalid VM launch identity, vsock CID, or mode")
+	}
+	for label, path := range map[string]string{"root SSH key": spec.RootSSHKeyPath, "user SSH key": spec.UserSSHKeyPath} {
+		if path == "" || !filepath.IsAbs(path) {
+			return fmt.Errorf("%s must be an absolute path", label)
+		}
 	}
 	if spec.GuestUID <= 0 || spec.GuestGID <= 0 {
 		return fmt.Errorf("invalid guest user identity")
@@ -177,8 +219,11 @@ func vmSupervisorArgs(spec vmLaunchSpec) []string {
 		"--workspace-sock", spec.WorkspaceSock, "--agent-state-sock", spec.AgentStateSock,
 		"--workspace", spec.Workspace, "--agent-state", spec.AgentState,
 		"--virtiofsd", spec.Virtiofsd, "--serial-log", spec.SerialLog,
-		"--ssh-port", spec.SSHPort, "--mode", spec.Mode, "--launch-id", spec.LaunchID,
+		"--vsock-cid", strconv.FormatUint(uint64(spec.VsockCID), 10),
+		"--root-ssh-key", spec.RootSSHKeyPath, "--user-ssh-key", spec.UserSSHKeyPath,
+		"--mode", spec.Mode, "--launch-id", spec.LaunchID,
 		"--guest-uid", strconv.Itoa(spec.GuestUID), "--guest-gid", strconv.Itoa(spec.GuestGID),
+		"--precommit-deadline-unix-ns", strconv.FormatInt(spec.PrecommitDeadlineUnixNano, 10),
 	}
 	if spec.WorkspaceSockAlias != "" {
 		args = append(args, "--workspace-sock-alias", spec.WorkspaceSockAlias)
@@ -210,8 +255,8 @@ func readVMSupervisorRecord(store projectStore) (vmSupervisorRecord, error) {
 	if err = json.Unmarshal(data, &record); err != nil {
 		return record, fmt.Errorf("decode VM supervisor record: %w", err)
 	}
-	if record.FormatVersion != 1 || record.LaunchID == "" {
-		return record, fmt.Errorf("unsupported VM supervisor record")
+	if (record.FormatVersion != 1 && record.FormatVersion != 2) || record.LaunchID == "" {
+		return record, fmt.Errorf("unsupported VM supervisor record format %d", record.FormatVersion)
 	}
 	if err := validateVMSupervisorRecord(record); err != nil {
 		return record, err
@@ -220,6 +265,12 @@ func readVMSupervisorRecord(store projectStore) (vmSupervisorRecord, error) {
 }
 
 func validateVMSupervisorRecord(record vmSupervisorRecord) error {
+	if record.FormatVersion == 2 && record.VsockCID < 3 {
+		return fmt.Errorf("VM supervisor record has invalid guest vsock CID")
+	}
+	if record.FormatVersion == 2 && record.SocketDir != vmSocketDir(record.LaunchID) {
+		return fmt.Errorf("VM supervisor record has invalid socket directory")
+	}
 	if record.VirtiofsSandbox != "" && record.VirtiofsSandbox != "namespace" && record.VirtiofsSandbox != "none" {
 		return fmt.Errorf("VM supervisor record has invalid virtiofs sandbox mode")
 	}
@@ -244,7 +295,7 @@ func validateVMSupervisorRecord(record vmSupervisorRecord) error {
 	}{
 		{"supervisor", record.Supervisor}, {"workspace daemon", record.WorkspaceDaemon},
 		{"workspace descendant", record.WorkspaceDescendant}, {"agent-state daemon", record.AgentStateDaemon},
-		{"agent-state descendant", record.AgentStateDescendant}, {"QEMU", record.QEMU},
+		{"agent-state descendant", record.AgentStateDescendant}, {"QEMU", record.QEMU}, {"SSH broker", record.SSHBroker},
 	}
 	absent := false
 	for _, child := range children {
@@ -403,7 +454,7 @@ func validateStaleVMRecord(store projectStore, record vmSupervisorRecord) error 
 			return fmt.Errorf("previous VM supervisor is still live")
 		}
 		live := false
-		for _, child := range []vmOwnedProcess{record.QEMU, record.WorkspaceDaemon, record.AgentStateDaemon, record.WorkspaceDescendant, record.AgentStateDescendant} {
+		for _, child := range []vmOwnedProcess{record.QEMU, record.WorkspaceDaemon, record.AgentStateDaemon, record.WorkspaceDescendant, record.AgentStateDescendant, record.SSHBroker} {
 			childLive, err := vmProcessLive(child)
 			if err != nil {
 				return fmt.Errorf("inspect previous VM descendant %d: %w", child.PID, err)
@@ -569,6 +620,193 @@ func vmProcessIdentity(pid int) (vmOwnedProcess, error) {
 	return vmOwnedProcess{PID: pid, StartTime: start, ProcessGroup: pgid, ExeDevice: uint64(stat.Dev), ExeInode: stat.Ino}, nil
 }
 
+func processState(pid int) (byte, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, err
+	}
+	index := strings.LastIndexByte(string(data), ')')
+	if index < 0 || index+2 >= len(data) {
+		return 0, fmt.Errorf("malformed process stat for PID %d", pid)
+	}
+	return data[index+2], nil
+}
+
+func sameProcessInstance(actual, expected vmOwnedProcess) bool {
+	return actual.PID == expected.PID && actual.StartTime == expected.StartTime && actual.ProcessGroup == expected.ProcessGroup
+}
+
+func terminateOwnedChildLauncher(child *exec.Cmd, expected vmOwnedProcess) error {
+	if child == nil || child.Process == nil || child.Process.Pid != expected.PID {
+		return fmt.Errorf("owned launcher handle for PID %d is unavailable", expected.PID)
+	}
+	if expected.ProcessGroup != expected.PID {
+		return fmt.Errorf("owned launcher PID %d is not the leader of its expected session", expected.PID)
+	}
+	actual, err := vmProcessIdentity(expected.PID)
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
+		members, memberErr := daemonGroupMembers(expected)
+		if memberErr != nil {
+			return fmt.Errorf("inspect owned launcher group %d after leader exit: %w", expected.ProcessGroup, memberErr)
+		}
+		if len(members) > 0 {
+			return fmt.Errorf("owned launcher leader PID %d exited while its process group still has members; refusing unanchored signaling", expected.PID)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("verify owned launcher PID %d before cleanup: %w", expected.PID, err)
+	}
+	if !sameProcessInstance(actual, expected) {
+		return fmt.Errorf("owned launcher PID %d changed before cleanup", expected.PID)
+	}
+	initialMembers, err := daemonGroupMembers(expected)
+	if err != nil {
+		return fmt.Errorf("snapshot owned launcher group %d: %w", expected.ProcessGroup, err)
+	}
+	if len(initialMembers) == 0 {
+		return nil
+	}
+	initialInstances := make(map[int]string, len(initialMembers))
+	for _, member := range initialMembers {
+		initialInstances[member.PID] = member.StartTime
+	}
+	var cleanupErr error
+	// startChild creates a fresh session, so while the verified leader is live
+	// its process group contains only this daemon and its descendants.
+	if err := syscall.Kill(-expected.ProcessGroup, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("terminate owned launcher group %d: %w", expected.ProcessGroup, err))
+	}
+	if err := child.Process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) && !errors.Is(err, syscall.ESRCH) {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("terminate owned launcher PID %d: %w", expected.PID, err))
+	}
+	waitGroup := func(deadline time.Time) ([]vmOwnedProcess, error) {
+		for time.Now().Before(deadline) {
+			members, err := daemonGroupMembers(expected)
+			if err != nil {
+				return nil, err
+			}
+			if len(members) == 0 {
+				return members, nil
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		members, err := daemonGroupMembers(expected)
+		return members, err
+	}
+	remaining, waitErr := waitGroup(time.Now().Add(time.Second))
+	cleanupErr = errors.Join(cleanupErr, waitErr)
+	if waitErr == nil && len(remaining) > 0 {
+		anchoredMember := false
+		for _, member := range remaining {
+			if initialInstances[member.PID] == member.StartTime {
+				anchoredMember = true
+				break
+			}
+		}
+		if !anchoredMember {
+			return errors.Join(cleanupErr, fmt.Errorf("owned launcher group %d no longer has a verified member; refusing escalation", expected.ProcessGroup))
+		}
+		if err := syscall.Kill(-expected.ProcessGroup, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("kill owned launcher group %d: %w", expected.ProcessGroup, err))
+		}
+		remaining, waitErr = waitGroup(time.Now().Add(time.Second))
+		cleanupErr = errors.Join(cleanupErr, waitErr)
+		if waitErr == nil && len(remaining) > 0 {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("owned launcher group %d remains live after SIGKILL", expected.ProcessGroup))
+		}
+	}
+	return cleanupErr
+}
+
+func executableIdentity(path string) (vmExecutableIdentity, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return vmExecutableIdentity{}, fmt.Errorf("inspect expected executable %s: %w", path, err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return vmExecutableIdentity{}, fmt.Errorf("inspect expected executable identity for %s", path)
+	}
+	return vmExecutableIdentity{Device: uint64(stat.Dev), Inode: stat.Ino}, nil
+}
+
+func waitForExpectedExecutable(expected vmOwnedProcess, executable vmExecutableIdentity, deadline time.Time) (vmOwnedProcess, error) {
+	for time.Now().Before(deadline) {
+		actual, err := vmProcessIdentity(expected.PID)
+		if err == nil {
+			if !sameProcessInstance(actual, expected) {
+				return vmOwnedProcess{}, fmt.Errorf("PID %d changed while waiting for executable transition", expected.PID)
+			}
+			if actual.ExeDevice == executable.Device && actual.ExeInode == executable.Inode {
+				return actual, nil
+			}
+		} else if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
+			return vmOwnedProcess{}, fmt.Errorf("PID %d exited before executable transition: %w", expected.PID, err)
+		} else {
+			return vmOwnedProcess{}, err
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return vmOwnedProcess{}, fmt.Errorf("PID %d did not transition to the expected executable before startup deadline", expected.PID)
+}
+
+func waitForQEMUProcessIdentity(launcher vmOwnedProcess, spec vmLaunchSpec, deadline time.Time) (vmOwnedProcess, bool, error) {
+	for time.Now().Before(deadline) {
+		state, err := processState(launcher.PID)
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
+			return vmOwnedProcess{}, false, nil
+		}
+		if err != nil {
+			return vmOwnedProcess{}, false, err
+		}
+		if state == 'Z' || state == 'X' {
+			return vmOwnedProcess{}, false, nil
+		}
+		actual, err := vmProcessIdentity(launcher.PID)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
+				return vmOwnedProcess{}, false, nil
+			}
+			return vmOwnedProcess{}, false, err
+		}
+		if !sameProcessInstance(actual, launcher) {
+			return vmOwnedProcess{}, false, fmt.Errorf("QEMU launcher PID %d changed before executable confirmation", launcher.PID)
+		}
+		args, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", launcher.PID))
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
+			return vmOwnedProcess{}, false, nil
+		}
+		if err != nil {
+			return vmOwnedProcess{}, false, err
+		}
+		argv := strings.Split(strings.TrimRight(string(args), "\x00"), "\x00")
+		exePath, exeErr := os.Readlink(fmt.Sprintf("/proc/%d/exe", launcher.PID))
+		if errors.Is(exeErr, os.ErrNotExist) || errors.Is(exeErr, syscall.ESRCH) {
+			return vmOwnedProcess{}, false, nil
+		}
+		if exeErr != nil {
+			return vmOwnedProcess{}, false, exeErr
+		}
+		if len(argv) > 0 && filepath.Base(argv[0]) == "qemu-system-x86_64" && filepath.Base(exePath) == "qemu-system-x86_64" {
+			qmpMatches, cidMatches := false, false
+			for i := 1; i+1 < len(argv); i++ {
+				if argv[i] == "-qmp" && qemuSocketPathFromOption(argv[i+1]) == spec.MonitorSock {
+					qmpMatches = true
+				}
+				if argv[i] == "-device" && argv[i+1] == fmt.Sprintf("vhost-vsock-device,guest-cid=%d", spec.VsockCID) {
+					cidMatches = true
+				}
+			}
+			if qmpMatches && cidMatches {
+				return actual, true, nil
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return vmOwnedProcess{}, false, fmt.Errorf("QEMU process PID %d did not exec with the expected QMP socket and vsock CID before startup deadline", launcher.PID)
+}
+
 func launchSupervisedVM(spec vmLaunchSpec) (*vmLaunchHandle, error) {
 	mode, err := selectVirtiofsSandbox(virtiofsPreferenceStore(spec))
 	if err != nil {
@@ -626,7 +864,7 @@ func launchSupervisedVM(spec vmLaunchSpec) (*vmLaunchHandle, error) {
 			}
 		}()
 	}
-	if err := os.WriteFile(filepath.Join(spec.RuntimeDir, "ssh-port"), []byte(spec.SSHPort), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(spec.RuntimeDir, "vsock-cid"), []byte(strconv.FormatUint(uint64(spec.VsockCID), 10)+"\n"), 0600); err != nil {
 		return nil, err
 	}
 	readyRead, readyWrite, err := os.Pipe()
@@ -640,6 +878,8 @@ func launchSupervisedVM(spec vmLaunchSpec) (*vmLaunchHandle, error) {
 		return nil, err
 	}
 	defer func() { _ = controlRead.Close() }()
+	precommitDeadline := time.Now().Add(vmSupervisorPrecommitTimeout)
+	spec.PrecommitDeadlineUnixNano = precommitDeadline.UnixNano()
 	command := exec.Command("/proc/self/exe", vmSupervisorArgs(spec)...)
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	command.ExtraFiles = []*os.File{readyWrite, controlRead, lock}
@@ -650,7 +890,6 @@ func launchSupervisedVM(spec vmLaunchSpec) (*vmLaunchHandle, error) {
 		return nil, err
 	}
 	command.Stdout, command.Stderr = log, log
-	precommitDeadline := time.Now().Add(150 * time.Second)
 	if err = command.Start(); err != nil {
 		_ = log.Close()
 		_ = readyRead.Close()
@@ -687,14 +926,92 @@ func launchSupervisedVM(spec vmLaunchSpec) (*vmLaunchHandle, error) {
 	}()
 	// FD3 remains open until the commit reply. A bounded read also catches a
 	// crashed supervisor whose inherited pipe closed without a message.
-	message, err := handle.readMessage(30 * time.Second)
+	message, err := handle.readMessage(time.Until(precommitDeadline) + vmSupervisorReplyGrace)
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("VM supervisor startup: %w", err), handle.cancel())
+	}
+	if message.State == vmGuestCIDCollisionState {
+		collision := &vmGuestCIDCollisionError{CID: spec.VsockCID, Detail: message.Message}
+		cleanupErr := handle.cancel()
+		if _, recordErr := readVMSupervisorRecord(store); recordErr == nil {
+			return nil, errors.Join(errors.New("guest CID collision cleanup left supervisor metadata"), cleanupErr)
+		} else if !os.IsNotExist(recordErr) {
+			return nil, errors.Join(fmt.Errorf("guest CID collision cleanup could not verify supervisor metadata: %w", recordErr), cleanupErr)
+		}
+		if _, runtimeErr := os.Stat(spec.RuntimeDir); runtimeErr == nil {
+			return nil, errors.Join(errors.New("guest CID collision cleanup left runtime state"), cleanupErr)
+		} else if !os.IsNotExist(runtimeErr) {
+			return nil, errors.Join(fmt.Errorf("guest CID collision cleanup could not verify runtime state: %w", runtimeErr), cleanupErr)
+		}
+		collision.Retryable = true
+		return nil, collision
 	}
 	if message.State != "ready" {
 		return nil, errors.Join(fmt.Errorf("VM supervisor startup: %s", message.Message), handle.cancel())
 	}
 	return handle, nil
+}
+
+const maxGuestCIDLaunchAttempts = 8
+
+func launchSupervisedVMWithCIDRetry(spec vmLaunchSpec) (vmControlEndpoint, *vmLaunchHandle, error) {
+	baseArgs := append([]string(nil), spec.QEMUArgs...)
+	for attempt := 1; attempt <= maxGuestCIDLaunchAttempts; attempt++ {
+		cid, err := newGuestVsockCID()
+		if err != nil {
+			return vmControlEndpoint{}, nil, err
+		}
+		args, err := qemuArgsWithGuestCID(baseArgs, cid)
+		if err != nil {
+			return vmControlEndpoint{}, nil, err
+		}
+		attemptSpec := spec
+		attemptSpec.VsockCID = cid
+		attemptSpec.QEMUArgs = args
+		handle, err := launchSupervisedVM(attemptSpec)
+		if err == nil {
+			endpoint, endpointErr := vmControlEndpointForLaunch(attemptSpec)
+			if endpointErr != nil {
+				return vmControlEndpoint{}, nil, errors.Join(endpointErr, handle.cancel())
+			}
+			return endpoint, handle, nil
+		}
+		var collision *vmGuestCIDCollisionError
+		if !errors.As(err, &collision) || !collision.Retryable {
+			return vmControlEndpoint{}, nil, err
+		}
+		if attempt == maxGuestCIDLaunchAttempts {
+			return vmControlEndpoint{}, nil, fmt.Errorf("guest vsock CID remained occupied after %d QEMU launches: %w", maxGuestCIDLaunchAttempts, err)
+		}
+		logWarn("QEMU reported an occupied guest vsock CID; retrying with a new CID", "attempt", attempt, "max_attempts", maxGuestCIDLaunchAttempts, "cid", cid)
+	}
+	return vmControlEndpoint{}, nil, errors.New("guest vsock CID retry loop ended unexpectedly")
+}
+
+func qemuArgsWithGuestCID(args []string, cid uint32) ([]string, error) {
+	updated := append([]string(nil), args...)
+	found := false
+	for i, arg := range updated {
+		if !strings.HasPrefix(arg, "vhost-vsock-device,") {
+			continue
+		}
+		parts := strings.Split(arg, ",")
+		for partIndex, part := range parts {
+			if !strings.HasPrefix(part, "guest-cid=") {
+				continue
+			}
+			if found {
+				return nil, errors.New("QEMU arguments contain multiple vhost-vsock guest CIDs")
+			}
+			parts[partIndex] = "guest-cid=" + strconv.FormatUint(uint64(cid), 10)
+			updated[i] = strings.Join(parts, ",")
+			found = true
+		}
+	}
+	if !found {
+		return nil, errors.New("QEMU arguments do not contain a vhost-vsock guest CID")
+	}
+	return updated, nil
 }
 
 func (handle *vmLaunchHandle) readMessage(timeout time.Duration) (vmLaunchMessage, error) {
@@ -818,46 +1135,35 @@ func (handle *vmLaunchHandle) stop() error {
 }
 
 func waitForVMGuestReady(handle *vmLaunchHandle, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	rootKey := rootSSHKeyPath()
-	for time.Now().Before(deadline) {
-		select {
-		case <-handle.exited:
-			return fmt.Errorf("VM supervisor exited before guest readiness: %v; see %s", handle.exitErr, filepath.Join(handle.spec.LogRoot, "vm-supervisor.log"))
-		default:
-		}
-		remaining := time.Until(deadline)
-		if remaining > 3*time.Second {
-			remaining = 3 * time.Second
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), remaining)
-		go func() {
-			select {
-			case <-handle.exited:
-				cancel()
-			case <-ctx.Done():
-			}
-		}()
-		args := append(sshManagedOptions(),
-			"-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-i", rootKey,
-			"-p", handle.spec.SSHPort, "root@localhost",
-			"findmnt -n -o FSTYPE /home/user/workspace; findmnt -n -o FSTYPE /home/user/.zaigr-agent-state")
-		output, err := exec.CommandContext(ctx, "ssh", args...).CombinedOutput()
-		cancel()
-		if err == nil {
-			mounts := strings.Fields(string(output))
-			if len(mounts) == 2 && mounts[0] == "virtiofs" && mounts[1] == "virtiofs" {
-				return nil
-			}
-			return fmt.Errorf("guest mount verification failed (workspace and agent state must be virtiofs): %q", strings.TrimSpace(string(output)))
-		}
-		select {
-		case <-handle.exited:
-			return fmt.Errorf("VM supervisor exited before guest readiness: %v; see %s", handle.exitErr, filepath.Join(handle.spec.LogRoot, "vm-supervisor.log"))
-		case <-time.After(200 * time.Millisecond):
-		}
+	if handle == nil {
+		return fmt.Errorf("VM launch handle is missing")
 	}
-	return fmt.Errorf("VM SSH and virtiofs mounts were not ready within %s; see %s", timeout, filepath.Join(handle.spec.LogRoot, "vm-supervisor.log"))
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	var output bytes.Buffer
+	command := "findmnt -n -o FSTYPE /home/user/workspace; findmnt -n -o FSTYPE /home/user/.zaigr-agent-state"
+	endpoint, err := vmControlEndpointForLaunch(handle.spec)
+	if err != nil {
+		return err
+	}
+	err = vmssh.Run(ctx, endpoint.SocketPath, vmssh.Request{User: "root", Command: command}, nil, &output, io.Discard)
+	if err != nil {
+		return fmt.Errorf("verify guest mounts over vsock SSH: %w", err)
+	}
+	mounts := strings.Fields(output.String())
+	if len(mounts) != 2 || mounts[0] != "virtiofs" || mounts[1] != "virtiofs" {
+		return fmt.Errorf("guest mount verification failed (workspace and agent state must be virtiofs): %q", strings.TrimSpace(output.String()))
+	}
+	return nil
+}
+
+func vmControlEndpointForLaunch(spec vmLaunchSpec) (vmControlEndpoint, error) {
+	return vmControlEndpointForRecord(vmSupervisorRecord{
+		RuntimeDir: spec.RuntimeDir,
+		SocketDir:  spec.SocketDir,
+		LaunchID:   spec.LaunchID,
+		VsockCID:   spec.VsockCID,
+	})
 }
 
 func openVMLog(root, name, launchID string) (*os.File, error) {
@@ -899,6 +1205,28 @@ func qemuExitResult(err error) error {
 	return fmt.Errorf("QEMU exited: %w", err)
 }
 
+func qemuCIDCollisionSince(path string, offset int64) (string, bool) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer file.Close()
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return "", false
+	}
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return "", false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "vhost-vsock") && strings.Contains(lower, "guest cid") && strings.Contains(lower, "address already in use") {
+			return strings.TrimSpace(line), true
+		}
+	}
+	return "", false
+}
+
 func startSupervisorHostNetwork(spec vmLaunchSpec, store projectStore) (*hostNetworkHandle, error) {
 	names, generation, grants, err := loadHostNetworkInitialPolicy(store)
 	if err != nil {
@@ -912,15 +1240,23 @@ func startSupervisorHostNetwork(spec vmLaunchSpec, store projectStore) (*hostNet
 	if err != nil {
 		return nil, err
 	}
-	sshPort, err := strconv.ParseUint(spec.SSHPort, 10, 16)
-	if err != nil || sshPort == 0 {
-		return nil, fmt.Errorf("invalid SSH host port %q for host network backend", spec.SSHPort)
-	}
 	return startHostNetworkRuntime(context.Background(), hostnet.Options{
 		LaunchID: spec.LaunchID, RuntimeDir: spec.RuntimeDir, Executable: executable,
-		SlirpPath: slirp, SSHHostPort: uint16(sshPort), SSHGuestPort: 22,
+		SlirpPath:       slirp,
 		InitialIPGrants: grants, InitialGeneration: generation,
 	}, store, names, generation)
+}
+
+func newGuestVsockCID() (uint32, error) {
+	var raw [4]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return 0, fmt.Errorf("generate guest vsock CID: %w", err)
+	}
+	// Keep random CIDs in the upper half of the 32-bit space, away from the
+	// well-known local, host, and any CIDs. QEMU reports collisions at launch.
+	cid := uint32(raw[0])<<24 | uint32(raw[1])<<16 | uint32(raw[2])<<8 | uint32(raw[3])
+	cid = 0x40000000 | (cid & 0x3fffffff)
+	return cid, nil
 }
 
 func hostNetworkOwnedProcesses(processes map[string]hostnet.ProcessIdentity) (map[string]vmOwnedProcess, error) {
@@ -1115,14 +1451,22 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 		// teardown handler is installed. Report those through the same bounded
 		// readiness protocol instead of making the launcher infer an exit code.
 		if retErr != nil && !committed && !readyErrorReported && ready != nil {
-			_, _ = fmt.Fprintf(ready, "{\"state\":\"error\",\"message\":%q}\n", retErr.Error())
+			state := "error"
+			var collision *vmGuestCIDCollisionError
+			if errors.As(retErr, &collision) {
+				state = vmGuestCIDCollisionState
+			}
+			_, _ = fmt.Fprintf(ready, "{\"state\":%q,\"message\":%q}\n", state, retErr.Error())
 		}
 		if ready != nil {
 			_ = ready.Close()
 		}
 	}()
 	startupDeadline := time.Now().Add(30 * time.Second)
-	precommitDeadline := time.Now().Add(150 * time.Second)
+	precommitDeadline := time.Now().Add(vmSupervisorPrecommitTimeout)
+	if spec.PrecommitDeadlineUnixNano > 0 {
+		precommitDeadline = time.Unix(0, spec.PrecommitDeadlineUnixNano)
+	}
 	precommitTimer := time.NewTimer(time.Until(precommitDeadline))
 	defer precommitTimer.Stop()
 	if err := validateVMLaunchSpec(spec); err != nil {
@@ -1179,7 +1523,7 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 	if err != nil {
 		return err
 	}
-	record := vmSupervisorRecord{FormatVersion: 1, LaunchID: spec.LaunchID, Mode: spec.Mode, NetworkBackend: spec.NetworkBackend, RuntimeDir: spec.RuntimeDir, SocketDir: spec.SocketDir, Supervisor: own, VirtiofsSandbox: spec.VirtiofsSandbox}
+	record := vmSupervisorRecord{FormatVersion: 2, VsockCID: spec.VsockCID, LaunchID: spec.LaunchID, Mode: spec.Mode, NetworkBackend: spec.NetworkBackend, RuntimeDir: spec.RuntimeDir, SocketDir: spec.SocketDir, Supervisor: own, VirtiofsSandbox: spec.VirtiofsSandbox}
 	if spec.NetworkBackend == vmNetworkBackendHost {
 		record.NetworkGeneration = 1
 	}
@@ -1205,12 +1549,15 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 	defer signal.Stop(signals)
 	children := map[string]*exec.Cmd{}
 	alive := map[string]bool{}
+	expectedExecutables := map[string]vmExecutableIdentity{}
 	var networkHandle *hostNetworkHandle
+	var sshBroker *vmSSHBroker
 	var networkExitWriter *os.File
 	var qemuTap *os.File
 	var qemuMaintenanceTap *os.File
 	var recordMu sync.Mutex
 	networkCleanupFailed := false
+	childTransitionCleanupFailed := false
 	defer func() {
 		// Closing the slirp exit writer is the first teardown action: it drops
 		// uplink connectivity before coordinator locks or DNS workers can delay
@@ -1227,9 +1574,24 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 			_ = qemuMaintenanceTap.Close()
 			qemuMaintenanceTap = nil
 		}
+		// Send the phase-specific startup error immediately after closing the
+		// uplink. Broker shutdown can take its own bounded grace period, but it
+		// must not hide the failure from the launcher until then.
 		if retErr != nil && !committed {
-			_, _ = fmt.Fprintf(ready, "{\"state\":\"error\",\"message\":%q}\n", retErr.Error())
+			state := "error"
+			var collision *vmGuestCIDCollisionError
+			if errors.As(retErr, &collision) {
+				state = vmGuestCIDCollisionState
+			}
+			_, _ = fmt.Fprintf(ready, "{\"state\":%q,\"message\":%q}\n", state, retErr.Error())
 			readyErrorReported = true
+		}
+		if sshBroker != nil {
+			retErr = errors.Join(retErr, sshBroker.Close())
+			brokerLive, brokerErr := vmProcessLive(record.SSHBroker)
+			retErr = errors.Join(retErr, brokerErr)
+			alive["ssh-broker"] = brokerLive || brokerErr != nil
+			sshBroker = nil
 		}
 		if networkHandle != nil {
 			closeErr := networkHandle.Close(context.Background())
@@ -1242,7 +1604,7 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 				networkCleanupFailed = true
 			}
 		}
-		if err := teardownVMChildren(spec, record, children, alive, exit, supervisorLog); err != nil {
+		if err := teardownVMChildren(spec, record, children, alive, exit, supervisorLog, childTransitionCleanupFailed); err != nil {
 			retErr = errors.Join(retErr, err)
 		} else if networkCleanupFailed {
 			retErr = errors.Join(retErr, errors.New("host network cleanup was not verified; retaining supervisor recovery metadata"))
@@ -1260,6 +1622,14 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 			return err
 		}
 		child := exec.Command(path, args...)
+		var expectedExecutable vmExecutableIdentity
+		if name == "workspace" || name == "agent-state" {
+			expectedExecutable, err = executableIdentity(child.Path)
+			if err != nil {
+				_ = log.Close()
+				return err
+			}
+		}
 		child.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Pdeathsig: syscall.SIGKILL}
 		switch name {
 		case "workspace":
@@ -1299,6 +1669,9 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 		}
 		children[name] = child
 		alive[name] = true
+		if name == "workspace" || name == "agent-state" {
+			expectedExecutables[name] = expectedExecutable
+		}
 		go func() { exit <- vmChildExit{name, child.Wait()} }()
 		recordMu.Lock()
 		switch name {
@@ -1315,6 +1688,51 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 		}
 		recordMu.Unlock()
 		return nil
+	}
+	refreshChildExecutable := func(name, path string, deadline time.Time) error {
+		recordMu.Lock()
+		var launcher vmOwnedProcess
+		switch name {
+		case "workspace":
+			launcher = record.WorkspaceDaemon
+		case "agent-state":
+			launcher = record.AgentStateDaemon
+		default:
+			recordMu.Unlock()
+			return fmt.Errorf("cannot refresh executable identity for child %q", name)
+		}
+		recordMu.Unlock()
+		executable, ok := expectedExecutables[name]
+		if !ok {
+			return fmt.Errorf("expected executable identity for %s was not captured before launch", name)
+		}
+		actual, err := waitForExpectedExecutable(launcher, executable, deadline)
+		if err != nil {
+			cleanupErr := terminateOwnedChildLauncher(children[name], launcher)
+			if cleanupErr != nil {
+				childTransitionCleanupFailed = true
+			}
+			return errors.Join(err, cleanupErr)
+		}
+		recordMu.Lock()
+		defer recordMu.Unlock()
+		var current vmOwnedProcess
+		switch name {
+		case "workspace":
+			current = record.WorkspaceDaemon
+		case "agent-state":
+			current = record.AgentStateDaemon
+		}
+		if !sameProcessInstance(current, launcher) {
+			return fmt.Errorf("%s launcher identity changed while confirming executable", name)
+		}
+		switch name {
+		case "workspace":
+			record.WorkspaceDaemon = actual
+		case "agent-state":
+			record.AgentStateDaemon = actual
+		}
+		return writeVMSupervisorRecord(store, record)
 	}
 	if spec.NetworkBackend == vmNetworkBackendHost {
 		networkHandle, err = startSupervisorHostNetwork(spec, store)
@@ -1359,6 +1777,9 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 	if err := startChild("workspace", spec.Virtiofsd, virtiofsDaemonArgs(workspacePath, spec.WorkspaceSock, spec.GuestUID, spec.GuestGID, spec.VirtiofsSandbox), "virtiofsd-workspace.log"); err != nil {
 		return fmt.Errorf("start workspace virtiofsd (%s): %w", filepath.Join(spec.LogRoot, "virtiofsd-workspace.log"), err)
 	}
+	if err := refreshChildExecutable("workspace", spec.Virtiofsd, startupDeadline); err != nil {
+		return fmt.Errorf("identify workspace virtiofsd executable: %w", err)
+	}
 	if err := waitVMSocket(spec.WorkspaceSock, "workspace", filepath.Join(spec.LogRoot, "virtiofsd-workspace.log"), children, alive, exit, commands, signals); err != nil {
 		return err
 	}
@@ -1402,6 +1823,9 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 	if err := startChild("agent-state", spec.Virtiofsd, virtiofsDaemonArgs(agentStatePath, spec.AgentStateSock, spec.GuestUID, spec.GuestGID, spec.VirtiofsSandbox), "virtiofsd-agent-state.log"); err != nil {
 		return fmt.Errorf("start agent-state virtiofsd (%s): %w", filepath.Join(spec.LogRoot, "virtiofsd-agent-state.log"), err)
 	}
+	if err := refreshChildExecutable("agent-state", spec.Virtiofsd, startupDeadline); err != nil {
+		return fmt.Errorf("identify agent-state virtiofsd executable: %w", err)
+	}
 	if err := waitVMSocket(spec.AgentStateSock, "agent-state", filepath.Join(spec.LogRoot, "virtiofsd-agent-state.log"), children, alive, exit, commands, signals); err != nil {
 		return err
 	}
@@ -1438,34 +1862,147 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 		}
 		recordMu.Unlock()
 	}
+	qemuLogPath := filepath.Join(spec.LogRoot, "vm-qemu.log")
+	var qemuLogStart int64
+	if info, statErr := os.Stat(qemuLogPath); statErr == nil {
+		qemuLogStart = info.Size()
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return fmt.Errorf("inspect QEMU log before launch: %w", statErr)
+	}
 	if err := startChild("qemu", spec.QEMUPath, spec.QEMUArgs, "vm-qemu.log"); err != nil {
 		return fmt.Errorf("start QEMU (%s): %w", filepath.Join(spec.LogRoot, "vm-qemu.log"), err)
 	}
-	readyResult := make(chan error, 1)
+	qemuLauncher := record.QEMU
+	qemuIdentity, qemuExecConfirmed, err := waitForQEMUProcessIdentity(qemuLauncher, spec, startupDeadline)
+	if err != nil {
+		return fmt.Errorf("identify QEMU process: %w", err)
+	}
+	if qemuExecConfirmed {
+		recordMu.Lock()
+		if record.QEMU.PID != qemuLauncher.PID || record.QEMU.StartTime != qemuLauncher.StartTime || record.QEMU.ProcessGroup != qemuLauncher.ProcessGroup {
+			recordMu.Unlock()
+			return errors.New("QEMU process identity changed while confirming its executable")
+		}
+		record.QEMU = qemuIdentity
+		if err := writeVMSupervisorRecord(store, record); err != nil {
+			recordMu.Unlock()
+			return err
+		}
+		recordMu.Unlock()
+	}
+	brokerCtx, cancelBroker := context.WithCancel(context.Background())
+	sshSocket := vmControlSocketPath(spec.SocketDir, spec.LaunchID)
+	sshBroker, err = startVMSSHBroker(brokerCtx, spec.VsockCID, sshSocket, spec.RootSSHKeyPath, spec.UserSSHKeyPath)
+	if err != nil {
+		cancelBroker()
+		return fmt.Errorf("start guest SSH broker: %w", err)
+	}
+	defer cancelBroker()
+	brokerIdentity, err := vmProcessIdentity(sshBroker.PID())
+	if err != nil {
+		return fmt.Errorf("identify guest SSH broker: %w", err)
+	}
+	alive["ssh-broker"] = true
+	recordMu.Lock()
+	record.SSHBroker = brokerIdentity
+	if err := writeVMSupervisorRecord(store, record); err != nil {
+		recordMu.Unlock()
+		return err
+	}
+	recordMu.Unlock()
+	brokerChild := sshBroker
+	go func() {
+		<-brokerChild.Done()
+		exit <- vmChildExit{name: "ssh-broker", err: brokerChild.Wait()}
+	}()
+	readyCtx, cancelReady := context.WithDeadline(brokerCtx, precommitDeadline)
+	defer cancelReady()
+	qmpReady := make(chan error, 1)
+	sshReady := make(chan error, 1)
 	qmpTimeout := time.Until(startupDeadline)
-	if qmpTimeout > 10*time.Second {
-		qmpTimeout = 10 * time.Second
+	if qmpTimeout > 30*time.Second {
+		qmpTimeout = 30 * time.Second
 	}
 	if qmpTimeout <= 0 {
 		return fmt.Errorf("VM supervisor 30s startup deadline exceeded")
 	}
-	go func() { readyResult <- waitQMPReady(spec.MonitorSock, qmpTimeout) }()
-	select {
-	case err := <-readyResult:
-		if err != nil {
-			return fmt.Errorf("QMP readiness: %w", err)
+	go func() { qmpReady <- waitQMPReady(spec.MonitorSock, qmpTimeout) }()
+	go func() { sshReady <- sshBroker.WaitReady(readyCtx) }()
+	qemuCollision := func() *vmGuestCIDCollisionError {
+		detail, found := qemuCIDCollisionSince(qemuLogPath, qemuLogStart)
+		if !found {
+			return nil
 		}
-	case ended := <-exit:
-		alive[ended.name] = false
-		return fmt.Errorf("%s exited during QMP startup: %v", ended.name, ended.err)
-	case <-signals:
-		return fmt.Errorf("supervisor signaled during QMP startup")
-	case line := <-commands:
-		return fmt.Errorf("launcher command %q before QMP readiness", line)
-	case <-precommitTimer.C:
-		return fmt.Errorf("VM precommit deadline exceeded")
-	case <-time.After(qmpTimeout):
-		return fmt.Errorf("QMP did not become ready within %s", qmpTimeout)
+		// QEMU may write the kernel's EADDRINUSE diagnostic just before it
+		// exits. Require the exact owned process to be gone before reporting a
+		// retryable collision, but allow that short exit race to settle.
+		deadline := time.Now().Add(time.Second)
+		for {
+			live, liveErr := vmProcessLive(record.QEMU)
+			if liveErr != nil {
+				return nil
+			}
+			if !live {
+				return &vmGuestCIDCollisionError{CID: spec.VsockCID, Detail: detail}
+			}
+			if !time.Now().Before(deadline) {
+				return nil
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	qmpOK, sshOK := false, false
+	for !qmpOK || !sshOK {
+		select {
+		case err := <-qmpReady:
+			if err != nil {
+				if collision := qemuCollision(); collision != nil {
+					return collision
+				}
+				return fmt.Errorf("QMP readiness: %w", err)
+			}
+			qmpOK = true
+			qmpReady = nil
+		case err := <-sshReady:
+			if err != nil {
+				if collision := qemuCollision(); collision != nil {
+					return collision
+				}
+				return fmt.Errorf("guest SSH readiness: %w", err)
+			}
+			sshOK = true
+			sshReady = nil
+		case ended := <-exit:
+			alive[ended.name] = false
+			if ended.name == "qemu" {
+				if detail, collision := qemuCIDCollisionSince(qemuLogPath, qemuLogStart); collision {
+					return &vmGuestCIDCollisionError{CID: spec.VsockCID, Detail: detail}
+				}
+			}
+			return fmt.Errorf("%s exited during QMP/SSH startup: %v", ended.name, ended.err)
+		case <-signals:
+			return fmt.Errorf("supervisor signaled during QMP/SSH startup")
+		case line := <-commands:
+			return fmt.Errorf("launcher command %q before QMP/SSH readiness", line)
+		case <-precommitTimer.C:
+			if !sshOK {
+				return fmt.Errorf("guest SSH readiness: %w", context.DeadlineExceeded)
+			}
+			return fmt.Errorf("VM precommit deadline exceeded")
+		}
+	}
+	var mountOutput bytes.Buffer
+	verifyCtx, cancelVerify := context.WithDeadline(context.Background(), precommitDeadline)
+	verifyErr := vmssh.Run(verifyCtx, sshSocket, vmssh.Request{
+		User: "root", Command: "findmnt -n -o FSTYPE /home/user/workspace; findmnt -n -o FSTYPE /home/user/.zaigr-agent-state",
+	}, nil, &mountOutput, io.Discard)
+	cancelVerify()
+	if verifyErr != nil {
+		return fmt.Errorf("guest mount verification over vsock SSH: %w", verifyErr)
+	}
+	mounts := strings.Fields(mountOutput.String())
+	if len(mounts) != 2 || mounts[0] != "virtiofs" || mounts[1] != "virtiofs" {
+		return fmt.Errorf("guest mount verification failed (workspace and agent state must be virtiofs): %q", strings.TrimSpace(mountOutput.String()))
 	}
 	if err := verifyHostNetworkReady(networkHandle, &record, &recordMu); err != nil {
 		return fmt.Errorf("host network failed before VM readiness: %w", err)
@@ -1494,7 +2031,7 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 					}
 				}
 			drainedPrecommitExits:
-				for _, name := range []string{"workspace", "agent-state", "qemu"} {
+				for _, name := range []string{"workspace", "agent-state", "qemu", "ssh-broker"} {
 					if !alive[name] {
 						return fmt.Errorf("%s exited before commit", name)
 					}
@@ -1505,7 +2042,7 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 				}{
 					{"workspace", record.WorkspaceDaemon}, {"workspace namespace child", record.WorkspaceDescendant},
 					{"agent-state", record.AgentStateDaemon}, {"agent-state namespace child", record.AgentStateDescendant},
-					{"QEMU", record.QEMU},
+					{"QEMU", record.QEMU}, {"SSH broker", record.SSHBroker},
 				} {
 					if spec.VirtiofsSandbox == "none" && (child.name == "workspace namespace child" || child.name == "agent-state namespace child") {
 						continue
@@ -1934,7 +2471,7 @@ func groupsEmpty(record vmSupervisorRecord) bool {
 	return err == nil && empty
 }
 
-func teardownVMChildren(spec vmLaunchSpec, record vmSupervisorRecord, children map[string]*exec.Cmd, alive map[string]bool, exit <-chan vmChildExit, log io.Writer) error {
+func teardownVMChildren(spec vmLaunchSpec, record vmSupervisorRecord, children map[string]*exec.Cmd, alive map[string]bool, exit <-chan vmChildExit, log io.Writer, retainRecoveryMetadata bool) error {
 	var cleanupErr error
 	drain := func() {
 		for {
@@ -1947,6 +2484,28 @@ func teardownVMChildren(spec vmLaunchSpec, record vmSupervisorRecord, children m
 		}
 	}
 	drain()
+	if alive["ssh-broker"] {
+		cleanupErr = errors.Join(cleanupErr, signalVerifiedVMProcess(record.SSHBroker, syscall.SIGTERM))
+		brokerDeadline := time.Now().Add(5 * time.Second)
+		for alive["ssh-broker"] && time.Now().Before(brokerDeadline) {
+			select {
+			case ended := <-exit:
+				alive[ended.name] = false
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+		if alive["ssh-broker"] {
+			cleanupErr = errors.Join(cleanupErr, signalVerifiedVMProcess(record.SSHBroker, syscall.SIGKILL))
+			brokerDeadline = time.Now().Add(2 * time.Second)
+			for alive["ssh-broker"] && time.Now().Before(brokerDeadline) {
+				select {
+				case ended := <-exit:
+					alive[ended.name] = false
+				case <-time.After(50 * time.Millisecond):
+				}
+			}
+		}
+	}
 	if alive["qemu"] {
 		cleanupErr = errors.Join(cleanupErr, signalVerifiedVMProcess(record.QEMU, syscall.SIGTERM))
 	}
@@ -1982,7 +2541,7 @@ func teardownVMChildren(spec vmLaunchSpec, record vmSupervisorRecord, children m
 	finalDeadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(finalDeadline) {
 		drain()
-		if !alive["workspace"] && !alive["agent-state"] && !alive["qemu"] && groupsEmpty(record) {
+		if !alive["workspace"] && !alive["agent-state"] && !alive["qemu"] && !alive["ssh-broker"] && groupsEmpty(record) {
 			break
 		}
 		select {
@@ -1992,9 +2551,13 @@ func teardownVMChildren(spec vmLaunchSpec, record vmSupervisorRecord, children m
 		}
 	}
 	groupsClear, groupErr := daemonGroupsEmpty(record)
-	if alive["qemu"] || alive["workspace"] || alive["agent-state"] || !groupsClear || groupErr != nil {
+	if alive["qemu"] || alive["workspace"] || alive["agent-state"] || alive["ssh-broker"] || !groupsClear || groupErr != nil {
 		_, _ = fmt.Fprintln(log, "VM cleanup could not confirm process tree termination")
 		return errors.Join(cleanupErr, groupErr, fmt.Errorf("VM cleanup could not confirm process tree termination; record retained"))
+	}
+	if retainRecoveryMetadata {
+		_, _ = fmt.Fprintln(log, "VM cleanup encountered an unverified executable transition; recovery metadata retained")
+		return errors.Join(cleanupErr, errors.New("VM cleanup encountered an unverified executable transition; record retained"))
 	}
 	cleanupPaths := []string{spec.WorkspaceSock, spec.WorkspaceSock + ".pid", spec.AgentStateSock, spec.AgentStateSock + ".pid", spec.MonitorSock}
 	if spec.WorkspaceSockAlias != "" {
@@ -2057,7 +2620,7 @@ func removeVMSocketDir(dir, launchID string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("VM socket directory was replaced: %s", dir)
 	}
-	for _, name := range []string{"workspace.sock", "workspace.sock.pid", "agent-state.sock", "agent-state.sock.pid"} {
+	for _, name := range []string{"workspace.sock", "workspace.sock.pid", "agent-state.sock", "agent-state.sock.pid", "ssh.sock"} {
 		if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}

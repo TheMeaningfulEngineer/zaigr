@@ -416,27 +416,64 @@ func expandCustomBaseImage(source, output, disk string) error {
 }
 
 func diskSizeBytes(value string) (int64, error) {
-	probe, err := os.CreateTemp("", "zaigr-disk-size-*")
-	if err != nil {
-		return 0, err
+	return parseDiskSizeBytes(value)
+}
+
+func parseDiskSizeBytes(value string) (int64, error) {
+	text := strings.TrimSpace(value)
+	if text == "" {
+		return 0, fmt.Errorf("invalid disk size: %q", value)
 	}
-	path := probe.Name()
-	if err := probe.Close(); err != nil {
-		_ = os.Remove(path)
-		return 0, err
+	multiplier := int64(1)
+	units := map[byte]int{'k': 1, 'K': 1, 'm': 2, 'M': 2, 'g': 3, 'G': 3, 't': 4, 'T': 4, 'p': 5, 'P': 5, 'e': 6, 'E': 6, 'z': 7, 'Z': 7, 'y': 8, 'Y': 8, 'r': 9, 'R': 9, 'q': 10, 'Q': 10}
+	if strings.HasSuffix(text, "iB") {
+		text = text[:len(text)-2]
+		if len(text) == 0 {
+			return 0, fmt.Errorf("invalid disk size: %q", value)
+		}
+		unit, ok := units[text[len(text)-1]]
+		if !ok {
+			return 0, fmt.Errorf("invalid disk size: %q", value)
+		}
+		text = text[:len(text)-1]
+		for i := 0; i < unit; i++ {
+			if multiplier > (1<<63-1)/1024 {
+				return 0, fmt.Errorf("invalid disk size: %q", value)
+			}
+			multiplier *= 1024
+		}
+	} else if strings.HasSuffix(text, "B") {
+		text = strings.TrimSuffix(text, "B")
+		if len(text) == 0 {
+			return 0, fmt.Errorf("invalid disk size: %q", value)
+		}
+		unit, ok := units[text[len(text)-1]]
+		if !ok {
+			return 0, fmt.Errorf("invalid disk size: %q", value)
+		}
+		text = text[:len(text)-1]
+		for i := 0; i < unit; i++ {
+			if multiplier > (1<<63-1)/1000 {
+				return 0, fmt.Errorf("invalid disk size: %q", value)
+			}
+			multiplier *= 1000
+		}
+	} else if unit, ok := units[text[len(text)-1]]; ok {
+		text = text[:len(text)-1]
+		for i := 0; i < unit; i++ {
+			if multiplier > (1<<63-1)/1024 {
+				return 0, fmt.Errorf("invalid disk size: %q", value)
+			}
+			multiplier *= 1024
+		}
+	} else if strings.ContainsAny(text, "iI") {
+		return 0, fmt.Errorf("invalid disk size: %q", value)
 	}
-	defer func() { _ = os.Remove(path) }()
-	if out, err := exec.Command("truncate", "-s", value, path).CombinedOutput(); err != nil {
-		return 0, fmt.Errorf("invalid disk size %s: %s", value, strings.TrimSpace(string(out)))
+	amount, err := strconv.ParseInt(text, 10, 64)
+	if err != nil || amount <= 0 || amount > (1<<63-1)/multiplier {
+		return 0, fmt.Errorf("invalid disk size: %q", value)
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return 0, err
-	}
-	if info.Size() <= 0 {
-		return 0, fmt.Errorf("invalid disk size: %s", value)
-	}
-	return info.Size(), nil
+	return amount * multiplier, nil
 }
 
 func checkExt4(path string) error {
@@ -731,11 +768,7 @@ func buildAndPublishGlobalBase(previous globalBaseManifest, customized bool, def
 		}
 		scripts = append(scripts, path)
 	}
-	port, err := allocateEphemeralSSHPort()
-	if err != nil {
-		return err
-	}
-	if err := applyStepsViaSSHInContext(working, scripts, ram, cpu, port, true, agentState, workspace, runtimeStore, globalBaseRoot()); err != nil {
+	if err := applyStepsViaSSHInContext(working, scripts, ram, cpu, true, agentState, workspace, runtimeStore, globalBaseRoot()); err != nil {
 		name := guestSetupExecutionStep(err)
 		for i, path := range scripts {
 			if filepath.Base(path) == name {

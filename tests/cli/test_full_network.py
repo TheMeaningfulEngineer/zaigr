@@ -934,19 +934,135 @@ def maintenance_gate_counters(project, record):
         "maintenance_gate_drop_to_uplink",
         "maintenance_gate_drop_from_uplink",
     )
-    counts = {}
-    for name in expected:
-        output = host_maintenance_nft(
-            project, record, "-j", "list", "counter", "inet", "zaigr", name
-        )
-        ruleset = json.loads(output)
-        matches = [
-            entry["counter"] for entry in ruleset["nftables"]
-            if "counter" in entry and entry["counter"].get("name") == name
-        ]
-        assert len(matches) == 1, (name, output)
-        counts[name] = int(matches[0]["packets"])
-    return counts
+    # These IDs and attributes follow linux/netfilter/nf_tables.h. GETOBJ reads
+    # one named object without asking nft userspace to decode the whole table.
+    helper = r'''import json, socket, struct, sys
+TABLE = "zaigr"
+NFNL_SUBSYS_NFTABLES = 10
+NFT_MSG_GETOBJ = 19
+NFT_MSG_NEWOBJ = 18
+NFT_MSG_GETGEN = 16
+NFT_MSG_NEWGEN = 15
+NFTA_OBJ_TABLE = 1
+NFTA_OBJ_NAME = 2
+NFTA_OBJ_TYPE = 3
+NFTA_OBJ_DATA = 4
+NFT_OBJECT_COUNTER = 1
+NFTA_COUNTER_BYTES = 1
+NFTA_COUNTER_PACKETS = 2
+NLMSG_ERROR = 2
+NLMSG_DONE = 3
+NLM_F_REQUEST = 1
+NFPROTO_INET = 1
+
+def attr(kind, value):
+    data = struct.pack("=HH", 4 + len(value), kind) + value
+    return data + b"\0" * ((-len(data)) % 4)
+
+def attributes(data):
+    while len(data) >= 4:
+        length, kind = struct.unpack_from("=HH", data)
+        if length < 4 or length > len(data):
+            raise RuntimeError("invalid netlink attribute length")
+        yield kind & 0x3fff, data[4:length]
+        data = data[(length + 3) & ~3:]
+
+def current_res_id(sock):
+    message_type = (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_GETGEN
+    payload = struct.pack("!BBH", 0, 0, 0)
+    header = struct.pack("=IHHII", 20, message_type, NLM_F_REQUEST, 1, 0)
+    sock.send(header + payload)
+    while True:
+        response = sock.recv(65536)
+        offset = 0
+        while offset + 16 <= len(response):
+            length, kind, flags, sequence, pid = struct.unpack_from("=IHHII", response, offset)
+            message = response[offset + 16:offset + length]
+            offset += (length + 3) & ~3
+            if sequence != 1:
+                continue
+            if kind == NLMSG_ERROR:
+                error = struct.unpack_from("=i", message)[0]
+                if error:
+                    raise OSError(-error, "nftables GETGEN failed")
+                continue
+            response_type = (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWGEN
+            if kind == response_type and len(message) >= 4:
+                return struct.unpack_from("!H", message, 2)[0]
+
+def counter(sock, sequence, name, res_id):
+    payload = struct.pack("!BBH", NFPROTO_INET, 0, res_id)
+    payload += attr(NFTA_OBJ_TABLE, TABLE.encode() + b"\0")
+    payload += attr(NFTA_OBJ_NAME, name.encode() + b"\0")
+    payload += attr(NFTA_OBJ_TYPE, struct.pack("!I", NFT_OBJECT_COUNTER))
+    message_type = (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_GETOBJ
+    header = struct.pack("=IHHII", 16 + len(payload), message_type, NLM_F_REQUEST, sequence, 0)
+    sock.send(header + payload)
+    while True:
+        response = sock.recv(65536)
+        offset = 0
+        while offset + 16 <= len(response):
+            length, kind, flags, seq, pid = struct.unpack_from("=IHHII", response, offset)
+            message = response[offset + 16:offset + length]
+            offset += (length + 3) & ~3
+            if seq != sequence:
+                continue
+            if kind == NLMSG_ERROR:
+                error = struct.unpack_from("=i", message)[0]
+                if error:
+                    raise OSError(-error, "nftables GETOBJ failed for " + name)
+                continue
+            if kind == NLMSG_DONE:
+                raise RuntimeError("nftables GETOBJ returned no object for " + name)
+            response_type = (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWOBJ
+            if kind != response_type or len(message) < 4:
+                continue
+            if message[0] != NFPROTO_INET:
+                raise RuntimeError("nftables GETOBJ returned the wrong family for " + name)
+            object_fields = {}
+            counter_data = None
+            for outer_kind, value in attributes(message[4:]):
+                if outer_kind in (NFTA_OBJ_TABLE, NFTA_OBJ_NAME):
+                    object_fields[outer_kind] = value.rstrip(b"\0").decode()
+                elif outer_kind == NFTA_OBJ_TYPE:
+                    object_fields[outer_kind] = struct.unpack("!I", value[:4])[0]
+                elif outer_kind == NFTA_OBJ_DATA:
+                    counter_data = value
+            if object_fields.get(NFTA_OBJ_TABLE) != TABLE:
+                raise RuntimeError("nftables GETOBJ returned the wrong table for " + name)
+            if object_fields.get(NFTA_OBJ_NAME) != name:
+                raise RuntimeError("nftables GETOBJ returned the wrong object name for " + name)
+            if object_fields.get(NFTA_OBJ_TYPE) != NFT_OBJECT_COUNTER:
+                raise RuntimeError("nftables GETOBJ returned the wrong object type for " + name)
+            if counter_data is None:
+                raise RuntimeError("nftables GETOBJ response lacks counter data for " + name)
+            result = {}
+            for inner_kind, inner_value in attributes(counter_data):
+                if inner_kind in (NFTA_COUNTER_BYTES, NFTA_COUNTER_PACKETS):
+                    # nftables emits these NLA_U64 counter values in BE.
+                    result[inner_kind] = struct.unpack("!Q", inner_value[:8])[0]
+            if NFTA_COUNTER_PACKETS not in result or NFTA_COUNTER_BYTES not in result:
+                raise RuntimeError("counter response lacks packet/byte totals for " + name)
+            return {"packets": result[NFTA_COUNTER_PACKETS], "bytes": result[NFTA_COUNTER_BYTES]}
+
+sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 12)
+sock.bind((0, 0))
+res_id = current_res_id(sock)
+result = {}
+for sequence, name in enumerate(sys.argv[1:], 1):
+    result[name] = counter(sock, sequence + 1, name, res_id)
+print(json.dumps(result, sort_keys=True))
+'''
+    helper_pid = record["network_processes"]["hostnet-helper"]["pid"]
+    command = [
+        "nsenter", "--target", str(helper_pid), "--user", "--net",
+        "--preserve-credentials", "/usr/bin/python3", "-c", helper, *expected,
+    ]
+    stdout, stderr, code = _run(command, cwd=project.cwd, env=project.env, timeout=15)
+    assert code == 0, err_msg(stdout, stderr)
+    counts = json.loads(stdout)
+    assert set(counts) == set(expected), counts
+    return {name: int(counts[name]["packets"]) for name in expected}
 
 
 def guest_udp_counts(path):

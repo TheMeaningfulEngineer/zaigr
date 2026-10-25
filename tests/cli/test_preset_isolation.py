@@ -1,14 +1,13 @@
 """Acceptance coverage for isolation between concurrent preset sessions."""
 
 import shlex
-import shutil
 import socket
 from functools import partial
 
 import pexpect
 import pytest
 
-from ..conftest import SetupFactory, err_msg, spawn_interactive
+from ..conftest import err_msg, spawn_interactive
 from ..conftest import run as _run
 
 
@@ -204,6 +203,7 @@ read -r _
     ssh_dir = project.home / ".ssh"
     ssh_dir.mkdir(mode=0o700)
     local_command_marker = project.cwd / "host-ssh-config-was-used"
+    ssh_invocation_marker = project.cwd / "host-ssh-was-invoked"
     (ssh_dir / "config").write_text(
         "Host *\n"
         "    ForwardAgent yes\n"
@@ -218,12 +218,12 @@ read -r _
     )
     ssh_shim_dir = project.cwd / "ssh-shim"
     ssh_shim_dir.mkdir()
-    real_ssh = shutil.which("ssh")
-    assert real_ssh is not None
     ssh_shim = ssh_shim_dir / "ssh"
     ssh_shim.write_text(
         "#!/bin/sh\n"
-        f"exec {shlex.quote(real_ssh)} -F {shlex.quote(str(ssh_dir / 'config'))} \"$@\"\n",
+        f"touch {shlex.quote(str(ssh_invocation_marker))}\n"
+        "printf 'host ssh executable must not be invoked by the product\\n' >&2\n"
+        "exit 97\n",
         encoding="utf-8",
     )
     ssh_shim.chmod(0o755)
@@ -247,6 +247,7 @@ read -r _
             shell.expect_exact("LAUNCHER_FDS_CLEAN", timeout=20)
             shell.expect_exact("INHERITED_CREDENTIAL_ENV_CLEAN", timeout=20)
             shell.expect_exact("REMOTE_FORWARD_ABSENT", timeout=20)
+            assert not ssh_invocation_marker.exists()
             shell.expect(
                 r"CLEAN_PRESET_READY=user\|user\|/home/user\|"
                 r"/home/user/workspace\|/home/user/workspace\|[^\r\n]+",
@@ -840,7 +841,7 @@ chown -h user:user /home/user/.ssh/authorized_keys
 rm -f /run/zaigr-ssh/user-authorized-keys
 rm -f /usr/local/lib/zaigr/run-preset-isolated
 sshd -t
-systemctl reload ssh
+systemctl restart ssh-vsock.socket
 """,
     )
     setup_factory.preset(

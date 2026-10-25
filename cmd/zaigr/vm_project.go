@@ -66,17 +66,17 @@ func cmdProjectStartVM(ram string, cpu string) error {
 		return err
 	}
 	if running != nil {
-		logInfo("project VM already running", "port", running.Port)
-		fmt.Printf(":: Project VM already running on port %s\n", running.Port)
+		logInfo("project VM already running", "vsock_cid", running.Endpoint.VsockCID)
+		fmt.Printf(":: Project VM already running (vsock CID %d)\n", running.Endpoint.VsockCID)
 		return nil
 	}
 
-	port, err := startPreparedProjectVM(ram, cpu)
+	endpoint, err := startPreparedProjectVM(ram, cpu)
 	if err != nil {
 		return err
 	}
-	logInfo("project vm start completed", "port", port)
-	fmt.Printf(":: Project VM started on port %s\n", port)
+	logInfo("project vm start completed", "vsock_cid", endpoint.VsockCID)
+	fmt.Printf(":: Project VM started (vsock CID %d)\n", endpoint.VsockCID)
 	return nil
 }
 
@@ -178,26 +178,22 @@ func cmdProjectVMExec(commandArgs []string, root bool) error {
 			if _, err := hostNetworkControl(ctx, currentProjectStore().runtimeDir(), networkRecord.LaunchID, "policy-reconcile", hostnet.Forward{}); err != nil {
 				return fmt.Errorf("reconcile host firewall before project vm exec: %w", err)
 			}
-		} else if err := reconcileSavedProjectFirewallIPsToVM(running.Port); err != nil {
+		} else if err := reconcileSavedProjectFirewallIPsToVM(running.Endpoint); err != nil {
 			return fmt.Errorf("reconcile project firewall before project vm exec: %w", err)
 		}
-		return sshRunCommandWithExitStatus(running.Port, "", "user", command)
+		return sshRunCommandWithExitStatus(running.Endpoint, "user", command)
 	}
 
 	if !confirmRootExecMarksDirtyProjectImage() {
 		return exitError(1)
 	}
-	rootKeyPath, _, err := ensureRootSSHKey()
-	if err != nil {
-		return fmt.Errorf("prepare root SSH key: %w", err)
-	}
 	if hostBackend {
 		if err := markCurrentProjectImageDirty("root-exec", "zaigr project vm exec --root"); err != nil {
 			return err
 		}
-		return sshRunCommandWithExitStatus(running.Port, rootKeyPath, "root", command)
+		return sshRunCommandWithExitStatus(running.Endpoint, "root", command)
 	}
-	return sshRunCommandWithExitStatus(running.Port, rootKeyPath, "root", command)
+	return sshRunCommandWithExitStatus(running.Endpoint, "root", command)
 }
 
 func projectVMExecShellCommand(commandArgs []string) string {
@@ -401,15 +397,7 @@ func cmdProjectRebuild(force bool) error {
 		running = nil
 	}
 	if running != nil {
-		versions := projectBaseRuntimeVersionsForStore(currentProjectStore())
-		rootKeyPath, _, keyErr := ensureRootSSHKey()
-		if keyErr == nil {
-			versions = projectBaseRuntimeVersionsForRunningVM(
-				currentProjectStore(), running.Port, rootKeyPath,
-			)
-		} else {
-			logDebug("could not prepare root key for running VM base runtime check", "err", keyErr)
-		}
+		versions := projectBaseRuntimeVersionsForRunningVM(currentProjectStore(), running.Endpoint)
 		if versions.upgradeRequired() {
 			return fmt.Errorf(
 				"this version of zaigr cannot replace the project's outdated base runtime while the VM is running\n"+
@@ -560,9 +548,9 @@ func stopProjectVMInStore(store projectStore, abrupt bool) (projectVMStopResult,
 		}
 		return projectVMStopResult{State: projectVMStopStateOff}, nil
 	}
-	if running != nil && running.Port != "" {
+	if running != nil && running.Endpoint.SocketPath != "" {
 		if state, err := store.readHostAccessRuntime(); err == nil && len(state.Devices) > 0 {
-			if _, err := hostAccessGuestCommand(running.Port, "cleanup"); err != nil {
+			if _, err := hostAccessGuestCommand(running.Endpoint, "cleanup"); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: device aliases will be cleaned on the next boot: %v\n", err)
 			}
 		}
@@ -573,14 +561,13 @@ func stopProjectVMInStore(store projectStore, abrupt bool) (projectVMStopResult,
 			return projectVMStopResult{}, err
 		}
 	} else {
-		if running == nil || running.Port == "" {
-			return projectVMStopResult{}, fmt.Errorf("QEMU is running but its monitor or SSH port is unavailable; use --abrupt to force")
+		if running == nil || running.Endpoint.SocketPath == "" {
+			if record, err := readVMSupervisorRecord(store); err == nil && record.FormatVersion == 1 {
+				return projectVMStopResult{}, errors.New(legacyVMUpgradeGuidance)
+			}
+			return projectVMStopResult{}, fmt.Errorf("QEMU is running but its monitor or vsock control endpoint is unavailable; use --abrupt to force")
 		}
-		rootKeyPath, _, keyErr := ensureRootSSHKey()
-		if keyErr != nil {
-			return projectVMStopResult{}, fmt.Errorf("prepare graceful VM shutdown: %w", keyErr)
-		}
-		if err := sshSync(running.Port, rootKeyPath); err != nil {
+		if err := sshSync(running.Endpoint); err != nil {
 			return projectVMStopResult{}, fmt.Errorf("flush project VM before shutdown: %w; use 'zaigr project vm stop --abrupt' only if recovery is required", err)
 		}
 		qmpQuit(sockPath)
@@ -815,12 +802,12 @@ func waitForQemuProcessesExit(processes []qemuProcessIdentity, timeout time.Dura
 	}
 }
 
-func syncAppliedSetupFirewallToVM(port string) error {
-	return syncAppliedSetupFirewallToVMContext(context.Background(), port)
+func syncAppliedSetupFirewallToVM(endpoint vmControlEndpoint) error {
+	return syncAppliedSetupFirewallToVMContext(context.Background(), endpoint)
 }
 
-func syncAppliedSetupFirewallToVMContext(ctx context.Context, port string) error {
-	_ = port
+func syncAppliedSetupFirewallToVMContext(ctx context.Context, endpoint vmControlEndpoint) error {
+	_ = endpoint
 	store := currentProjectStore()
 	host, record, err := runningHostNetworkRecord(store)
 	if err != nil {

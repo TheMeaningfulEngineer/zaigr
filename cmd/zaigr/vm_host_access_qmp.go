@@ -126,10 +126,7 @@ func (q *hostAccessQMP) forwards() (map[int]int, error) {
 	return result, nil
 }
 
-func (q *hostAccessQMP) applyPort(p hostAccessPort, sshPort string, remove bool) error {
-	if strconv.Itoa(p.Host) == sshPort {
-		return fmt.Errorf("host port %d is the VM management SSH port; stop the VM and retry", p.Host)
-	}
+func (q *hostAccessQMP) applyPort(p hostAccessPort, remove bool) error {
 	active, err := q.forwards()
 	if err != nil {
 		return err

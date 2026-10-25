@@ -24,8 +24,7 @@ def test_install_standalone_as_regular_user_and_run_vm(cloudvm_factory, distro):
     checked(
         vm,
         "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "
-        "coreutils e2fsprogs openssh-client qemu-system-x86 qemu-utils "
-        "util-linux",
+        "coreutils e2fsprogs qemu-system-x86 qemu-utils",
         timeout=300,
         user="user",
     )
@@ -37,10 +36,18 @@ def test_install_standalone_as_regular_user_and_run_vm(cloudvm_factory, distro):
     checked(vm, "install -m 0755 /home/user/zaigr /home/user/.local/bin/zaigr", user="user")
     host_uid = checked(vm, "id -u", user="user").strip()
     host_gid = checked(vm, "id -g", user="user").strip()
+    product_path = vm.zaigr_path_without_host_tools()
+    assert vm.run("command -v ssh", user="user", env={"PATH": product_path})[2] != 0
+    assert vm.run("command -v ssh-keygen", user="user", env={"PATH": product_path})[2] != 0
+    assert vm.run("command -v truncate", user="user", env={"PATH": product_path})[2] != 0
+    assert vm.run("command -v setpriv", user="user", env={"PATH": product_path})[2] != 0
     assert host_uid.isdigit() and host_uid != "0"
-    assert checked(vm, "command -v zaigr", user="user", env={
-        "PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin",
-    }).strip() == "/home/user/.local/bin/zaigr"
+    assert checked(
+        vm,
+        'readlink -f "$(command -v zaigr)"',
+        user="user",
+        env={"PATH": product_path},
+    ).strip() == "/home/user/.local/bin/zaigr"
     assert checked(vm, "stat -c '%u %a' /home/user/.local/bin/zaigr", user="user").strip() == f"{host_uid} 755"
     expected_digest = hashlib.sha256(vm.dist_artifact.read_bytes()).hexdigest()
     assert checked(vm, "sha256sum /home/user/.local/bin/zaigr", user="user").split()[0] == expected_digest
@@ -55,7 +62,7 @@ def test_install_standalone_as_regular_user_and_run_vm(cloudvm_factory, distro):
     ).strip() == "1"
     initial_check = vm.run(
         "/home/user/.local/bin/zaigr misc check", user="user", timeout=90,
-        env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+        env={"PATH": product_path},
     )
     if apparmor_restricted:
         assert initial_check[2] != 0, initial_check[0] + initial_check[1]
@@ -64,6 +71,7 @@ def test_install_standalone_as_regular_user_and_run_vm(cloudvm_factory, distro):
             vm,
             "/home/user/.local/bin/zaigr misc apparmor-profile > /tmp/zaigr.profile",
             user="user",
+            env={"PATH": product_path},
         )
         checked(
             vm,
@@ -83,16 +91,16 @@ def test_install_standalone_as_regular_user_and_run_vm(cloudvm_factory, distro):
         "/home/user/.local/bin/zaigr misc check",
         user="user",
         timeout=90,
-        env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+        env={"PATH": product_path},
     )
-    assert "6/6 checks passed" in check
+    assert "7/7 checks passed" in check
 
     user = partial(
         checked,
         vm,
         user="user",
         cwd="/home/user/project",
-        env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+        env={"PATH": product_path},
     )
     host_project_owner, host_project_mode = user("stat -c '%u:%g %a' .").split()
     assert host_project_owner == f"{host_uid}:{host_gid}"
@@ -102,7 +110,7 @@ def test_install_standalone_as_regular_user_and_run_vm(cloudvm_factory, distro):
     start = vm.run(
         "/home/user/.local/bin/zaigr project vm start",
         cwd="/home/user/project", user="user", input="y\n", timeout=240,
-        env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+        env={"PATH": product_path},
     )
     assert start[2] == 0, f"project VM failed to start with system slirp installed:\n{start[0]}{start[1]}"
     bundled_executables = checked(
@@ -120,26 +128,26 @@ def test_install_standalone_as_regular_user_and_run_vm(cloudvm_factory, distro):
     allowed = vm.run(
         "/home/user/.local/bin/zaigr project firewall allow deb.debian.org",
         cwd="/home/user/project", timeout=30, user="user",
-        env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+        env={"PATH": product_path},
     )
     assert allowed[2] == 0, f"firewall allow failed with system slirp installed:\n{allowed[0]}{allowed[1]}"
     allowed_traffic = vm.run(
         "/home/user/.local/bin/zaigr project vm exec -- curl --noproxy '*' -4fsS --connect-timeout 5 "
         "--max-time 15 https://deb.debian.org/",
         cwd="/home/user/project", timeout=30, user="user",
-        env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+        env={"PATH": product_path},
     )
     assert allowed_traffic[2] == 0, f"allowed traffic failed with system slirp installed:\n{allowed_traffic[0]}{allowed_traffic[1]}"
     blocked_traffic = vm.run(
         "/home/user/.local/bin/zaigr project vm exec -- curl --noproxy '*' -4fsS --connect-timeout 3 "
         "--max-time 8 https://example.com/",
         cwd="/home/user/project", timeout=20, user="user",
-        env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+        env={"PATH": product_path},
     )
     assert blocked_traffic[2] == 6, f"example.com did not fail at DNS with system slirp installed:\n{blocked_traffic[0]}{blocked_traffic[1]}"
     assert "could not resolve host" in (blocked_traffic[0] + blocked_traffic[1]).lower()
     checked(vm, "/home/user/.local/bin/zaigr project vm stop", cwd="/home/user/project", user="user", timeout=60,
-            env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"})
+            env={"PATH": product_path})
     checked(vm, "sudo DEBIAN_FRONTEND=noninteractive apt-get purge -y slirp4netns", timeout=120, user="user")
     absent_package = vm.run("dpkg-query -W -f='${Status}' slirp4netns", user="user")
     assert absent_package[2] != 0 or absent_package[0].strip() != "install ok installed", (
@@ -147,21 +155,21 @@ def test_install_standalone_as_regular_user_and_run_vm(cloudvm_factory, distro):
     )
     absent_from_path = vm.run(
         "if command -v slirp4netns >/dev/null 2>&1; then exit 1; else printf 'no system slirp on PATH\\n'; fi",
-        user="user", env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+        user="user", env={"PATH": product_path},
     )
     assert absent_from_path[2] == 0 and absent_from_path[0] == "no system slirp on PATH\n", (
         absent_from_path[0] + absent_from_path[1]
     )
     check_without_system_slirp = checked(
         vm, "/home/user/.local/bin/zaigr misc check", user="user", timeout=90,
-        env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+        env={"PATH": product_path},
     )
-    assert "6/6 checks passed" in check_without_system_slirp, check_without_system_slirp
+    assert "7/7 checks passed" in check_without_system_slirp, check_without_system_slirp
 
     start = vm.run(
         "/home/user/.local/bin/zaigr project vm start",
         cwd="/home/user/project", user="user", input="y\n", timeout=240,
-        env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+        env={"PATH": product_path},
     )
     assert start[2] == 0, f"project VM failed to start without system slirp:\n{start[0]}{start[1]}"
     bundled_executables = checked(
@@ -179,21 +187,21 @@ def test_install_standalone_as_regular_user_and_run_vm(cloudvm_factory, distro):
     allowed = vm.run(
         "/home/user/.local/bin/zaigr project firewall allow deb.debian.org",
         cwd="/home/user/project", timeout=30, user="user",
-        env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+        env={"PATH": product_path},
     )
     assert allowed[2] == 0, f"firewall allow failed without system slirp:\n{allowed[0]}{allowed[1]}"
     allowed_traffic = vm.run(
         "/home/user/.local/bin/zaigr project vm exec -- curl --noproxy '*' -4fsS --connect-timeout 5 "
         "--max-time 15 https://deb.debian.org/",
         cwd="/home/user/project", timeout=30, user="user",
-        env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+        env={"PATH": product_path},
     )
     assert allowed_traffic[2] == 0, f"allowed traffic failed without system slirp:\n{allowed_traffic[0]}{allowed_traffic[1]}"
     blocked_traffic = vm.run(
         "/home/user/.local/bin/zaigr project vm exec -- curl --noproxy '*' -4fsS --connect-timeout 3 "
         "--max-time 8 https://example.com/",
         cwd="/home/user/project", timeout=20, user="user",
-        env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+        env={"PATH": product_path},
     )
     assert blocked_traffic[2] == 6, f"example.com did not fail at DNS without system slirp:\n{blocked_traffic[0]}{blocked_traffic[1]}"
     assert "could not resolve host" in (blocked_traffic[0] + blocked_traffic[1]).lower()

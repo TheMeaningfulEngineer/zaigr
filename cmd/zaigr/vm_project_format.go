@@ -411,30 +411,26 @@ func compactToDirectProjectOverlay(sourcePath, outputPath string) error {
 	return nil
 }
 
-func applySetupDirectlyToRunningVM(port string, def setupDefinition, payload []byte) error {
-	return withMaintenanceNetworkSessionForSetups(currentProjectStore(), port, "setup execution", []setupDefinition{def}, func(namespace string) error {
-		return applySetupDirectlyToRunningVMInNamespace(port, def, payload, namespace)
+func applySetupDirectlyToRunningVM(endpoint vmControlEndpoint, def setupDefinition, payload []byte) error {
+	return withMaintenanceNetworkSessionForSetups(currentProjectStore(), endpoint, "setup execution", []setupDefinition{def}, func(namespace string) error {
+		return applySetupDirectlyToRunningVMInNamespace(endpoint, def, payload, namespace)
 	})
 }
 
-func applySetupDirectlyToRunningVMInNamespace(port string, def setupDefinition, payload []byte, namespace string) error {
-	rootKeyPath, _, err := ensureRootSSHKey()
-	if err != nil {
-		return fmt.Errorf("prepare root SSH key: %w", err)
-	}
+func applySetupDirectlyToRunningVMInNamespace(endpoint vmControlEndpoint, def setupDefinition, payload []byte, namespace string) error {
 	store := currentProjectStore()
 	intent := directSetupExecutionIntent{Name: def.Name, Version: def.Version, ProjectLocal: def.ProjectLocal}
 	executionStarted := false
 	executionDeadline := time.Now().Add(setupExecutionTimeout)
-	started, runErr := sshRunSetupScriptInNamespaceUntil(port, rootKeyPath, namespace, "set -e\n"+string(payload), executionDeadline, &intent)
+	started, runErr := sshRunSetupScriptInNamespaceUntil(endpoint, namespace, "set -e\n"+string(payload), executionDeadline, &intent)
 	executionStarted = started
 	persisted, intentErr := store.setupExecutionIntentPersisted(intent)
 	if persisted {
 		executionStarted = true
 	}
-	err = errors.Join(runErr, intentErr)
+	err := errors.Join(runErr, intentErr)
 	if err == nil {
-		err = sshSync(port, rootKeyPath)
+		err = sshSync(endpoint)
 	}
 	if err != nil {
 		if executionStarted {
@@ -470,12 +466,8 @@ func applySetupDirectlyToStoppedProject(def setupDefinition, payload []byte, ram
 		ram = "4096"
 	}
 	cpus, _ = resolveCPUs(cpus)
-	port, err := allocateEphemeralSSHPort()
-	if err != nil {
-		return err
-	}
 	intent := directSetupExecutionIntent{Name: def.Name, Version: def.Version, ProjectLocal: def.ProjectLocal}
-	err = applyStepsViaSSHWithIntent(currentProjectStore().authoritativeImagePath(), []string{scriptPath}, ram, cpus, port, true, &intent)
+	err = applyStepsViaSSHWithIntent(currentProjectStore().authoritativeImagePath(), []string{scriptPath}, ram, cpus, true, &intent)
 	if err != nil {
 		if isGuestSetupExecutionError(err) {
 			if stateErr := recordDirectSetupFailure(def); stateErr != nil {

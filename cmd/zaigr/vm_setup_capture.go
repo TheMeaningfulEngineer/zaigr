@@ -141,7 +141,7 @@ func startNewSetupCapture(store projectStore, confirmRunningVM bool) (returnErr 
 		projectImagePathOverrideForNextBoot = ""
 	}()
 
-	port, err := startPreparedProjectVM("", "")
+	endpoint, err := startPreparedProjectVM("", "")
 	if err != nil {
 		if guardErr := requireNoActiveVMSupervisor(store, "failed setup capture cleanup"); guardErr != nil {
 			return errors.Join(err, guardErr)
@@ -175,8 +175,8 @@ func startNewSetupCapture(store projectStore, confirmRunningVM bool) (returnErr 
 	if err != nil {
 		return err
 	}
-	return withMaintenanceNetworkSession(store, port, "project setup capture", func(namespace string) error {
-		return runProjectSetupCaptureShell(port, token, namespace)
+	return withMaintenanceNetworkSession(store, endpoint, "project setup capture", func(namespace string) error {
+		return runProjectSetupCaptureShell(endpoint, token, namespace)
 	})
 }
 
@@ -209,8 +209,8 @@ func activeSetupCaptureRefusalError(command string, meta setupCaptureMetadata) e
 }
 
 func startSetupCaptureOnRunningVM(store projectStore, running *runningVMInfo) (returnErr error) {
-	if running.Port == "" {
-		return fmt.Errorf("project VM is running but its SSH port is unknown")
+	if running.Endpoint.SocketPath == "" {
+		return fmt.Errorf("project VM is running but its vsock control endpoint is unknown")
 	}
 	_ = store.clearSetupCaptureObservedEndpoints()
 	if err := store.prepareSetupCaptureCommands(); err != nil {
@@ -245,8 +245,8 @@ func startSetupCaptureOnRunningVM(store projectStore, running *runningVMInfo) (r
 	if err != nil {
 		return err
 	}
-	return withMaintenanceNetworkSession(store, running.Port, "project setup capture", func(namespace string) error {
-		return runProjectSetupCaptureShell(running.Port, token, namespace)
+	return withMaintenanceNetworkSession(store, running.Endpoint, "project setup capture", func(namespace string) error {
+		return runProjectSetupCaptureShell(running.Endpoint, token, namespace)
 	})
 }
 
@@ -632,7 +632,7 @@ func discardSetupCaptureState(store projectStore, meta setupCaptureMetadata, pro
 	return true, nil
 }
 
-func runProjectSetupCaptureShell(port string, token string, namespace string) error {
+func runProjectSetupCaptureShell(endpoint vmControlEndpoint, token string, namespace string) error {
 	store := currentProjectStore()
 	captureMeta, captureActive, metaErr := store.readSetupCaptureMetadata()
 	if metaErr != nil {
@@ -642,31 +642,16 @@ func runProjectSetupCaptureShell(port string, token string, namespace string) er
 	if launchErr != nil {
 		return launchErr
 	}
-	args, err := projectSSHArgs(port, true)
-	if err != nil {
-		return err
-	}
-	args = append([]string{args[0], "-tt"}, args[1:]...)
 	if !validHostPolicyScopeID(strings.TrimPrefix(namespace, "zaigr-maint-")) {
 		return errors.New("invalid maintenance namespace for setup capture")
 	}
-	args = append(args, "ip netns exec "+singleQuotedArg(namespace)+" bash -eu -c "+singleQuotedArg(setupCaptureShellCommand(token)))
-
-	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	cleanup, err := writeShellSessionMarker(currentProjectStore(), cmd.Process.Pid, true, port)
+	command := "ip netns exec " + singleQuotedArg(namespace) + " bash -eu -c " + singleQuotedArg(setupCaptureShellCommand(token))
+	cleanup, err := writeShellSessionMarker(currentProjectStore(), os.Getpid(), true, endpoint)
 	if err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
 		return fmt.Errorf("track shell session: %w", err)
 	}
 	defer cleanup()
-	waitErr := cmd.Wait()
+	waitErr := runVMGuestInteractive(context.Background(), endpoint, "root", command, os.Stdin)
 	if intentionalCaptureTeardown(waitErr, store, captureMeta, captureActive, launchRecord.LaunchID) {
 		return nil
 	}

@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +16,7 @@ import (
 	"syscall"
 
 	"github.com/klauspost/compress/zstd"
+	"golang.org/x/crypto/ssh"
 	"golang.org/x/sys/unix"
 )
 
@@ -25,8 +29,12 @@ func buildImageFromEmbeddedBase(outputPath string, disk string) error {
 	if err := decompressZstd(embeddedRootfs, rawPath); err != nil {
 		return fmt.Errorf("decompress rootfs: %w", err)
 	}
-	if out, err := exec.Command("truncate", "-s", disk, rawPath).CombinedOutput(); err != nil {
-		return fmt.Errorf("resize shared base file: %s", strings.TrimSpace(string(out)))
+	size, err := parseDiskSizeBytes(disk)
+	if err != nil {
+		return fmt.Errorf("resize shared base file: %w", err)
+	}
+	if err := os.Truncate(rawPath, size); err != nil {
+		return fmt.Errorf("resize shared base file: %w", err)
 	}
 	e2fsck := findTool("e2fsck", "/sbin/e2fsck")
 	if out, err := exec.Command(e2fsck, "-f", "-y", rawPath).CombinedOutput(); err != nil {
@@ -332,10 +340,9 @@ func ensureSSHKey(privPath string, comment string) (string, string, error) {
 		return "", "", fmt.Errorf("inspect orphaned SSH public key %q: %w", pubPath, err)
 	}
 
-	cmd := exec.Command("ssh-keygen", "-t", "ed25519", "-f", privPath, "-N", "", "-C", comment)
 	logInfo("generating SSH key", "path", privPath, "comment", comment)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", "", fmt.Errorf("ssh-keygen: %s", strings.TrimSpace(string(out)))
+	if err := createProtectedEd25519KeyPair(keyDirectory, filepath.Base(privPath), filepath.Base(pubPath), comment); err != nil {
+		return "", "", err
 	}
 
 	if err := validateProtectedSSHPrivateKey(privPath); err != nil {
@@ -349,6 +356,70 @@ func ensureSSHKey(privPath string, comment string) (string, string, error) {
 		return "", "", err
 	}
 	return privPath, pub, nil
+}
+
+func createProtectedEd25519KeyPair(directory *os.File, privateName, publicName, comment string) (returnErr error) {
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return fmt.Errorf("generate SSH ed25519 key: %w", err)
+	}
+	key, err := ssh.NewSignerFromKey(privateKey)
+	if err != nil {
+		return fmt.Errorf("encode SSH ed25519 key: %w", err)
+	}
+	privateBlock, err := ssh.MarshalPrivateKey(privateKey, comment)
+	if err != nil {
+		return fmt.Errorf("marshal SSH private key: %w", err)
+	}
+	privatePEM := pem.EncodeToMemory(privateBlock)
+	publicLine := strings.TrimSuffix(string(ssh.MarshalAuthorizedKey(key.PublicKey())), "\n") + " " + comment + "\n"
+	createdPrivate := false
+	createdPublic := false
+	defer func() {
+		if returnErr != nil {
+			if createdPrivate {
+				_ = unix.Unlinkat(int(directory.Fd()), privateName, 0)
+			}
+			if createdPublic {
+				_ = unix.Unlinkat(int(directory.Fd()), publicName, 0)
+			}
+		}
+	}()
+	privateFD, err := unix.Openat(int(directory.Fd()), privateName, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0600)
+	if err != nil {
+		return fmt.Errorf("create SSH private key without following links: %w", err)
+	}
+	createdPrivate = true
+	privateFile := os.NewFile(uintptr(privateFD), privateName)
+	if _, err := privateFile.Write(privatePEM); err != nil {
+		_ = privateFile.Close()
+		return fmt.Errorf("write SSH private key: %w", err)
+	}
+	if err := privateFile.Sync(); err != nil {
+		_ = privateFile.Close()
+		return fmt.Errorf("sync SSH private key: %w", err)
+	}
+	if err := privateFile.Close(); err != nil {
+		return fmt.Errorf("close SSH private key: %w", err)
+	}
+	publicFD, err := unix.Openat(int(directory.Fd()), publicName, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0644)
+	if err != nil {
+		return fmt.Errorf("create SSH public key without following links: %w", err)
+	}
+	createdPublic = true
+	publicFile := os.NewFile(uintptr(publicFD), publicName)
+	if _, err := io.WriteString(publicFile, publicLine); err != nil {
+		_ = publicFile.Close()
+		return fmt.Errorf("write SSH public key: %w", err)
+	}
+	if err := publicFile.Sync(); err != nil {
+		_ = publicFile.Close()
+		return fmt.Errorf("sync SSH public key: %w", err)
+	}
+	if err := publicFile.Close(); err != nil {
+		return fmt.Errorf("close SSH public key: %w", err)
+	}
+	return nil
 }
 
 func sshKeyDirectoryOwnershipError(path string, foundUID, mode uint32) error {

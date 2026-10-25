@@ -303,7 +303,10 @@ def test_global_projects_abrupt_kill_finds_vm_without_monitor(project, tmp_path,
     store = project.store_dir
     # Model damaged runtime metadata while the actual VM process remains alive.
     (store / "runtime" / "vm.sock").unlink()
-    (store / "runtime" / "ssh-port").unlink()
+    supervisor = json.loads((store / "vm-supervisor.json").read_text(encoding="utf-8"))
+    socket_dir = Path(supervisor["socket_dir"])
+    (socket_dir / "ssh.sock").unlink()
+    (store / "runtime" / "vsock-cid").unlink()
 
     for command in (
         f"{zaigr} project clean",

@@ -27,10 +27,10 @@ def udp_probe(address):
     ]
 
 
-def ssh_options(key):
+def ssh_options(key, ssh_binary="ssh"):
     """Use only disposable credentials for the isolated test SSH service."""
     return [
-        "ssh", "-F", "/dev/null", "-i", str(key), "-p", "2222",
+        ssh_binary, "-F", "/dev/null", "-i", str(key), "-p", "2222",
         "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
         "-o", "ConnectTimeout=4",
@@ -50,7 +50,7 @@ def assert_host_services(endpoint, key):
         endpoint["token"] + ":probe"
     )
     output = checked(
-        prefix + ssh_options(key)
+        prefix + ssh_options(key, endpoint["ssh_binary"])
         + [f"root@{endpoint['ip']}", "printf", endpoint["token"]], timeout=10,
     )
     assert output == endpoint["token"]
@@ -63,12 +63,32 @@ def ip_network(test_root):
     directory.mkdir()
     key = directory / "client-key"
     host_key = directory / "host-key"
+    ssh_keygen_binary = next(
+        (
+            str(path)
+            for path in (Path("/usr/bin/ssh-keygen"), Path("/bin/ssh-keygen"))
+            if path.is_file() and os.access(path, os.X_OK)
+        ),
+        None,
+    )
+    ssh_binary = next(
+        (
+            str(path)
+            for path in (Path("/usr/bin/ssh"), Path("/bin/ssh"))
+            if path.is_file() and os.access(path, os.X_OK)
+        ),
+        None,
+    )
+    assert ssh_keygen_binary is not None, "OpenSSH client fixture requires ssh-keygen"
+    assert ssh_binary is not None, "OpenSSH positive control requires ssh"
     for path in (key, host_key):
-        checked(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", path])
+        checked([ssh_keygen_binary, "-q", "-t", "ed25519", "-N", "", "-f", path])
     endpoints = [
         {"ip": f"192.0.2.{index + 11}", "token": f"ip-endpoint-{uuid.uuid4().hex}"}
         for index in range(2)
     ]
+    for endpoint in endpoints:
+        endpoint["ssh_binary"] = ssh_binary
     host = {"port": 18083, "token": f"host-endpoint-{uuid.uuid4().hex}"}
     (directory / "services.json").write_text(
         json.dumps({"endpoints": endpoints, "host": host}), encoding="utf-8",

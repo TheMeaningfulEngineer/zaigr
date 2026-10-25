@@ -5,7 +5,8 @@ for each [project](docs/terminology.md#project).
 
 ## Installation
 
-Requires Linux x86-64 with usable KVM.
+Requires Linux x86-64 with usable KVM and `/dev/vhost-vsock` access (normally
+provided by membership in the `kvm` group).
 
 ### Standalone binary
 
@@ -27,7 +28,7 @@ host dependencies separately from your distribution's repositories. On Debian
 or Ubuntu:
 
 ```sh
-sudo apt install coreutils e2fsprogs openssh-client qemu-system-x86 qemu-utils util-linux
+sudo apt install coreutils e2fsprogs qemu-system-x86 qemu-utils
 ```
 
 Firewall enforcement now runs on the host, outside the VM. Older installations
@@ -37,7 +38,9 @@ tools, QEMU/KVM, filesystem sandbox, disk-space and host-networking failures.
 It prints only the missing Debian/Ubuntu packages and a suggested install
 command. Zaigr never installs packages or changes host policy automatically.
 
-The host kernel must support nftables conntrack marks
+The host must expose a usable `/dev/vhost-vsock` device. If it is missing,
+enable the host's vhost-vsock support; if it is not accessible to your account,
+add yourself to the `kvm` group. The host kernel must support nftables conntrack marks
 (`CONFIG_NF_CONNTRACK_MARK`). The bundled kernel enables this option. When
 running Zaigr inside an older Zaigr VM, boot that VM with the updated bundled
 kernel before using the new firewall. `zaigr misc check` verifies rule setup.
@@ -79,7 +82,6 @@ and run `zaigr project rebuild` before reopening it. This catches known host
 requirements before rebuild work begins; it cannot predict every later runtime
 failure.
 
-On Ubuntu, [`setpriv` is part of util-linux](https://manpages.ubuntu.com/manpages/noble/man1/setpriv.1.html).
 Zaigr creates namespaces directly, so it does not require the `unshare` command.
 For Ubuntu AppArmor restrictions, see the [Ubuntu security documentation](https://documentation.ubuntu.com/security/security-features/privilege-restriction/apparmor/).
 
@@ -580,6 +582,10 @@ the bundled guest runtime. A customized global base image may require
 `zaigr global base-image reset` and reapplying its setups. The CLI reports
 the appropriate action when it finds a runtime mismatch. Host workspace
 and agent-state files remain in their existing directories.
+
+When upgrading from a Zaigr version that used TCP management SSH, stop any
+running VM with the version that started it. Then use the new version to run
+`zaigr project rebuild` before starting the project again.
 
 ## More help
 
