@@ -27,7 +27,7 @@ host dependencies separately from your distribution's repositories. On Debian
 or Ubuntu:
 
 ```sh
-sudo apt install coreutils e2fsprogs openssh-client qemu-system-x86 qemu-utils slirp4netns util-linux
+sudo apt install coreutils e2fsprogs openssh-client qemu-system-x86 qemu-utils util-linux
 ```
 
 Firewall enforcement now runs on the host, outside the VM. Older installations
@@ -556,13 +556,16 @@ Replace `my-project` with the name or ID you chose.
 
 ## Building from source
 
-`make build` builds the guest kernel and root filesystem, compiles virtiofsd
-1.13.2 as a static musl executable, then embeds all three artifacts in the Go
-binary. It needs Go 1.24, Rust 1.82.0 with the `x86_64-unknown-linux-musl` target installed,
+`make build` builds the guest kernel and root filesystem, compiles the pinned
+virtiofsd version as a static musl executable, downloads upstream's static
+slirp4netns release binary and verifies it against `deps.lock`, then embeds the
+guest assets and both host tools in the Go binary. Zaigr extracts slirp4netns under
+`~/.zaigr/` and does not depend on a system slirp4netns package. It needs Go
+1.24, Rust 1.82.0 with the `x86_64-unknown-linux-musl` target installed,
 `x86_64-linux-musl-gcc`, `gperf`, `pkg-config`, `make`, `binutils`, `git`,
-`curl`, `tar`, and Linux headers. The daemon build script downloads pinned
-libcap-ng 0.8.5 and libseccomp 2.6.0 sources and builds their static musl
-libraries; host development copies of those libraries are not used. The
+`curl`, `tar`, and Linux headers. The daemon build script downloads the
+checksum-pinned libcap-ng and libseccomp sources from `deps.lock` and builds
+their static musl libraries; host development copies of those libraries are not used. The
 kernel build additionally needs GCC, flex, bison, and bc. The rootfs build
 needs mmdebstrap, fakeroot, zstd, openssl, and e2fsprogs. See
 [`vm_prep/build-virtiofsd.sh`](vm_prep/build-virtiofsd.sh) for exact source

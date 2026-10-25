@@ -27,7 +27,6 @@ overrides:
       - openssh-client
       - qemu-system-x86
       - qemu-utils
-      - slirp4netns
       - util-linux
   rpm:
     depends:
@@ -37,7 +36,6 @@ overrides:
       - openssh-clients
       - qemu-img
       - qemu-system-x86-core
-      - slirp4netns
       - util-linux
   archlinux:
     depends:
@@ -47,5 +45,4 @@ overrides:
       - openssh
       - qemu-img
       - qemu-system-x86
-      - slirp4netns
       - util-linux

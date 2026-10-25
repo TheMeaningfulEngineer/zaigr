@@ -64,7 +64,8 @@ DISTROS = {
     },
 }
 
-# Packages named by the README's documented apt install line.
+# Baseline packages in prepared distro images. slirp4netns remains installed
+# here so acceptance tests can cover both system-package states by removing it.
 GUEST_PACKAGES = (
     "coreutils", "e2fsprogs", "openssh-client", "qemu-system-x86",
     "qemu-utils", "slirp4netns", "util-linux",

@@ -26,7 +26,7 @@ def test_install_deb_and_run_documented_workflow(cloudvm_factory, distro):
         vm,
         "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "
         "coreutils e2fsprogs openssh-client qemu-system-x86 qemu-utils "
-        "slirp4netns util-linux",
+        "util-linux",
         timeout=300,
         user="user",
     )

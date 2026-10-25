@@ -1,0 +1,669 @@
+#!/usr/bin/env python3
+"""Report upstream versions and release notes for pinned dependencies."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections.abc import Iterable
+from dataclasses import dataclass
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Any
+
+LOG = logging.getLogger("deps-check")
+ROOT = Path(__file__).resolve().parent.parent
+LOCK_PATH = ROOT / "deps.lock"
+TIMEOUT_SECONDS = 20
+MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+MAX_PAGES = 100
+SOURCE_BASE_URL: str | None = None
+
+
+@dataclass(frozen=True)
+class Release:
+    """One stable upstream release and its published notes, when available."""
+
+    version: str
+    parts: tuple[int, ...]
+    notes: str
+    url: str
+    tag_only: bool = False
+
+
+def parse_lock(path: Path) -> dict[str, str]:
+    """Read simple KEY=VALUE assignments from the dependency lock."""
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        values[key.strip()] = value.strip().strip("\"'")
+    required = (
+        "KERNEL_VERSION", "DEBIAN_SUITE", "VIRTIOFSD_VERSION", "LIBSECCOMP_VERSION",
+        "LIBCAP_NG_VERSION", "SLIRP4NETNS_VERSION", "GO_VERSION",
+    )
+    missing = [key for key in required if not values.get(key)]
+    if missing:
+        raise ValueError(f"{path}: missing required keys: {', '.join(missing)}")
+    return values
+
+
+def fetch(url: str, missing_ok: bool = False) -> tuple[bytes, Any]:
+    """Fetch one bounded response and identify network errors by hostname."""
+    original = urllib.parse.urlsplit(url)
+    host = original.hostname or "unknown host"
+    if SOURCE_BASE_URL:
+        base = urllib.parse.urlsplit(SOURCE_BASE_URL)
+        url = urllib.parse.urlunsplit((base.scheme, base.netloc, original.path, original.query, ""))
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json, text/html;q=0.9, */*;q=0.8",
+            "User-Agent": "zaigr-deps-check/1.0",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+            body = response.read(MAX_RESPONSE_BYTES + 1)
+            if len(body) > MAX_RESPONSE_BYTES:
+                raise ValueError(f"response from {host} exceeded {MAX_RESPONSE_BYTES} bytes")
+            return body, response.headers
+    except urllib.error.HTTPError as exc:
+        if missing_ok and exc.code in {404, 410}:
+            return b"", {"status": exc.code}
+        raise RuntimeError(f"fetch failed from host {host}: {exc}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"fetch failed from host {host}: {exc}") from exc
+
+
+def numeric_version(tag: str) -> tuple[str, tuple[int, ...]] | None:
+    """Extract a complete stable version from common upstream tag spellings."""
+    if re.search(r"(?i)(?:^|[-_.])(?:alpha|beta|rc|pre|preview|dev)(?:[-_.]|\d|$)", tag):
+        return None
+    normalized = tag.strip().removeprefix("go")
+    match = re.fullmatch(r"(?:[A-Za-z][A-Za-z0-9._-]*-)?v?(\d+(?:\.\d+){1,3})", normalized)
+    if match is None:
+        return None
+    version = match.group(1)
+    return version, tuple(int(piece) for piece in version.split("."))
+
+
+def version_parts(tag: str) -> tuple[int, ...]:
+    """Return a numeric version tuple or reject unsupported version text."""
+    parsed = numeric_version(tag)
+    if parsed is None:
+        raise ValueError(f"unsupported version: {tag}")
+    return parsed[1]
+
+
+def json_response(url: str) -> tuple[Any, Any]:
+    """Fetch and decode a JSON response, reporting malformed data clearly."""
+    body, headers = fetch(url)
+    try:
+        return json.loads(body), headers
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        host = urllib.parse.urlsplit(url).hostname or "unknown host"
+        raise RuntimeError(f"invalid JSON from host {host}: {exc}") from exc
+
+
+def fetch_paginated(url: str, kind: str) -> list[dict[str, Any]]:
+    """Fetch every page of a GitHub or GitLab collection endpoint."""
+    items: list[dict[str, Any]] = []
+    page = 1
+    while page <= MAX_PAGES:
+        page_url = f"{url}{'&' if '?' in url else '?'}per_page=100&page={page}"
+        data, headers = json_response(page_url)
+        if not isinstance(data, list):
+            raise TypeError(f"unexpected {kind} response shape from {urllib.parse.urlsplit(url).hostname}")
+        items.extend(item for item in data if isinstance(item, dict))
+        if kind == "GitLab":
+            next_page = headers.get("x-next-page")
+            if next_page:
+                page = int(next_page)
+                continue
+            if len(data) < 100:
+                return items
+        if kind == "GitHub" and len(data) < 100:
+            return items
+        page += 1
+    host = urllib.parse.urlsplit(url).hostname or "unknown host"
+    raise RuntimeError(f"pagination exceeded {MAX_PAGES} pages from host {host}")
+
+
+def github_releases(project: str, baseline: str) -> list[Release]:
+    """Collect GitHub releases and tag-only stable versions for a project."""
+    api = f"https://api.github.com/repos/{project}"
+    release_rows = fetch_paginated(f"{api}/releases", "GitHub")
+    tag_rows = fetch_paginated(f"{api}/tags", "GitHub")
+    releases: dict[tuple[int, ...], Release] = {}
+    excluded_versions: set[tuple[int, ...]] = set()
+    for row in release_rows:
+        raw_tag = str(row.get("tag_name", ""))
+        parsed = numeric_version(raw_tag)
+        if parsed is None:
+            continue
+        if row.get("draft") or row.get("prerelease"):
+            excluded_versions.add(parsed[1])
+            continue
+        version, parts = parsed
+        body = str(row.get("body") or "").strip()
+        url = str(row.get("html_url") or f"https://github.com/{project}/releases/tag/{raw_tag}")
+        releases[parts] = Release(version, parts, body, url)
+    for row in tag_rows:
+        parsed = numeric_version(str(row.get("name", "")))
+        if parsed is None:
+            continue
+        version, parts = parsed
+        if parts in excluded_versions:
+            continue
+        releases.setdefault(
+            parts,
+            Release(version, parts, "", f"https://github.com/{project}/releases/tag/{row['name']}", True),
+        )
+    return _versions_after_baseline(releases.values(), baseline)
+
+
+def gitlab_releases(project: str, baseline: str) -> list[Release]:
+    """Collect GitLab release notes plus stable tags without release entries."""
+    encoded_project = urllib.parse.quote(project, safe="")
+    api = f"https://gitlab.com/api/v4/projects/{encoded_project}"
+    release_rows = fetch_paginated(f"{api}/releases", "GitLab")
+    tag_rows = fetch_paginated(f"{api}/repository/tags", "GitLab")
+    releases: dict[tuple[int, ...], Release] = {}
+    for row in release_rows:
+        raw_tag = str(row.get("tag_name", ""))
+        parsed = numeric_version(raw_tag)
+        if parsed is None:
+            continue
+        version, parts = parsed
+        body = str(row.get("description") or row.get("name") or "").strip()
+        url = str(row.get("_links", {}).get("self", f"https://gitlab.com/{project}/-/releases/{raw_tag}"))
+        releases[parts] = Release(version, parts, body, url)
+    for row in tag_rows:
+        raw_tag = str(row.get("name", ""))
+        parsed = numeric_version(raw_tag)
+        if parsed is None:
+            continue
+        version, parts = parsed
+        releases.setdefault(parts, Release(version, parts, "", f"https://gitlab.com/{project}/-/tags/{raw_tag}", True))
+    return _versions_after_baseline(releases.values(), baseline)
+
+
+def _versions_after_baseline(releases: Iterable[Release], baseline: str) -> list[Release]:
+    """Keep stable versions newer than the pinned version in ascending order."""
+    parsed_baseline = numeric_version(baseline)
+    if parsed_baseline is None:
+        raise ValueError(f"unsupported pinned version: {baseline}")
+    baseline_parts = parsed_baseline[1]
+    return sorted((release for release in releases if release.parts > baseline_parts), key=lambda item: item.parts)
+
+
+def kernel_versions(shipped: str) -> tuple[str, str, str]:
+    """Return the shipped-series, next long-term, and latest stable kernel versions."""
+    data, _ = json_response("https://www.kernel.org/releases.json")
+    shipped_version = numeric_version(shipped)
+    if shipped_version is None:
+        raise ValueError(f"unsupported kernel version: {shipped}")
+    shipped_parts = shipped_version[1]
+    if not isinstance(data, dict) or not isinstance(data.get("releases"), list):
+        raise TypeError("unexpected release data from host www.kernel.org")
+    releases = [row for row in data["releases"] if isinstance(row, dict) and numeric_version(str(row.get("version", "")))]
+    same_series = [
+        row for row in releases
+        if row.get("moniker") in {"stable", "longterm"}
+        and version_parts(str(row["version"]))[:2] == shipped_parts[:2]
+        and version_parts(str(row["version"])) >= shipped_parts
+    ]
+    longterm = [
+        row for row in releases
+        if row.get("moniker") == "longterm"
+        and version_parts(str(row["version"]))[:2] > shipped_parts[:2]
+    ]
+    stable = [row for row in releases if row.get("moniker") == "stable"]
+    latest_same = max(same_series, key=lambda row: version_parts(str(row["version"]))) if same_series else None
+    next_lts = min(longterm, key=lambda row: version_parts(str(row["version"]))) if longterm else None
+    latest_stable = max(stable, key=lambda row: version_parts(str(row["version"]))) if stable else None
+    return (
+        str(latest_same["version"]) if latest_same else "none",
+        str(next_lts["version"]) if next_lts else "none",
+        str(latest_stable["version"]) if latest_stable else "none",
+    )
+
+
+def debian_rootfs(suite: str) -> tuple[str, str, str]:
+    """Return Debian rootfs shipped label, latest point release, and next stable."""
+    release_index, _ = fetch("https://www.debian.org/releases/")
+    index_text = parse_visible_text(release_index)
+    index_text = re.sub(r"\s+", " ", index_text)
+    stable_match = re.search(
+        r'The current ["“”\']?stable["“”\']? distribution of Debian is version (\d+), codenamed ([a-z0-9-]+)',
+        index_text,
+    )
+    if stable_match is None:
+        raise ValueError("could not find current Debian stable release on www.debian.org")
+    stable_major = int(stable_match.group(1))
+    stable_codename = stable_match.group(2)
+
+    suite_page, _ = fetch(f"https://www.debian.org/releases/{urllib.parse.quote(suite)}/")
+    suite_text = re.sub(r"\s+", " ", parse_visible_text(suite_page))
+    released_versions = [
+        (int(major), int(point))
+        for major, point in re.findall(r"Debian (\d+)\.(\d+)\s+was released", suite_text)
+    ]
+    if not released_versions:
+        raise ValueError(f"could not find Debian point release for suite {suite!r} on www.debian.org")
+    shipped_major = released_versions[0][0]
+    shipped_label = f"Debian {shipped_major} ({suite})"
+    bugfix = ".".join(str(part) for part in max(released_versions))
+    feature = (
+        f"Debian {stable_major} ({stable_codename})"
+        if stable_major > shipped_major else "up to date"
+    )
+    return shipped_label, bugfix, feature
+
+
+class GoReleaseHistoryParser(HTMLParser):
+    """Extract Go release-history sections keyed by their version anchors."""
+
+    def __init__(self) -> None:
+        """Initialize the release-section collector."""
+        super().__init__()
+        self.sections: dict[str, list[str]] = {}
+        self.current: str | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """Start collecting text when a release heading or patch entry begins."""
+        attributes = dict(attrs)
+        anchor = attributes.get("id") or ""
+        is_release_anchor = re.fullmatch(r"go1\.\d+(?:\.\d+)?", anchor) is not None
+        if tag == "h2":
+            self.current = anchor if is_release_anchor else None
+        elif tag == "h3":
+            self.current = None
+        elif tag == "p" and is_release_anchor:
+            self.current = anchor
+        if self.current:
+            self.sections.setdefault(self.current, [])
+            if tag in {"p", "li", "br"}:
+                self.sections[self.current].append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        """Separate block text while collecting a release section."""
+        if self.current and tag in {"p", "li", "h2", "br"}:
+            self.sections[self.current].append("\n")
+
+    def handle_data(self, data: str) -> None:
+        """Append visible text to the current Go release section."""
+        if self.current:
+            self.sections[self.current].append(data)
+
+
+class VisibleTextParser(HTMLParser):
+    """Collect visible text from an upstream HTML release-note page."""
+
+    def __init__(self) -> None:
+        """Initialize the visible-text collector."""
+        super().__init__()
+        self.parts: list[str] = []
+        self.main_parts: list[str] = []
+        self.in_main = False
+        self.hidden_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """Track hidden elements and separate visible block text."""
+        if tag in {"script", "style"}:
+            self.hidden_depth += 1
+            return
+        if tag == "main" and dict(attrs).get("id") == "main-content":
+            self.in_main = True
+        if not self.hidden_depth and tag in {"p", "li", "h1", "h2", "h3", "br"}:
+            self._append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        """Stop hidden elements and separate visible block text."""
+        if tag in {"script", "style"} and self.hidden_depth:
+            self.hidden_depth -= 1
+            return
+        if not self.hidden_depth and tag in {"p", "li", "h1", "h2", "h3", "br"}:
+            self._append("\n")
+        if tag == "main":
+            self.in_main = False
+
+    def handle_data(self, data: str) -> None:
+        """Append visible HTML text."""
+        if not self.hidden_depth:
+            self._append(data)
+
+    def _append(self, text: str) -> None:
+        """Append text to both fallback and main-content buffers."""
+        self.parts.append(text)
+        if self.in_main:
+            self.main_parts.append(text)
+
+
+def parse_visible_text(body: bytes) -> str:
+    """Extract line-preserving visible text from an HTML document."""
+    parser = VisibleTextParser()
+    parser.feed(body.decode("utf-8", errors="replace"))
+    content = parser.main_parts if parser.main_parts else parser.parts
+    return clean_note("".join(content))
+
+
+def parse_go_history(body: bytes) -> dict[str, str]:
+    """Return line-preserving release-note text for every anchored Go version."""
+    parser = GoReleaseHistoryParser()
+    parser.feed(body.decode("utf-8", errors="replace"))
+    return {version: clean_note("".join(parts)) for version, parts in parser.sections.items()}
+
+
+def go_releases(shipped: str) -> list[Release]:
+    """Read stable Go versions and attach the official release-history URL."""
+    data, _ = json_response("https://go.dev/dl/?mode=json&include=all")
+    history, _ = fetch("https://go.dev/doc/devel/release")
+    notes_by_version = parse_go_history(history)
+    if not isinstance(data, list):
+        raise TypeError("unexpected version data from host go.dev")
+    releases: dict[tuple[int, ...], Release] = {}
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        if not row.get("stable"):
+            continue
+        parsed = numeric_version(str(row.get("version", "")))
+        if parsed is None:
+            continue
+        version, parts = parsed
+        anchor = f"go{version}"
+        note = notes_by_version.get(anchor, "")
+        url = f"https://go.dev/doc/devel/release#{anchor}"
+        releases[parts] = Release(version, parts, note, url)
+    after_baseline = _versions_after_baseline(releases.values(), shipped)
+    complete_notes: list[Release] = []
+    for release in after_baseline:
+        if len(release.parts) == 3 and release.parts[2] == 0:
+            major_minor = ".".join(str(number) for number in release.parts[:2])
+            note_url = f"https://go.dev/doc/go{major_minor}"
+            body, _ = fetch(note_url)
+            note_text = parse_visible_text(body)
+            if note_text:
+                release = Release(release.version, release.parts, note_text, note_url)
+        complete_notes.append(release)
+    return complete_notes
+
+
+def direct_go_requirements(path: Path) -> list[tuple[str, str]]:
+    """Read direct Go module requirements from go.mod, excluding indirect rows."""
+    requirements: list[tuple[str, str]] = []
+    in_block = False
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        if "// indirect" in raw_line:
+            continue
+        line = raw_line.split("//", 1)[0].strip()
+        if not line:
+            continue
+        if line == "require (":
+            in_block = True
+            continue
+        if in_block and line == ")":
+            in_block = False
+            continue
+        if line.startswith("require "):
+            line = line[len("require "):].strip()
+        elif not in_block:
+            continue
+        fields = line.split()
+        if len(fields) == 2:
+            requirements.append((fields[0], fields[1]))
+    return requirements
+
+
+def go_proxy_escape(module: str) -> str:
+    """Escape uppercase letters as required by the Go module proxy protocol."""
+    return "".join(f"!{character.lower()}" if character.isupper() else character for character in module)
+
+
+def parse_module_version(value: str) -> tuple[tuple[int, int, int], tuple[int, str]] | None:
+    """Parse a stable module version or Go pseudo-version for ordering."""
+    value = value.strip()
+    match = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)(-[^+]+)?(?:\+incompatible)?", value)
+    if match is None:
+        return None
+    core = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    suffix = match.group(4)
+    pseudo = suffix if suffix and re.fullmatch(
+        r"(?:-0\.\d{14}|-\d{14}|-[A-Za-z0-9.]+\.0\.\d{14})-[0-9A-Fa-f]{7,}", suffix
+    ) else None
+    if suffix and pseudo is None:
+        return None
+    # A final release sorts after a pseudo-version with the same core.
+    order: tuple[int, str] = (1, pseudo) if pseudo is not None else (2, "")
+    return core, order
+
+
+def module_version_key(version: str) -> tuple[tuple[int, int, int], tuple[int, str]]:
+    """Return a parsed module-version key, rejecting unsupported versions."""
+    parsed = parse_module_version(version)
+    if parsed is None:
+        raise ValueError(f"unsupported Go module version: {version}")
+    return parsed
+
+
+def module_classification_parts(version: str) -> tuple[int, int, int]:
+    """Return the semantic release base used to assign a pseudo-version channel."""
+    parsed = parse_module_version(version)
+    if parsed is None:
+        raise ValueError(f"unsupported Go module version: {version}")
+    parts = parsed[0]
+    suffix = version.split("+", 1)[0][len("v" + ".".join(str(number) for number in parts)):]
+    if suffix.startswith("-0.") and parts[2] > 0:
+        return parts[0], parts[1], parts[2] - 1
+    return parts
+
+
+def module_releases(module: str, baseline: str, missing_ok: bool = False) -> list[str]:
+    """Fetch stable tagged and latest pseudo versions for one module."""
+    escaped = go_proxy_escape(module)
+    base = f"https://proxy.golang.org/{escaped}/@v"
+    body, headers = fetch(f"{base}/list", missing_ok=missing_ok)
+    if headers.get("status") in {404, 410}:
+        return []
+    versions = body.decode("utf-8", errors="replace").splitlines()
+    latest_body, latest_headers = fetch(f"https://proxy.golang.org/{escaped}/@latest", missing_ok=missing_ok)
+    if latest_headers.get("status") in {404, 410}:
+        return []
+    try:
+        latest_data = json.loads(latest_body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError(f"invalid JSON from host proxy.golang.org: {exc}") from exc
+    if not isinstance(latest_data, dict) or not isinstance(latest_data.get("Version"), str):
+        raise TypeError(f"unexpected latest-version response from host proxy.golang.org for {module}")
+    versions.append(latest_data["Version"])
+    baseline_key = module_version_key(baseline)
+    parsed: dict[tuple[tuple[int, int, int], tuple[int, str]], str] = {}
+    for version in versions:
+        key = parse_module_version(version)
+        if key is not None and key > baseline_key:
+            parsed[key] = version
+    return [parsed[key] for key in sorted(parsed)]
+
+
+def next_major_module_path(module: str) -> str:
+    """Return exactly one next-major module path for a bounded feature probe."""
+    gopkg = re.fullmatch(r"(gopkg\.in/.+)\.v(\d+)", module)
+    if gopkg:
+        return f"{gopkg.group(1)}.v{int(gopkg.group(2)) + 1}"
+    suffix = re.fullmatch(r"(.+)/v(\d+)", module)
+    if suffix:
+        return f"{suffix.group(1)}/v{int(suffix.group(2)) + 1}"
+    if not module.startswith("gopkg.in/"):
+        return f"{module}/v2"
+    raise ValueError(f"unsupported gopkg.in module major suffix: {module}")
+
+
+def module_label(module: str) -> str:
+    """Return the short display name specified for Go module rows."""
+    parts = module.split("/")
+    if parts and re.fullmatch(r"v\d+", parts[-1]):
+        parts.pop()
+    elif module.startswith("gopkg.in/"):
+        parts[-1] = re.sub(r"\.v\d+$", "", parts[-1])
+    return parts[-1]
+
+
+def module_update_rows(requirements: list[tuple[str, str]]) -> list[tuple[str, str, str, str]]:
+    """Return aligned summary rows for direct modules that have newer versions."""
+    labels = [module_label(module) for module, _ in requirements]
+    collisions = {label for label in labels if labels.count(label) > 1}
+    rows = []
+    for (module, shipped), label in zip(requirements, labels, strict=True):
+        versions = module_releases(module, shipped)
+        next_major = next_major_module_path(module)
+        versions.extend(module_releases(next_major, shipped, missing_ok=True))
+        versions = sorted(set(versions), key=module_version_key)
+        if not versions:
+            continue
+        shipped_key = module_classification_parts(shipped)
+        bugfix = []
+        features = []
+        for version in versions:
+            candidate = module_classification_parts(version)
+            if shipped_key[0] == 0 or candidate[:2] > shipped_key[:2]:
+                features.append(version)
+            elif candidate[:2] == shipped_key[:2]:
+                bugfix.append(version)
+        bugfix_version = max(bugfix, key=module_version_key) if bugfix else "up to date"
+        feature_version = max(features, key=module_version_key) if features else "up to date"
+        if label in collisions:
+            label = "/".join(module.split("/")[-2:])
+            if re.fullmatch(r"v\d+", module.split("/")[-1]):
+                label = "/".join(module.split("/")[-3:-1])
+        rows.append((label, shipped, bugfix_version, feature_version))
+    return rows
+
+
+def series(release: Release, width: int) -> tuple[int, ...]:
+    """Return the major/minor series key used for update channels."""
+    return release.parts[:width]
+
+
+def clean_note(note: str) -> str:
+    """Remove common linked-image badges and trim only outer blank lines."""
+    note = re.sub(r"\[!\[[^\]]*\]\([^)]*\)\]\([^)]*\)", "", note)
+    note = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", note)
+    return re.sub(r"\A(?:[ \t]*\r?\n)+|(?:\r?\n[ \t]*)+\Z", "", note)
+
+
+def component_report(
+    name: str,
+    shipped: str,
+    releases: list[Release],
+    width: int,
+) -> tuple[tuple[str, str, str, str], list[str]]:
+    """Build summary cells and release notes for a dependency's two channels."""
+    shipped_parts = version_parts(shipped)
+    shipped_series = shipped_parts[:width]
+    bugfixes = [
+        release for release in releases
+        if series(release, width) == shipped_series and release.parts > shipped_parts
+    ]
+    features = [release for release in releases if series(release, width) > shipped_series]
+    bugfix = max(bugfixes, key=lambda item: item.parts).version if bugfixes else "up to date"
+    feature = max(features, key=lambda item: item.parts).version if features else "up to date"
+    lines = [f"{name} release notes:"]
+    for channel, channel_releases, latest in (
+        ("bugfix updates channel", bugfixes, bugfix),
+        ("feature updates channel", features, feature),
+    ):
+        lines.append(f"  {channel}:")
+        if latest == "up to date":
+            lines.append("    up to date")
+            continue
+        latest_parts = version_parts(latest)
+        for release in channel_releases:
+            if release.parts > latest_parts:
+                continue
+            if release.notes:
+                lines.append(f"    {release.version}: [{release.url}]")
+                lines.extend(f"      {line}" for line in clean_note(release.notes).splitlines())
+            elif release.tag_only:
+                lines.append(f"    {release.version}: tag-only; no release notes entry was published [{release.url}]")
+            else:
+                lines.append(f"    {release.version}: release has no published notes [{release.url}]")
+    return (name, shipped, bugfix, feature), lines
+
+
+def display_version(value: str) -> str:
+    """Shorten a Go pseudo-version to its base and year so the table stays narrow."""
+    match = re.fullmatch(r"(v\d+\.\d+\.\d+-(?:\w+\.)?(?:0\.)?)(\d{4})\d{10}-[0-9a-f]{12}(\+incompatible)?", value)
+    return f"{match.group(1)}{match.group(2)}…" if match else value
+
+
+def print_summary(rows: list[tuple[str, str, str, str]]) -> None:
+    """Print dependency summary rows in aligned four-column form."""
+    rows = [(row[0], *(display_version(value) for value in row[1:])) for row in rows]  # type: ignore[misc]
+    headers = ("component", "shipped", "bugfix updates channel", "feature updates channel")
+    widths = tuple(max(len(header), *(len(row[index]) for row in rows)) for index, header in enumerate(headers))
+    print("  ".join(header.ljust(widths[index]) for index, header in enumerate(headers)))
+    print("  ".join("-" * width for width in widths))
+    for row in rows:
+        print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
+
+
+def main() -> int:
+    """Fetch and display upstream dependency versions and notes."""
+    global SOURCE_BASE_URL
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source-base-url", help="fixture server origin; routes requests locally while preserving upstream paths")
+    args = parser.parse_args()
+    SOURCE_BASE_URL = args.source_base_url.rstrip("/") if args.source_base_url else None
+    logging.basicConfig(level=logging.ERROR, format="%(levelname)s: %(message)s")
+    try:
+        lock = parse_lock(LOCK_PATH)
+        kernel_same, kernel_lts, kernel_stable = kernel_versions(lock["KERNEL_VERSION"])
+        kernel_shipped_parts = version_parts(lock["KERNEL_VERSION"])
+        kernel_bugfix = (
+            kernel_same if kernel_same != "none" and version_parts(kernel_same) > kernel_shipped_parts
+            else "up to date"
+        )
+        kernel_feature = "; ".join(
+            f"{label}: {version if version != 'none' and version_parts(version) > kernel_shipped_parts else 'up to date'}"
+            for label, version in (("next long-term", kernel_lts), ("latest stable", kernel_stable))
+        )
+        components = (
+            ("virtiofsd", lock["VIRTIOFSD_VERSION"], gitlab_releases("virtio-fs/virtiofsd", lock["VIRTIOFSD_VERSION"]), 2),
+            ("libseccomp", lock["LIBSECCOMP_VERSION"], github_releases("seccomp/libseccomp", lock["LIBSECCOMP_VERSION"]), 2),
+            ("libcap-ng", lock["LIBCAP_NG_VERSION"], github_releases("stevegrubb/libcap-ng", lock["LIBCAP_NG_VERSION"]), 2),
+            ("slirp4netns", lock["SLIRP4NETNS_VERSION"], github_releases("rootless-containers/slirp4netns", lock["SLIRP4NETNS_VERSION"]), 2),
+            ("Go", lock["GO_VERSION"], go_releases(lock["GO_VERSION"]), 2),
+        )
+        reports = [component_report(name, shipped, releases, width) for name, shipped, releases, width in components]
+        rootfs_shipped, rootfs_bugfix, rootfs_feature = debian_rootfs(lock["DEBIAN_SUITE"])
+        module_rows = module_update_rows(direct_go_requirements(ROOT / "go.mod"))
+        summary_rows = [
+            ("Kernel", lock["KERNEL_VERSION"], kernel_bugfix, kernel_feature),
+            ("Base rootfs", rootfs_shipped, rootfs_bugfix, rootfs_feature),
+            *(cells for cells, _ in reports),
+            *module_rows,
+        ]
+        print_summary(summary_rows)
+        print("Release notes:")
+        for _, notes in reports:
+            for line in notes:
+                print(line)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        LOG.error("%s", exc)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

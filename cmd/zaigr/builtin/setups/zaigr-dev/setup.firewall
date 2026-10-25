@@ -1,3 +1,4 @@
+api.github.com
 archive.ubuntu.com
 auth.docker.io
 cdn.registry.fedoraproject.org
@@ -15,6 +16,7 @@ git.kernel.org
 github-releases.githubusercontent.com
 github.com
 gitlab.com
+go.dev
 index.crates.io
 index.docker.io
 laotzu.ftp.acc.umu.se
@@ -22,6 +24,7 @@ mirrors.fedoraproject.org
 objects.githubusercontent.com
 production.cloudflare.docker.com
 production.cloudfront.docker.com
+proxy.golang.org
 registry-1.docker.io
 registry.fedoraproject.org
 release-assets.githubusercontent.com
@@ -30,3 +33,5 @@ security.ubuntu.com
 sh.rustup.rs
 static.crates.io
 static.rust-lang.org
+www.debian.org
+www.kernel.org

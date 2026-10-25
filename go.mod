@@ -2,8 +2,6 @@ module zaigr
 
 go 1.24.0
 
-toolchain go1.24.4
-
 require (
 	github.com/google/nftables v0.3.0
 	github.com/mdlayher/netlink v1.7.3-0.20250113171957-fbb4dce95f42

@@ -46,6 +46,7 @@ coverage.out
 *.qcow2.wip
 *.img
 /cmd/zaigr/vm_data/bzImage
+/cmd/zaigr/vm_data/bzImage.build-key
 /cmd/zaigr/vm_data/base-rootfs.img.zst
 /cmd/zaigr/vm_data/base-rootfs.version
 
@@ -57,3 +58,4 @@ coverage.out
 *.swo
 .DS_Store
 /cmd/zaigr/vm_data/virtiofsd
+/cmd/zaigr/vm_data/slirp4netns

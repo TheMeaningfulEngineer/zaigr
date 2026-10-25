@@ -904,9 +904,9 @@ func startSupervisorHostNetwork(spec vmLaunchSpec, store projectStore) (*hostNet
 	if err != nil {
 		return nil, err
 	}
-	slirp, err := exec.LookPath("slirp4netns")
+	slirp, err := ensureSlirp4netnsWithWriter(false, io.Discard)
 	if err != nil {
-		return nil, fmt.Errorf("locate slirp4netns for host network backend: %w", err)
+		return nil, fmt.Errorf("extract bundled slirp4netns: %w", err)
 	}
 	executable, err := os.Executable()
 	if err != nil {

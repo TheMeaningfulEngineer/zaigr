@@ -129,7 +129,8 @@ func ensureKernelQuiet(noCache bool) (string, error) {
 
 func ensureKernelWithWriter(noCache bool, out io.Writer) (string, error) {
 	ver := embeddedVersion(embeddedKernel, "zaigr-")
-	path := filepath.Join(zaigDir(), fmt.Sprintf("bzImage-%s", ver))
+	digest := sha256.Sum256(embeddedKernel)
+	path := filepath.Join(zaigDir(), fmt.Sprintf("bzImage-%s-%x", ver, digest))
 
 	if !noCache {
 		if _, err := os.Stat(path); err == nil {
@@ -206,6 +207,60 @@ func ensureVirtiofsdWithWriter(noCache bool, out io.Writer) (string, error) {
 		return "", fmt.Errorf("publish virtiofsd: %w", err)
 	}
 	_, _ = fmt.Fprintf(out, ":: Virtiofsd extracted to %s\n", path)
+	return path, nil
+}
+
+func ensureSlirp4netnsWithWriter(noCache bool, out io.Writer) (string, error) {
+	digest := sha256.Sum256(embeddedSlirp4netns)
+	version := strings.TrimSpace(embeddedSlirp4netnsVersion)
+	if version == "" {
+		return "", errors.New("embedded slirp4netns version is empty")
+	}
+	path := filepath.Join(zaigDir(), fmt.Sprintf("slirp4netns-%s-%x", version, digest))
+	if err := os.MkdirAll(zaigDir(), 0755); err != nil {
+		return "", fmt.Errorf("create slirp4netns cache: %w", err)
+	}
+	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return "", fmt.Errorf("open slirp4netns extraction lock: %w", err)
+	}
+	defer func() { _ = lock.Close() }()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return "", fmt.Errorf("lock slirp4netns extraction: %w", err)
+	}
+	if !noCache {
+		if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() && info.Mode().Perm() == 0755 {
+			if cached, err := os.ReadFile(path); err == nil && sha256.Sum256(cached) == digest {
+				_, _ = fmt.Fprintf(out, ":: Slirp4netns cached at %s\n", path)
+				return path, nil
+			}
+		}
+	}
+	tmp, err := os.CreateTemp(zaigDir(), ".slirp4netns-*")
+	if err != nil {
+		return "", fmt.Errorf("create temporary slirp4netns: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+	if _, err = tmp.Write(embeddedSlirp4netns); err != nil {
+		_ = tmp.Close()
+		return "", fmt.Errorf("write slirp4netns: %w", err)
+	}
+	if err = tmp.Chmod(0755); err != nil {
+		_ = tmp.Close()
+		return "", fmt.Errorf("chmod slirp4netns: %w", err)
+	}
+	if err = tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return "", fmt.Errorf("sync slirp4netns: %w", err)
+	}
+	if err = tmp.Close(); err != nil {
+		return "", fmt.Errorf("close slirp4netns: %w", err)
+	}
+	if err = os.Rename(tmpPath, path); err != nil {
+		return "", fmt.Errorf("publish slirp4netns: %w", err)
+	}
+	_, _ = fmt.Fprintf(out, ":: Slirp4netns extracted to %s\n", path)
 	return path, nil
 }
 

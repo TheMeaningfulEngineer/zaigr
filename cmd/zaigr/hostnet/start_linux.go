@@ -206,11 +206,7 @@ func startLinux(ctx context.Context, opts Options) (Runtime, error) {
 		return nil, err
 	}
 	api := r.apiSocket
-	args := []string{"--configure"}
-	if slirpSupportsDisableDNS(ctx, opts.SlirpPath) {
-		args = append(args, "--disable-dns")
-	}
-	args = append(args, "--cidr="+UplinkCIDR, "--netns-type=pid", "--ready-fd=4", "--exit-fd=3", "--api-socket="+api, strconv.Itoa(helper.Process.Pid), uplinkTapName)
+	args := []string{"--configure", "--disable-dns", "--cidr=" + UplinkCIDR, "--netns-type=pid", "--ready-fd=4", "--exit-fd=3", "--api-socket=" + api, strconv.Itoa(helper.Process.Pid), uplinkTapName}
 	slirp := exec.CommandContext(ctx, opts.SlirpPath, args...)
 	slirp.ExtraFiles = []*os.File{exitRead, readyWrite}
 	slirp.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Pdeathsig: syscall.SIGKILL}
@@ -762,15 +758,4 @@ func readProcStartTime(pid int) (string, error) {
 		return "", errors.New("short process stat")
 	}
 	return fields[19], nil
-}
-
-// slirpSupportsDisableDNS reports whether the host slirp4netns accepts
-// --disable-dns (added after the 1.0.x series shipped by Ubuntu 22.04). Without
-// it slirp's DNS forwarder stays on, but the guest cannot reach it: guest
-// packets to the uplink network 10.0.3.0/24 are always dropped.
-func slirpSupportsDisableDNS(ctx context.Context, path string) bool {
-	helpCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	out, _ := exec.CommandContext(helpCtx, path, "--help").CombinedOutput()
-	return strings.Contains(string(out), "--disable-dns")
 }

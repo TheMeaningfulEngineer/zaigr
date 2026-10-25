@@ -1,0 +1,23 @@
+# Production dependency pins. Source scripts may source this file directly.
+KERNEL_VERSION=6.12.0
+KERNEL_TAG=v6.12
+KERNEL_COMMIT=adc218676eef25575469234709c2d87185ca223a
+KERNEL_URL=https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+
+VIRTIOFSD_VERSION=1.13.2
+VIRTIOFSD_COMMIT=720245d0857e9837484488ff69c2f8c577466851
+VIRTIOFSD_URL=https://gitlab.com/virtio-fs/virtiofsd.git
+
+LIBSECCOMP_VERSION=2.6.0
+LIBSECCOMP_SHA256=83b6085232d1588c379dc9b9cae47bb37407cf262e6e74993c61ba72d2a784dc
+LIBSECCOMP_URL=https://github.com/seccomp/libseccomp/releases/download/v${LIBSECCOMP_VERSION}/libseccomp-${LIBSECCOMP_VERSION}.tar.gz
+LIBCAP_NG_VERSION=0.8.5
+LIBCAP_NG_SHA256=e4be07fdd234f10b866433f224d183626003c65634ed0552b02e654a380244c2
+LIBCAP_NG_URL=https://deb.debian.org/debian/pool/main/libc/libcap-ng/libcap-ng_${LIBCAP_NG_VERSION}.orig.tar.gz
+
+SLIRP4NETNS_VERSION=1.3.4
+SLIRP4NETNS_SHA256=e8d0440de8d8c87072138883bc27cfa02f8b0e8a504badbf335c41f794788cc2
+
+DEBIAN_SUITE=trixie
+
+GO_VERSION=1.24.4

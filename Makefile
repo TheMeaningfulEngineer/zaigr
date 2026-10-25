@@ -9,12 +9,13 @@ PYTEST_XDIST_WORKERS ?= 8
 PYTEST_BUILTIN_WORKERS ?= 2
 CLOUDVM_DISTROS ?=
 TEST_BINARY = $(if $(strip $(ZAIGR_TEST_BINARY)),$(abspath $(ZAIGR_TEST_BINARY)),$(CURDIR)/zaigr)
+GO_VERSION = $(shell sed -n 's/^GO_VERSION=//p' deps.lock)
 
-.PHONY: build lint lint-golang lint-python test-all test-prepare test-cli test-cli-install test-builtin test-versioning test-install test-release test-logged clean base-rootfs base-kernel base-virtiofsd clean-kernel
+.PHONY: build lint lint-golang lint-python test-all test-prepare test-cli test-cli-install test-builtin test-versioning test-install test-release test-logged clean base-rootfs base-kernel base-virtiofsd base-slirp4netns clean-kernel deps-check
 
 # Build the base image, then compile the Go binary
-build: base-kernel base-rootfs base-virtiofsd
-	go build -ldflags "$(LDFLAGS)" -o zaigr ./cmd/zaigr
+build: base-kernel base-rootfs base-virtiofsd base-slirp4netns
+	GOTOOLCHAIN=go$(GO_VERSION) go build -ldflags "$(LDFLAGS)" -o zaigr ./cmd/zaigr
 
 # Build the base image rootfs (skips if up to date)
 base-rootfs:
@@ -27,13 +28,19 @@ base-kernel:
 base-virtiofsd:
 	vm_prep/build-virtiofsd.sh
 
+base-slirp4netns:
+	vm_prep/fetch-slirp4netns.sh
+
+deps-check:
+	./release/deps-check
+
 lint: lint-golang lint-python
 
 lint-golang:
 	golangci-lint run ./cmd/zaigr/...
 
 lint-python:
-	ruff check tests release/release
+	ruff check tests release/release release/deps-check release/check-build-pins
 
 test-prepare:
 	@if [ -n "$(ZAIGR_TEST_BINARY)" ]; then \
@@ -79,6 +86,7 @@ test-install:
 
 clean-kernel:
 	rm -f cmd/zaigr/vm_data/bzImage
+	rm -f cmd/zaigr/vm_data/bzImage.build-key
 
 clean:
 	rm -f zaigr
@@ -87,4 +95,7 @@ clean:
 	rm -rf release/dist release/RELEASE_NOTES.md
 	rm -f cmd/zaigr/vm_data/base-rootfs.img.zst
 	rm -f cmd/zaigr/vm_data/bzImage
+	rm -f cmd/zaigr/vm_data/bzImage.build-key
 	rm -f cmd/zaigr/vm_data/virtiofsd
+	rm -f cmd/zaigr/vm_data/slirp4netns
+	rm -f cmd/zaigr/vm_data/slirp4netns.version

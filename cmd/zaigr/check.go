@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -140,7 +141,7 @@ func shortPreflightDetail(detail string) string {
 }
 
 func missingNetworkTool(missing map[string]bool) bool {
-	return missing["slirp4netns"] || missing["setpriv"]
+	return missing["setpriv"]
 }
 
 func hostPreflightPackageGuidance(host checkHost, missing map[string]bool) string {
@@ -161,14 +162,12 @@ func hostPreflightPackageGuidance(host checkHost, missing map[string]bool) strin
 			packages["openssh-client"] = true
 		case "debugfs", "e2fsck", "resize2fs", "dumpe2fs":
 			packages["e2fsprogs"] = true
-		case "slirp4netns":
-			packages["slirp4netns"] = true
 		case "setpriv":
 			packages["util-linux"] = true
 		}
 	}
 	var ordered []string
-	for _, name := range []string{"qemu-system-x86", "qemu-utils", "openssh-client", "e2fsprogs", "slirp4netns", "util-linux"} {
+	for _, name := range []string{"qemu-system-x86", "qemu-utils", "openssh-client", "e2fsprogs", "util-linux"} {
 		if packages[name] {
 			ordered = append(ordered, name)
 		}
@@ -222,14 +221,11 @@ func checkHostNetworking(host checkHost) checkResult {
 	var guidance string
 	failed := false
 	runtimeCanRun := true
-	for _, tool := range []string{"slirp4netns", "setpriv"} {
+	for _, tool := range []string{"setpriv"} {
 		if _, err := checkHostToolPath(tool); err != nil {
 			failed = true
 			missing = append(missing, tool)
 			details = append(details, fmt.Sprintf("%s: %v", tool, err))
-			if tool != "setpriv" {
-				runtimeCanRun = false
-			}
 		}
 	}
 	if len(missing) > 0 {
@@ -281,18 +277,18 @@ func checkHostNetworking(host checkHost) checkResult {
 			summary = append(summary, "could not start the disposable host network runtime: "+boundedPreflightCause(err))
 			details = append(details, "Disposable host-network namespace probe:\n  operation: Zaigr-created user/network namespace followed by a no-VM TAP/nftables/slirp start/stop\n  result: "+err.Error()+"\n  diagnosis: "+networkRuntimeDiagnosis(host, err))
 		} else if failed {
-			details = append(details, "Disposable host namespace, TAP, nftables controller and slirp4netns start/stop probe passed; setpriv is still required by the DNS frontend.")
+			details = append(details, "Bundled slirp4netns "+strings.TrimSpace(embeddedSlirp4netnsVersion)+" started and stopped; setpriv is still required by the DNS frontend.")
 		}
 	}
 	if failed {
-		var report []string
+		report := []string{"Bundled slirp4netns version: " + strings.TrimSpace(embeddedSlirp4netnsVersion)}
 		if len(missing) > 0 {
 			report = append(report, "Missing tools/devices: "+strings.Join(missing, ", "))
 		}
 		report = append(report, details...)
 		return checkResult{name: "host-enforced networking", detail: strings.Join(report, "\n"), summary: strings.Join(summary, "; "), guidance: guidance, missingTools: strings.Join(missing, ", ")}
 	}
-	return checkResult{name: "host-enforced networking", detail: "disposable host namespace, TAP, nftables controller and slirp4netns start/stop probe passed; this does not verify outbound traffic or every later runtime condition", passed: true}
+	return checkResult{name: "host-enforced networking", detail: "bundled slirp4netns " + strings.TrimSpace(embeddedSlirp4netnsVersion) + "; disposable host namespace, TAP, nftables controller and slirp start/stop probe passed; this does not verify outbound traffic or every later runtime condition", passed: true}
 }
 
 func boundedPreflightCause(err error) string {
@@ -330,7 +326,7 @@ func checkHostToolPath(name string) (string, error) {
 }
 
 func probeHostNetworkRuntime() (returnErr error) {
-	slirp, err := checkHostToolPath("slirp4netns")
+	slirp, err := ensureSlirp4netnsWithWriter(false, io.Discard)
 	if err != nil {
 		return err
 	}

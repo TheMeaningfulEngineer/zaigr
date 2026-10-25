@@ -49,6 +49,7 @@ def development_repo(tmp_path):
     (repo / "release").mkdir()
     shutil.copy2(script, repo / "release" / "dev-version.sh")
     shutil.copy2(Path(REPO_ROOT) / "Makefile", repo / "Makefile")
+    shutil.copy2(Path(REPO_ROOT) / "deps.lock", repo / "deps.lock")
     (repo / "tracked.txt").write_text("original\n", encoding="utf-8")
     (repo / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
 
@@ -170,6 +171,7 @@ def test_make_development_version_without_git_metadata(tmp_path):
     """A source directory without Git metadata retains the unknown fallback."""
     (tmp_path / "release").mkdir()
     shutil.copy2(Path(REPO_ROOT) / "Makefile", tmp_path / "Makefile")
+    shutil.copy2(Path(REPO_ROOT) / "deps.lock", tmp_path / "deps.lock")
     shutil.copy2(
         Path(REPO_ROOT) / "release/dev-version.sh", tmp_path / "release/dev-version.sh"
     )
@@ -230,3 +232,40 @@ def test_building_block_change():
         )
     finally:
         shutil.move(backup, BASE_IMAGE_BUILD)
+
+
+def test_debian_suite_change_invalidates_base_image_version(tmp_path):
+    """Changing only the locked Debian suite changes the base image version."""
+    repo = tmp_path / "repo"
+    (repo / "vm_prep").mkdir(parents=True)
+    (repo / "cmd/zaigr/vm_data").mkdir(parents=True)
+    shutil.copy2(Path(VM_PREP) / "base-image-version.sh", repo / "vm_prep")
+    shutil.copytree(
+        Path(VM_PREP) / "base-image-building-blocks",
+        repo / "vm_prep/base-image-building-blocks",
+    )
+    shutil.copy2(Path(REPO_ROOT) / "deps.lock", repo / "deps.lock")
+    shutil.copy2(MINICONFIG, repo / "cmd/zaigr/vm_data/miniconfig")
+
+    stdout, stderr, rc = run(
+        "./vm_prep/base-image-version.sh .", cwd=repo
+    )
+    assert rc == 0, err_msg(stdout, stderr)
+    before = _parse_versions(stdout)
+
+    lock = repo / "deps.lock"
+    lock.write_text(
+        lock.read_text(encoding="utf-8").replace(
+            "DEBIAN_SUITE=trixie", "DEBIAN_SUITE=bookworm"
+        ),
+        encoding="utf-8",
+    )
+    stdout, stderr, rc = run(
+        "./vm_prep/base-image-version.sh .", cwd=repo
+    )
+    assert rc == 0, err_msg(stdout, stderr)
+    after = _parse_versions(stdout)
+
+    assert after["miniconfig"] == before["miniconfig"]
+    assert after["building-blocks"] != before["building-blocks"]
+    assert after["base-image"] != before["base-image"]

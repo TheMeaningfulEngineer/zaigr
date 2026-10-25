@@ -2,10 +2,8 @@
 # Build the minimal bzImage from kernel-src/ + cmd/zaigr/vm_data/miniconfig.
 # Usage: vm_prep/build-kernel.sh [REPO_ROOT]
 #
-# The miniconfig hash is injected as CONFIG_LOCALVERSION so that uname -r
-# shows which miniconfig produced the kernel (e.g. 6.12.0-zaigr-a1b2c3d).
-# If a bzImage exists but its version doesn't match the current hash, it
-# gets rebuilt automatically.
+# The miniconfig hash is injected as CONFIG_LOCALVERSION so uname -r identifies
+# the config. A sidecar build key also tracks the selected kernel source pin.
 #
 # Uses O= (out-of-tree build) to place build artifacts on tmpfs when the
 # source tree is on a 9p mount. 9p without cache=mmap does not support
@@ -13,32 +11,48 @@
 set -eu
 
 REPO="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
+REPO="$(cd "$REPO" && pwd)"
+. "$REPO/deps.lock"
 ZAIGR_EXTERNAL_SOURCES="${ZAIGR_EXTERNAL_SOURCES:-$HOME/.zaigr/external-sources}"
-KERNEL_SRC="$ZAIGR_EXTERNAL_SOURCES/kernel-src"
+KERNEL_SRC="$ZAIGR_EXTERNAL_SOURCES/kernel-src-v${KERNEL_VERSION}-${KERNEL_COMMIT}"
 MINICONFIG="$REPO/cmd/zaigr/vm_data/miniconfig"
 BZIMAGE="$REPO/cmd/zaigr/vm_data/bzImage"
 
-# Get kernel version from the single source of truth
+test -f "$MINICONFIG" || { echo "ERROR: $MINICONFIG not found" >&2; exit 1; }
+command -v gcc >/dev/null 2>&1 || { echo "ERROR: gcc not found" >&2; exit 1; }
 MC_VERSION="zaigr-$("$REPO/vm_prep/base-image-version.sh" "$REPO" | grep '^miniconfig:' | cut -d: -f2)"
-echo ":: Miniconfig version: $MC_VERSION"
+VERSION_SCRIPT_HASH="$(sha256sum "$REPO/vm_prep/base-image-version.sh" | cut -d' ' -f1)"
+BUILD_KEY_INPUT="$KERNEL_VERSION:$KERNEL_COMMIT:$(sha256sum "$MINICONFIG" | cut -d' ' -f1):$VERSION_SCRIPT_HASH:$(sha256sum "$0" | cut -d' ' -f1):$(gcc --version | head -1)"
+BUILD_KEY="$(printf '%s' "$BUILD_KEY_INPUT" | sha256sum | cut -d' ' -f1)"
+BUILD_KEY_FILE="$BZIMAGE.build-key"
+echo ":: Kernel build key: $BUILD_KEY"
 
-# Check if existing bzImage already matches
-if [ -f "$BZIMAGE" ]; then
-    if strings "$BZIMAGE" | grep -q "$MC_VERSION"; then
-        echo ":: bzImage already up to date ($MC_VERSION), skipping build"
+if [ -s "$BZIMAGE" ] && grep -Fxq "build_key=$BUILD_KEY" "$BUILD_KEY_FILE" 2>/dev/null; then
+    EXPECTED_SHA="$(sed -n 's/^artifact_sha256=//p' "$BUILD_KEY_FILE")"
+    ACTUAL_SHA="$(sha256sum "$BZIMAGE" | cut -d' ' -f1)"
+    if [ -n "$EXPECTED_SHA" ] && [ "$EXPECTED_SHA" = "$ACTUAL_SHA" ]; then
+        echo ":: bzImage already up to date ($MC_VERSION, kernel $KERNEL_VERSION), skipping build"
         exit 0
     fi
-    echo ":: bzImage exists but doesn't match miniconfig, rebuilding"
-    rm -f "$BZIMAGE"
 fi
 
 if [ ! -d "$KERNEL_SRC" ]; then
     echo ":: Cloning kernel source ..."
     "$REPO/vm_prep/clone.sh" "$REPO"
 fi
-test -f "$MINICONFIG" || { echo "ERROR: $MINICONFIG not found" >&2; exit 1; }
-
-for tool in make gcc flex bison bc strings; do
+if [ "$(git -C "$KERNEL_SRC" remote get-url origin 2>/dev/null || true)" != "$KERNEL_URL" ]; then
+    echo "ERROR: kernel source has an unexpected origin" >&2
+    exit 1
+fi
+if [ "$(git -C "$KERNEL_SRC" rev-parse HEAD)" != "$KERNEL_COMMIT" ]; then
+    echo "ERROR: kernel source is not pinned to $KERNEL_COMMIT; run clone.sh" >&2
+    exit 1
+fi
+if [ -n "$(git -C "$KERNEL_SRC" status --porcelain --untracked-files=no)" ]; then
+    echo "ERROR: tracked kernel source changes in $KERNEL_SRC; refusing to build" >&2
+    exit 1
+fi
+for tool in make gcc flex bison bc; do
     command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: $tool not found" >&2; exit 1; }
 done
 
@@ -107,6 +121,9 @@ fi
 # Copy result to vm_data (the only location that matters — go:embed reads from here)
 OUT_BZIMAGE="$BUILD_DIR/arch/x86/boot/bzImage"
 cp "$OUT_BZIMAGE" "$BZIMAGE"
+ARTIFACT_SHA="$(sha256sum "$BZIMAGE" | cut -d' ' -f1)"
+printf 'build_key=%s\nartifact_sha256=%s\n' "$BUILD_KEY" "$ARTIFACT_SHA" > "$BUILD_KEY_FILE.tmp-$$"
+mv "$BUILD_KEY_FILE.tmp-$$" "$BUILD_KEY_FILE"
 if [ "$BUILD_DIR" != "$KERNEL_SRC" ]; then
     rm -rf "$BUILD_DIR"
 fi

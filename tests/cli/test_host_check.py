@@ -54,7 +54,7 @@ def _path_without_unshare(test_root):
         if not directory or not Path(directory).is_dir():
             continue
         for executable in Path(directory).iterdir():
-            if executable.name == "unshare" or executable.name in linked_names:
+            if executable.name in {"unshare", "slirp4netns"} or executable.name in linked_names:
                 continue
             if not executable.is_file() or not os.access(executable, os.X_OK):
                 continue
@@ -76,13 +76,12 @@ def _assert_aggregate_host_preflight(output, operation):
         "Host-enforced networking needs these tools on the host, including when upgrading from the guest firewall."
         in output
     )
-    for tool in ("slirp4netns", "setpriv"):
-        assert tool in output
+    assert "Bundled slirp4netns version:" in output
+    assert "setpriv" in output
     assert "unshare" not in output
     if _is_debian_family():
         assert "sudo apt install" in output
-        for package in ("slirp4netns", "util-linux"):
-            assert package in output
+        assert "util-linux" in output
 
 
 def _sha256(path):
@@ -143,17 +142,17 @@ def test_host_check_reports_missing_tools_and_still_probes_sandbox(
         )
         assert install_line == (
             "Install missing packages: sudo apt install qemu-system-x86 "
-            "openssh-client slirp4netns util-linux"
+            "openssh-client util-linux"
         )
         assert "qemu-utils" not in install_line
         assert "e2fsprogs" not in install_line
         assert "conntrack" not in install_line
-        assert "slirp4netns" in install_line
+        assert "slirp4netns" not in install_line
         assert "util-linux" in install_line
     else:
         assert "Missing tool names are listed above" in stdout
-    for tool in ("slirp4netns", "setpriv"):
-        assert tool in stdout
+    assert "Bundled slirp4netns version:" in stdout
+    assert "setpriv" in stdout
     assert "unshare" not in stdout
     # No newuidmap/newgidmap helpers are needed for the production mapping.
     assert "answered a vhost-user request" in stdout
@@ -161,7 +160,7 @@ def test_host_check_reports_missing_tools_and_still_probes_sandbox(
     assert not (zaigr_home / ".zaigr/store").exists()
 
 
-def test_host_runtime_failure_shows_cause_without_namespace_policy_guidance(
+def test_host_check_reports_bundled_slirp_version_with_system_shadow(
     project, test_root
 ):
     fake_tools = test_root / "failing-slirp-bin"
@@ -177,24 +176,16 @@ def test_host_runtime_failure_shows_cause_without_namespace_policy_guidance(
         **project.env,
         "PATH": str(fake_tools) + os.pathsep + project.env["PATH"],
     }
-    stdout, stderr, rc = _run(
-        [project.zaigr_bin, "project", "vm", "start"],
+    stdout, stderr, _rc = _run(
+        [project.zaigr_bin, "misc", "check"],
         cwd=project.cwd,
         env=env,
-        input="y\n",
         timeout=90,
     )
     output = stdout + stderr
 
-    assert rc != 0, err_msg(stdout, stderr)
-    runtime_failure = "could not start the disposable host network runtime:"
-    assert runtime_failure in output
-    summary_line = next(line for line in output.splitlines() if runtime_failure in line)
-    assert summary_line.split(runtime_failure, 1)[1].strip()
-    assert "intentional slirp runtime failure" in summary_line
-    assert "Ubuntu setup" not in output
-    assert "Container setup" not in output
-    assert "Setup for " not in output
+    assert "intentional slirp runtime failure" not in output
+    assert any("slirp4netns" in line.lower() and "1.3.4" in line for line in output.splitlines())
     assert not (project.home / ".zaigr" / "store").exists()
 
 
@@ -283,7 +274,7 @@ def test_running_vm_survives_batch_rebuild_preflight_and_reuses_without_qemu(
 
     restricted_path = _path_with_real_tools(
         test_root,
-        ("ssh", "ssh-keygen", "slirp4netns", "unshare", "setpriv", "true"),
+        ("ssh", "ssh-keygen", "unshare", "setpriv", "true"),
     )
     restricted_env = {**project.env, "PATH": str(restricted_path)}
 
@@ -328,18 +319,20 @@ def _ubuntu_guidance(output):
 def test_namespace_policy_guidance_matches_and_vm_networking_needs_no_unshare(
     project, test_root
 ):
-    """Direct namespace creation works without unshare and denial guidance is shared."""
+    """Bundled networking works without system slirp4netns or unshare."""
     zaigr = project.zaigr_bin.resolve()
     commands_without_unshare = _path_without_unshare(test_root)
     assert not (commands_without_unshare / "unshare").exists()
+    assert not (commands_without_unshare / "slirp4netns").exists()
     no_unshare_env = {**project.env, "PATH": str(commands_without_unshare)}
 
     stdout, stderr, rc = _run(
         [str(zaigr), "misc", "check"], cwd=project.cwd, env=no_unshare_env, timeout=90
     )
     assert rc == 0, err_msg(stdout, stderr)
+    assert "Bundled slirp4netns version:" in stdout
     assert "6/6 checks passed" in stdout
-    assert "disposable host namespace, TAP, nftables controller and slirp4netns start/stop probe passed" in stdout
+    assert "disposable host namespace, TAP, nftables controller and slirp start/stop probe passed" in stdout
 
     stdout, stderr, rc = _run(
         [str(zaigr), "project", "vm", "start"],

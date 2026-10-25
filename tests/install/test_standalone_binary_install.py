@@ -25,7 +25,7 @@ def test_install_standalone_as_regular_user_and_run_vm(cloudvm_factory, distro):
         vm,
         "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "
         "coreutils e2fsprogs openssh-client qemu-system-x86 qemu-utils "
-        "slirp4netns util-linux",
+        "util-linux",
         timeout=300,
         user="user",
     )
@@ -97,12 +97,106 @@ def test_install_standalone_as_regular_user_and_run_vm(cloudvm_factory, distro):
     host_project_owner, host_project_mode = user("stat -c '%u:%g %a' .").split()
     assert host_project_owner == f"{host_uid}:{host_gid}"
     user("printf 'standalone installation works\\n' > installation-input.txt")
+    system_slirp = checked(vm, "dpkg-query -W -f='${Status}' slirp4netns", user="user").strip()
+    assert system_slirp == "install ok installed", f"system slirp package is not installed: {system_slirp!r}"
     start = vm.run(
         "/home/user/.local/bin/zaigr project vm start",
         cwd="/home/user/project", user="user", input="y\n", timeout=240,
         env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
     )
-    assert start[2] == 0, f"project VM failed to start:\n{start[0]}{start[1]}"
+    assert start[2] == 0, f"project VM failed to start with system slirp installed:\n{start[0]}{start[1]}"
+    bundled_executables = checked(
+        vm,
+        "for exe in /proc/[0-9]*/exe; do target=$(readlink \"$exe\" 2>/dev/null) || continue; "
+        "case \"$target\" in /home/user/.zaigr/slirp4netns-*) "
+        "pid=${exe#/proc/}; pid=${pid%/exe}; printf '%s %s\\n' \"$pid\" \"$target\";; esac; done",
+        user="user",
+    ).splitlines()
+    assert bundled_executables, "no live slirp process is executing from the bundled ~/.zaigr cache"
+    assert all(
+        pid.isdigit() and executable.startswith("/home/user/.zaigr/slirp4netns-")
+        for pid, executable in (line.split(" ", 1) for line in bundled_executables)
+    ), bundled_executables
+    allowed = vm.run(
+        "/home/user/.local/bin/zaigr project firewall allow deb.debian.org",
+        cwd="/home/user/project", timeout=30, user="user",
+        env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+    )
+    assert allowed[2] == 0, f"firewall allow failed with system slirp installed:\n{allowed[0]}{allowed[1]}"
+    allowed_traffic = vm.run(
+        "/home/user/.local/bin/zaigr project vm exec -- curl --noproxy '*' -4fsS --connect-timeout 5 "
+        "--max-time 15 https://deb.debian.org/",
+        cwd="/home/user/project", timeout=30, user="user",
+        env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+    )
+    assert allowed_traffic[2] == 0, f"allowed traffic failed with system slirp installed:\n{allowed_traffic[0]}{allowed_traffic[1]}"
+    blocked_traffic = vm.run(
+        "/home/user/.local/bin/zaigr project vm exec -- curl --noproxy '*' -4fsS --connect-timeout 3 "
+        "--max-time 8 https://example.com/",
+        cwd="/home/user/project", timeout=20, user="user",
+        env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+    )
+    assert blocked_traffic[2] == 6, f"example.com did not fail at DNS with system slirp installed:\n{blocked_traffic[0]}{blocked_traffic[1]}"
+    assert "could not resolve host" in (blocked_traffic[0] + blocked_traffic[1]).lower()
+    checked(vm, "/home/user/.local/bin/zaigr project vm stop", cwd="/home/user/project", user="user", timeout=60,
+            env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"})
+    checked(vm, "sudo DEBIAN_FRONTEND=noninteractive apt-get purge -y slirp4netns", timeout=120, user="user")
+    absent_package = vm.run("dpkg-query -W -f='${Status}' slirp4netns", user="user")
+    assert absent_package[2] != 0 or absent_package[0].strip() != "install ok installed", (
+        "slirp4netns package is still installed for the bundled-only case"
+    )
+    absent_from_path = vm.run(
+        "if command -v slirp4netns >/dev/null 2>&1; then exit 1; else printf 'no system slirp on PATH\\n'; fi",
+        user="user", env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+    )
+    assert absent_from_path[2] == 0 and absent_from_path[0] == "no system slirp on PATH\n", (
+        absent_from_path[0] + absent_from_path[1]
+    )
+    check_without_system_slirp = checked(
+        vm, "/home/user/.local/bin/zaigr misc check", user="user", timeout=90,
+        env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+    )
+    assert "6/6 checks passed" in check_without_system_slirp, check_without_system_slirp
+
+    start = vm.run(
+        "/home/user/.local/bin/zaigr project vm start",
+        cwd="/home/user/project", user="user", input="y\n", timeout=240,
+        env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+    )
+    assert start[2] == 0, f"project VM failed to start without system slirp:\n{start[0]}{start[1]}"
+    bundled_executables = checked(
+        vm,
+        "for exe in /proc/[0-9]*/exe; do target=$(readlink \"$exe\" 2>/dev/null) || continue; "
+        "case \"$target\" in /home/user/.zaigr/slirp4netns-*) "
+        "pid=${exe#/proc/}; pid=${pid%/exe}; printf '%s %s\\n' \"$pid\" \"$target\";; esac; done",
+        user="user",
+    ).splitlines()
+    assert bundled_executables, "no live slirp process is executing from ~/.zaigr after removing the system package"
+    assert all(
+        pid.isdigit() and executable.startswith("/home/user/.zaigr/slirp4netns-")
+        for pid, executable in (line.split(" ", 1) for line in bundled_executables)
+    ), bundled_executables
+    allowed = vm.run(
+        "/home/user/.local/bin/zaigr project firewall allow deb.debian.org",
+        cwd="/home/user/project", timeout=30, user="user",
+        env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+    )
+    assert allowed[2] == 0, f"firewall allow failed without system slirp:\n{allowed[0]}{allowed[1]}"
+    allowed_traffic = vm.run(
+        "/home/user/.local/bin/zaigr project vm exec -- curl --noproxy '*' -4fsS --connect-timeout 5 "
+        "--max-time 15 https://deb.debian.org/",
+        cwd="/home/user/project", timeout=30, user="user",
+        env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+    )
+    assert allowed_traffic[2] == 0, f"allowed traffic failed without system slirp:\n{allowed_traffic[0]}{allowed_traffic[1]}"
+    blocked_traffic = vm.run(
+        "/home/user/.local/bin/zaigr project vm exec -- curl --noproxy '*' -4fsS --connect-timeout 3 "
+        "--max-time 8 https://example.com/",
+        cwd="/home/user/project", timeout=20, user="user",
+        env={"PATH": "/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"},
+    )
+    assert blocked_traffic[2] == 6, f"example.com did not fail at DNS without system slirp:\n{blocked_traffic[0]}{blocked_traffic[1]}"
+    assert "could not resolve host" in (blocked_traffic[0] + blocked_traffic[1]).lower()
     guest_uid = user("/home/user/.local/bin/zaigr project vm exec -- id -u", timeout=30).strip()
     guest_gid = user("/home/user/.local/bin/zaigr project vm exec -- id -g", timeout=30).strip()
     assert guest_uid.isdigit() and guest_uid != "0"

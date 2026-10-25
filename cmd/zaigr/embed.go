@@ -21,6 +21,12 @@ var embeddedVirtiofsd []byte
 //go:embed vm_data/virtiofsd.version
 var embeddedVirtiofsdVersion string
 
+//go:embed vm_data/slirp4netns
+var embeddedSlirp4netns []byte
+
+//go:embed vm_data/slirp4netns.version
+var embeddedSlirp4netnsVersion string
+
 // embeddedVersion extracts a version string from embedded binary data
 // by searching for a prefix and returning the following 7 characters.
 func embeddedVersion(data []byte, prefix string) string {

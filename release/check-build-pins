@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Reject literal dependency versions in production build inputs."""
+
+from __future__ import annotations
+
+import re
+import sys
+from collections.abc import Iterator
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+VERSION_RE = re.compile(r"v?\d+\.\d+(?:\.\d+){0,2}(?:[-+][A-Za-z0-9.-]+)?")
+DEFAULT_RE = re.compile(r"\$\{[^}]*?(?::-|:=|-|=)([^}]+)\}")
+ASSIGNMENT_RE = re.compile(
+    r"^\s*(?:export\s+)?([A-Z][A-Z0-9_]*?(?:_VERSION|_TAG|_COMMIT)|VERSION|DEBIAN_SUITE)\s*=\s*([^\s#]+)"
+)
+URL_RE = re.compile(r"https?://[^\s\"']+")
+CLONE_BRANCH_RE = re.compile(r"(?:--branch(?:=|\s+)|-b\s+)[\"']?([^\s\"']+)")
+
+
+def build_inputs(repo: Path) -> list[Path]:
+    """Find maintained build scripts and named build entry points."""
+    paths = sorted(path for path in (repo / "vm_prep").rglob("*.sh") if path.is_file())
+    paths.extend(path for path in (repo / "Makefile", repo / "release" / "release") if path.is_file())
+    return paths
+
+
+def locked_pins(repo: Path) -> set[str]:
+    """Read lock values that can be passed as literal build arguments."""
+    pins = set()
+    for line in (repo / "deps.lock").read_text(encoding="utf-8").splitlines():
+        name, separator, value = line.partition("=")
+        if not separator or "$" in value or "#" in name:
+            continue
+        if name.endswith(("_VERSION", "_TAG")) or name == "DEBIAN_SUITE":
+            value = value.strip().strip("\"'")
+            if value:
+                pins.add(value)
+    return pins
+
+
+def logical_lines(path: Path) -> Iterator[tuple[int, str]]:
+    """Join shell continuation lines while retaining their starting line number."""
+    pending = ""
+    start = 0
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not pending:
+            start = number
+        pending += line.rstrip().removesuffix("\\") + " "
+        if line.rstrip().endswith("\\"):
+            continue
+        yield start, pending
+        pending = ""
+    if pending:
+        yield start, pending
+
+
+def violations(repo: Path) -> list[str]:
+    """Return build-input lines that duplicate dependency pins as literals."""
+    if not (repo / "deps.lock").is_file():
+        raise FileNotFoundError(f"{repo / 'deps.lock'} is missing")
+    findings: list[str] = []
+    pins = locked_pins(repo)
+    suite = next(
+        (pin for pin in pins if pin == _lock_value(repo, "DEBIAN_SUITE")),
+        None,
+    )
+    branch_pins = {pin.removeprefix("v") for pin in pins}
+    for path in build_inputs(repo):
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            stripped = line.lstrip()
+            if stripped.startswith(("#", "//")):
+                continue
+            assignment = ASSIGNMENT_RE.match(line)
+            if assignment:
+                name, raw_value = assignment.groups()
+                value = raw_value.strip("\"'").lstrip("v")
+                has_variable = "$" in value or "`" in value
+                has_default = DEFAULT_RE.search(value) is not None
+                is_pin_literal = name.endswith(("_VERSION", "_TAG", "_COMMIT")) or name in {
+                    "VERSION", "DEBIAN_SUITE"
+                }
+                is_static_pin = (
+                    name == "DEBIAN_SUITE" or name.endswith(("_TAG", "_COMMIT"))
+                ) and (not has_variable or has_default)
+                has_static_version = VERSION_RE.search(value) is not None
+                if is_pin_literal and (is_static_pin or has_static_version):
+                    findings.append(f"{path.relative_to(repo)}:{number}: {name}={raw_value}")
+            if any(token in line for token in ("curl", "wget", "git clone", "URL=")):
+                for url in URL_RE.findall(line):
+                    if VERSION_RE.search(url):
+                        findings.append(f"{path.relative_to(repo)}:{number}: version literal in URL {url}")
+        for number, command in logical_lines(path):
+            if suite and re.search(r"\bmmdebstrap\b", command) and re.search(
+                rf"(?<![\w$]){re.escape(suite)}(?![\w])", command
+            ):
+                findings.append(
+                    f"{path.relative_to(repo)}:{number}: literal Debian suite argument {suite}"
+                )
+            if re.search(r"\bgit\s+clone\b", command):
+                branch = CLONE_BRANCH_RE.search(command)
+                branch_value = branch.group(1).removeprefix("v") if branch else ""
+                if branch and (
+                    branch_value in branch_pins or VERSION_RE.fullmatch(branch_value)
+                ):
+                    findings.append(
+                        f"{path.relative_to(repo)}:{number}: literal clone branch {branch.group(1)}"
+                    )
+    return findings
+
+
+def _lock_value(repo: Path, key: str) -> str:
+    """Return one required value from the simple KEY=value lock file."""
+    for line in (repo / "deps.lock").read_text(encoding="utf-8").splitlines():
+        name, separator, value = line.partition("=")
+        if separator and name == key:
+            return value.strip()
+    return ""
+
+
+def main() -> int:
+    """Check the current repository or an isolated fixture repository."""
+    repo = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT
+    findings = violations(repo)
+    if findings:
+        print("Version literals in production build inputs:", file=sys.stderr)
+        print("\n".join(findings), file=sys.stderr)
+        return 1
+    print("Production build inputs use deps.lock for pinned versions.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

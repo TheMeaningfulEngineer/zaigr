@@ -7,6 +7,11 @@ set -eu
 
 REPO="$1"
 BASE_VERSION="$2"
+. "$REPO/deps.lock"
+if [ -z "${DEBIAN_SUITE:-}" ]; then
+    echo "ERROR: DEBIAN_SUITE is missing from $REPO/deps.lock" >&2
+    exit 1
+fi
 BB="$(cd "$(dirname "$0")" && pwd)"
 ROOTFS_TAR="$REPO/.cache/base-rootfs.tar"
 ROOTFS_IMG="$REPO/.cache/base-rootfs.img"
@@ -60,7 +65,7 @@ mmdebstrap \
     --customize-hook='rm -rf "$1"/usr/share/doc/*' \
     --customize-hook='rm -rf "$1"/usr/share/man/*' \
     --customize-hook='rm -rf "$1"/usr/share/locale/*' \
-    trixie "$ROOTFS_TAR" http://deb.debian.org/debian
+    "$DEBIAN_SUITE" "$ROOTFS_TAR" http://deb.debian.org/debian
 
 echo ":: Unpacking and finalizing rootfs ..."
 

@@ -10,11 +10,7 @@
 # and stored under $ZAIGR_EXTERNAL_SOURCES/virtiofsd-native-deps/. They are
 # rebuilt when the pinned versions or this script change.
 #
-# Version pin: cmd/zaigr/vm_data/virtiofsd.version (currently 1.13.2).
-# Source commit pin: 720245d0857e9837484488ff69c2f8c577466851 (v1.13.2 tag target commit;
-#   tag object fd21b60ec99703bbfea23a8eb39ff2065f358e78).
-# libcap-ng version: 0.8.5 (from deb.debian.org/debian/pool/main/libc/libcap-ng/).
-# libseccomp version: 2.6.0 (from github.com/seccomp/libseccomp/releases).
+# Versions and source pins come from the repository-root deps.lock.
 #
 # Build cache key (stored in $ZAIGR_EXTERNAL_SOURCES/virtiofsd-build-state/):
 #   virtiofsd source commit + Cargo.lock hash + this script hash +
@@ -23,6 +19,8 @@
 set -eu
 
 REPO="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
+REPO="$(cd "$REPO" && pwd)"
+. "$REPO/deps.lock"
 ZAIGR_EXTERNAL_SOURCES="${ZAIGR_EXTERNAL_SOURCES:-$HOME/.zaigr/external-sources}"
 
 # Resolve all paths before changing directories.
@@ -35,23 +33,9 @@ BUILD_STATE="$ZAIGR_EXTERNAL_SOURCES/virtiofsd-build-state"
 OUTPUT="$REPO/cmd/zaigr/vm_data/virtiofsd"
 VERSION_FILE="$REPO/cmd/zaigr/vm_data/virtiofsd.version"
 
-if [ ! -f "$VERSION_FILE" ]; then
-    printf 'ERROR: %s not found\n' "$VERSION_FILE" >&2
-    exit 1
-fi
-VERSION="$(cat "$VERSION_FILE")"
-if [ "$VERSION" != "1.13.2" ] || [ "$(wc -c < "$VERSION_FILE")" -ne 7 ]; then
-    printf 'ERROR: expected exactly 1.13.2 and newline in %s\n' "$VERSION_FILE" >&2
-    exit 1
-fi
-# Pinned upstream commit for v1.13.2 (the commit the annotated tag points to;
-# the tag object itself is fd21b60ec99703bbfea23a8eb39ff2065f358e78):
-PINNED_COMMIT="720245d0857e9837484488ff69c2f8c577466851"
+VERSION="$VIRTIOFSD_VERSION"
+PINNED_COMMIT="$VIRTIOFSD_COMMIT"
 
-LIBCAP_NG_VERSION="0.8.5"
-LIBSECCOMP_VERSION="2.6.0"
-LIBCAP_NG_SHA256="e4be07fdd234f10b866433f224d183626003c65634ed0552b02e654a380244c2"
-LIBSECCOMP_SHA256="83b6085232d1588c379dc9b9cae47bb37407cf262e6e74993c61ba72d2a784dc"
 TARGET="x86_64-unknown-linux-musl"
 
 printf ':: virtiofsd version: %s\n' "$VERSION"
@@ -87,7 +71,7 @@ printf ':: Checking virtiofsd source...\n'
 mkdir -p "$(dirname "$VIRTIOFSD_SRC")"
 if [ -d "$VIRTIOFSD_SRC" ]; then
     # Verify it's a valid git repo with the expected remote.
-    if [ "$(git -C "$VIRTIOFSD_SRC" remote get-url origin 2>/dev/null)" != "https://gitlab.com/virtio-fs/virtiofsd.git" ]; then
+    if [ "$(git -C "$VIRTIOFSD_SRC" remote get-url origin 2>/dev/null)" != "$VIRTIOFSD_URL" ]; then
         printf 'ERROR: %s exists but has unexpected origin; remove it manually\n' "$VIRTIOFSD_SRC" >&2
         exit 1
     fi
@@ -104,7 +88,7 @@ if [ -d "$VIRTIOFSD_SRC" ]; then
 else
     printf ':: Cloning virtiofsd v%s...\n' "$VERSION"
     git clone --depth=1 --branch "v${VERSION}" \
-        "https://gitlab.com/virtio-fs/virtiofsd.git" "$VIRTIOFSD_SRC" 2>&1
+        "$VIRTIOFSD_URL" "$VIRTIOFSD_SRC" 2>&1
 fi
 
 # Verify the tag resolves to the pinned commit.
@@ -151,7 +135,7 @@ if [ ! -f "$NATIVE_DEPS_READY" ] || [ ! -s "$NATIVE_DEPS/dist/lib/libcap-ng.a" ]
         ln -s /usr/include/asm-generic "$KERNEL_HEADERS/asm-generic"
     fi
 
-    # ---- libcap-ng 0.8.5 ----
+    # ---- libcap-ng ----
     # Downloaded from deb.debian.org as a release tarball with pre-generated configure.
     CAPNG_TAR="$NATIVE_DEPS/src/libcap-ng-debian-${LIBCAP_NG_VERSION}.tar.gz"
     CAPNG_SRC="$NATIVE_DEPS/src/libcap-ng-${LIBCAP_NG_VERSION}"
@@ -159,7 +143,7 @@ if [ ! -f "$NATIVE_DEPS_READY" ] || [ ! -s "$NATIVE_DEPS/dist/lib/libcap-ng.a" ]
     if [ ! -f "$CAPNG_TAR" ]; then
         printf ':: Downloading libcap-ng %s...\n' "$LIBCAP_NG_VERSION"
         curl -L --retry 3 --max-time 120 -o "$CAPNG_TAR" \
-            "https://deb.debian.org/debian/pool/main/libc/libcap-ng/libcap-ng_${LIBCAP_NG_VERSION}.orig.tar.gz"
+            "$LIBCAP_NG_URL"
     fi
     printf '%s  %s\n' "$LIBCAP_NG_SHA256" "$CAPNG_TAR" | sha256sum -c - >/dev/null
     if [ ! -d "$CAPNG_SRC" ]; then
@@ -182,11 +166,11 @@ static inline int __fsetlocking(void *f, int type) { (void)f; (void)type; return
 STUB_EOF
 
     # Minimal config.h with features available in musl.
-    cat > "$CAPNG_BUILD/config.h" << 'CONFIG_EOF'
-/* config.h for libcap-ng 0.8.5 static musl build */
+    cat > "$CAPNG_BUILD/config.h" <<CONFIG_EOF
+/* config.h for libcap-ng ${LIBCAP_NG_VERSION} static musl build */
 #define PACKAGE_NAME "libcap-ng"
-#define PACKAGE_VERSION "0.8.5"
-#define PACKAGE_STRING "libcap-ng 0.8.5"
+#define PACKAGE_VERSION "${LIBCAP_NG_VERSION}"
+#define PACKAGE_STRING "libcap-ng ${LIBCAP_NG_VERSION}"
 #define _GNU_SOURCE 1
 #define HAVE_SYSCALL_H 1
 #define HAVE_LINUX_SECUREBITS_H 1
@@ -210,7 +194,7 @@ CONFIG_EOF
     cp "$CAPNG_SRC/src/cap-ng.h" "$NATIVE_DEPS/dist/include/"
     printf ':: libcap-ng.a built\n'
 
-    # ---- libseccomp 2.6.0 ----
+    # ---- libseccomp ----
     # Downloaded as release tarball (has pre-generated configure script and
     # pre-generated syscalls.perf.c so gperf is only needed to satisfy configure).
     SECCOMP_TAR="$NATIVE_DEPS/src/libseccomp-${LIBSECCOMP_VERSION}.tar.gz"
@@ -218,7 +202,7 @@ CONFIG_EOF
     if [ ! -f "$SECCOMP_TAR" ]; then
         printf ':: Downloading libseccomp %s...\n' "$LIBSECCOMP_VERSION"
         curl -L --retry 3 --max-time 120 -o "$SECCOMP_TAR" \
-            "https://github.com/seccomp/libseccomp/releases/download/v${LIBSECCOMP_VERSION}/libseccomp-${LIBSECCOMP_VERSION}.tar.gz"
+            "$LIBSECCOMP_URL"
     fi
     printf '%s  %s\n' "$LIBSECCOMP_SHA256" "$SECCOMP_TAR" | sha256sum -c - >/dev/null
     if [ ! -d "$SECCOMP_SRC" ]; then
@@ -335,6 +319,8 @@ printf '%s' "$CACHE_KEY" > "$CACHE_KEY_FILE"
 mkdir -p "$(dirname "$OUTPUT")"
 mv "$STRIPPED" "${OUTPUT}.tmp-$$"
 mv "${OUTPUT}.tmp-$$" "$OUTPUT"
+printf '%s\n' "$VERSION" > "${VERSION_FILE}.tmp-$$"
+mv "${VERSION_FILE}.tmp-$$" "$VERSION_FILE"
 
 printf ':: virtiofsd v%s built: %s\n' "$VERSION" "$OUTPUT"
 printf ':: SHA-256: %s\n' "$ARTIFACT_SHA256"

@@ -30,7 +30,8 @@ def _init_git_repo(path):
         encoding="utf-8",
     )
     (path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
-    out, err, rc = run(["git", "add", ".gitignore", "tracked.txt"], cwd=path, timeout=10)
+    shutil.copy2(Path(REPO_ROOT) / "deps.lock", path / "deps.lock")
+    out, err, rc = run(["git", "add", ".gitignore", "tracked.txt", "deps.lock"], cwd=path, timeout=10)
     assert rc == 0, err_msg(out, err)
     out, err, rc = run(["git", "commit", "-m", "chore: seed"], cwd=path, timeout=10)
     assert rc == 0, err_msg(out, err)
@@ -57,7 +58,7 @@ def _fake_script(path, body):
     return path
 
 
-def _write_fake_candidate_primitives(repo, tmp_path, go_body, virtiofsd_body=None):
+def _write_fake_candidate_primitives(repo, tmp_path, go_body, virtiofsd_body=None, slirp4netns_body=None):
     build_kernel = _fake_script(
         repo / "vm_prep" / "build-kernel.sh",
         "printf 'build-kernel\\n' >> \"$PWD/release/state/commands.log\"\n",
@@ -70,7 +71,13 @@ def _write_fake_candidate_primitives(repo, tmp_path, go_body, virtiofsd_body=Non
         repo / "vm_prep" / "build-virtiofsd.sh",
         virtiofsd_body or "printf 'build-virtiofsd\\n' >> \"$PWD/release/state/commands.log\"\n",
     )
-    out, err, rc = run(["git", "add", build_kernel, build_rootfs, build_virtiofsd], cwd=repo, timeout=10)
+    fetch_slirp4netns = _fake_script(
+        repo / "vm_prep" / "fetch-slirp4netns.sh",
+        slirp4netns_body or "printf 'fetch-slirp4netns\\n' >> \"$PWD/release/state/commands.log\"\n",
+    )
+    out, err, rc = run(
+        ["git", "add", build_kernel, build_rootfs, build_virtiofsd, fetch_slirp4netns], cwd=repo, timeout=10
+    )
     assert rc == 0, err_msg(out, err)
     out, err, rc = run(["git", "commit", "-m", "test: fake release primitives"], cwd=repo, timeout=10)
     assert rc == 0, err_msg(out, err)
@@ -192,6 +199,177 @@ def test_candidate_rejects_bad_versions(tmp_path, version):
     assert not (repo / "release/state").exists()
 
 
+@pytest.mark.parametrize("changed_path", ["tracked.txt", "cmd/zaigr/vm_data/miniconfig"])
+def test_candidate_rejects_buried_dependency_and_source_commit(tmp_path, changed_path):
+    """Reject a mixed lock/source update even when a later commit is benign."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    (repo / "deps.lock").write_text(
+        (repo / "deps.lock").read_text(encoding="utf-8") + "# lock update\n",
+        encoding="utf-8",
+    )
+    source = repo / changed_path
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("source update\n", encoding="utf-8")
+    out, err, rc = run(["git", "add", "deps.lock", changed_path], cwd=repo, timeout=10)
+    assert rc == 0, err_msg(out, err)
+    out, err, rc = run(["git", "commit", "-m", "deps: mix lock and source"], cwd=repo, timeout=10)
+    assert rc == 0, err_msg(out, err)
+    (repo / "tracked.txt").write_text("later harmless change\n", encoding="utf-8")
+    out, err, rc = run(["git", "add", "tracked.txt"], cwd=repo, timeout=10)
+    assert rc == 0, err_msg(out, err)
+    out, err, rc = run(["git", "commit", "-m", "docs: later change"], cwd=repo, timeout=10)
+    assert rc == 0, err_msg(out, err)
+
+    out, err, rc = run(
+        [RELEASE, "candidate", "1.0.0"],
+        cwd=repo,
+        env=_release_env(tmp_path),
+        timeout=10,
+    )
+
+    assert rc != 0
+    assert "deps.lock" in out + err
+    assert changed_path in out + err
+    assert not (repo / "release/state").exists()
+
+
+def test_candidate_allows_dependency_lock_with_generated_vm_data(tmp_path):
+    """Allow generated VM outputs alongside an existing dependency lock."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    lock_text = (repo / "deps.lock").read_text(encoding="utf-8")
+    (repo / "deps.lock").write_text(
+        lock_text.replace("GO_VERSION=1.24.4", "GO_VERSION=1.25.8") + "# refreshed pins\n",
+        encoding="utf-8",
+    )
+    generated = repo / "cmd/zaigr/vm_data/slirp4netns.version"
+    generated.parent.mkdir(parents=True)
+    generated.write_text("1.3.4\n", encoding="utf-8")
+    rootfs_version = repo / "cmd/zaigr/vm_data/base-rootfs.version"
+    rootfs_version.write_text("6e86cb0-ac2b98b\n", encoding="utf-8")
+    out, err, rc = run(
+        ["git", "add", "deps.lock", generated, rootfs_version], cwd=repo, timeout=10
+    )
+    assert rc == 0, err_msg(out, err)
+    out, err, rc = run(["git", "commit", "-m", "deps: refresh generated pins"], cwd=repo, timeout=10)
+    assert rc == 0, err_msg(out, err)
+    _write_fake_candidate_primitives(
+        repo,
+        tmp_path,
+        """
+printf 'GOTOOLCHAIN=%s\\n' "${GOTOOLCHAIN-}" >> "$PWD/release/state/commands.log"
+printf '#!/bin/sh\\nexit 0\\n' > zaigr
+chmod +x zaigr
+""",
+    )
+
+    out, err, rc = run(
+        [RELEASE, "candidate", "1.0.0"],
+        cwd=repo,
+        env=_release_env(tmp_path),
+        input="y\n",
+        timeout=10,
+    )
+
+    assert rc == 0, err_msg(out, err)
+    assert "Release candidate created" in out
+    commands = (repo / "release/state" / "commands.log").read_text(encoding="utf-8")
+    assert "GOTOOLCHAIN=go1.25.8" in commands
+
+
+def test_candidate_allows_go_module_pin_update_without_source(tmp_path):
+    """Allow a Go pin update when it changes only go.mod and go.sum."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    (repo / "go.mod").write_text("module example.invalid/app\n\ngo 1.24.4\n", encoding="utf-8")
+    (repo / "go.sum").write_text("example.invalid/dependency v1.2.3 h1:test\n", encoding="utf-8")
+    out, err, rc = run(["git", "add", "go.mod", "go.sum"], cwd=repo, timeout=10)
+    assert rc == 0, err_msg(out, err)
+    out, err, rc = run(["git", "commit", "-m", "deps: update Go module pins"], cwd=repo, timeout=10)
+    assert rc == 0, err_msg(out, err)
+    _write_fake_candidate_primitives(
+        repo,
+        tmp_path,
+        "printf '#!/bin/sh\\nexit 0\\n' > zaigr\nchmod +x zaigr\n",
+    )
+
+    out, err, rc = run(
+        [RELEASE, "candidate", "1.0.0"],
+        cwd=repo,
+        env=_release_env(tmp_path),
+        input="y\n",
+        timeout=10,
+    )
+
+    assert rc == 0, err_msg(out, err)
+    assert "Release candidate created" in out
+
+
+def test_candidate_rejects_go_module_pins_mixed_with_source(tmp_path):
+    """Reject a Go pin change committed together with application source."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    (repo / "go.mod").write_text("module example.invalid/app\n\ngo 1.24.4\n", encoding="utf-8")
+    (repo / "go.sum").write_text("example.invalid/dependency v1.2.3 h1:test\n", encoding="utf-8")
+    (repo / "tracked.txt").write_text("source changed with Go pins\n", encoding="utf-8")
+    out, err, rc = run(["git", "add", "go.mod", "go.sum", "tracked.txt"], cwd=repo, timeout=10)
+    assert rc == 0, err_msg(out, err)
+    out, err, rc = run(["git", "commit", "-m", "deps: mix Go pins and source"], cwd=repo, timeout=10)
+    assert rc == 0, err_msg(out, err)
+
+    out, err, rc = run(
+        [RELEASE, "candidate", "1.0.0"],
+        cwd=repo,
+        env=_release_env(tmp_path),
+        timeout=10,
+    )
+
+    assert rc != 0
+    assert "a Go module pin update may include only go.mod and go.sum" in out + err
+    assert "tracked.txt" in out + err
+    assert not (repo / "release/state").exists()
+
+
+def test_candidate_allows_lock_introduction_with_reader_update(tmp_path):
+    """Allow a lock introduction and its source reader in one commit."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    out, err, rc = run(["git", "rm", "deps.lock"], cwd=repo, timeout=10)
+    assert rc == 0, err_msg(out, err)
+    out, err, rc = run(["git", "commit", "-m", "chore: establish pre-lock history"], cwd=repo, timeout=10)
+    assert rc == 0, err_msg(out, err)
+    shutil.copy2(Path(REPO_ROOT) / "deps.lock", repo / "deps.lock")
+    (repo / "go.mod").write_text("module example.invalid/app\n\ngo 1.24.4\n", encoding="utf-8")
+    (repo / "go.sum").write_text("example.invalid/dependency v1.2.3 h1:test\n", encoding="utf-8")
+    (repo / "tracked.txt").write_text("now reads the dependency lock\n", encoding="utf-8")
+    out, err, rc = run(
+        ["git", "add", "deps.lock", "go.mod", "go.sum", "tracked.txt"], cwd=repo, timeout=10
+    )
+    assert rc == 0, err_msg(out, err)
+    out, err, rc = run(["git", "commit", "-m", "build: introduce dependency lock reader"], cwd=repo, timeout=10)
+    assert rc == 0, err_msg(out, err)
+    _write_fake_candidate_primitives(
+        repo,
+        tmp_path,
+        """
+printf '#!/bin/sh\\nexit 0\\n' > zaigr
+chmod +x zaigr
+""",
+    )
+
+    out, err, rc = run(
+        [RELEASE, "candidate", "1.0.0"],
+        cwd=repo,
+        env=_release_env(tmp_path),
+        input="y\n",
+        timeout=10,
+    )
+
+    assert rc == 0, err_msg(out, err)
+    assert "Release candidate created" in out
+
+
 def test_candidate_summary_derives_tag_and_first_build(tmp_path):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
@@ -199,7 +377,7 @@ def test_candidate_summary_derives_tag_and_first_build(tmp_path):
         repo,
         tmp_path,
         """
-printf 'go %s\\n' "$*" >> "$PWD/release/state/commands.log"
+printf 'GOTOOLCHAIN=%s go %s\\n' "${GOTOOLCHAIN-}" "$*" >> "$PWD/release/state/commands.log"
 printf '#!/bin/sh\\nexit 0\\n' > zaigr
 chmod +x zaigr
 """,
@@ -218,6 +396,8 @@ chmod +x zaigr
     assert "version:" in out and "1.0.0" in out
     assert "build:" in out and "1" in out
     assert "tag:" in out and "v1.0.0" in out
+    commands = (repo / "release/state" / "commands.log").read_text(encoding="utf-8")
+    assert "GOTOOLCHAIN=go1.24.4" in commands
     assert "Plan" not in out
     assert "Release candidate" in err
     assert "version:" in err and "1.0.0" in err
@@ -505,6 +685,39 @@ def test_candidate_stops_on_virtiofsd_build_failure_and_keeps_transcript(tmp_pat
     assert Path(release["failure"]["transcript_path"]) == transcript
     assert "daemon build failed" in transcript.read_text(encoding="utf-8")
     assert "go build" not in (repo / "release/state/commands.log").read_text(encoding="utf-8")
+
+
+def test_candidate_stops_on_slirp4netns_fetch_failure_and_keeps_transcript(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _write_fake_candidate_primitives(
+        repo,
+        tmp_path,
+        "printf 'go %s\\n' \"$*\" >> \"$PWD/release/state/commands.log\"\n",
+        slirp4netns_body="printf 'fetch-slirp4netns\\n' >> \"$PWD/release/state/commands.log\"\nprintf 'slirp fetch failed\\n' >&2\nexit 34\n",
+    )
+
+    out, err, rc = run(
+        [RELEASE, "candidate", "1.0.0"],
+        cwd=repo,
+        env=_release_env(tmp_path),
+        input="y\n",
+        timeout=10,
+    )
+
+    assert rc != 0
+    assert "command failed with exit code 34" in out + err
+    candidate = repo / "release/state/candidates/1.0.0-1"
+    release = json.loads((candidate / "release.json").read_text(encoding="utf-8"))
+    assert release["status"] == "failed"
+    assert release["failure"]["command_display"] == "Fetch upstream slirp4netns"
+    transcript = candidate / "transcripts/candidate.log"
+    assert Path(release["failure"]["transcript_path"]) == transcript
+    assert "slirp fetch failed" in transcript.read_text(encoding="utf-8")
+    commands = (repo / "release/state/commands.log").read_text(encoding="utf-8")
+    assert "build-virtiofsd" in commands
+    assert "fetch-slirp4netns" in commands
+    assert "go build" not in commands
 
 
 def test_candidate_after_failed_candidate_reports_failure_and_creates_next_build(tmp_path):
@@ -1252,6 +1465,7 @@ chmod +x zaigr
     assert ":: Build base kernel" in err
     assert ":: Build base rootfs" in err
     assert ":: Build virtiofsd" in err
+    assert ":: Fetch upstream slirp4netns" in err
     assert ":: Build zaigr binary" in err
     assert ":: Generate release notes" in err
     assert ":: Build Debian package" in err
@@ -1266,10 +1480,13 @@ chmod +x zaigr
     assert ":: Checking release tools" in transcript
     assert f"{repo}$ vm_prep/build-kernel.sh" in transcript
     assert f"{repo}$ vm_prep/build-virtiofsd.sh" in transcript
+    assert f"{repo}$ vm_prep/fetch-slirp4netns.sh" in transcript
     assert f"{repo}$ go build" in transcript
-    assert transcript.index("vm_prep/build-virtiofsd.sh") < transcript.index("$ go build")
+    assert transcript.index("vm_prep/build-virtiofsd.sh") < transcript.index("vm_prep/fetch-slirp4netns.sh")
+    assert transcript.index("vm_prep/fetch-slirp4netns.sh") < transcript.index("$ go build")
     commands = (repo / "release/state/commands.log").read_text(encoding="utf-8")
-    assert commands.index("build-virtiofsd") < commands.index("go build")
+    assert commands.index("build-virtiofsd") < commands.index("fetch-slirp4netns")
+    assert commands.index("fetch-slirp4netns") < commands.index("go build")
     assert "-X main.version=1.0.0" in transcript
     assert "git-cliff --config release/cliff.toml --tag v1.0.0 --output release/RELEASE_NOTES.md" in transcript
     assert ":: Writing checksums" in transcript
