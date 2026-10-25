@@ -4,18 +4,13 @@ package hostnet
 
 import (
 	"bufio"
-	"bytes"
-	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/netip"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -24,11 +19,13 @@ import (
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
+	"github.com/google/nftables/userdata"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
 
 const guestTapName = "zgr_gst"
+const maintenanceTapName = "zgr_mnt"
 const uplinkTapName = "zgr_upl"
 const nftTableName = "zaigr"
 const maximumKernelLease = 10 * time.Second
@@ -47,11 +44,8 @@ type helperRequest struct {
 	Deadline        int64            `json:"deadline,omitempty"`
 	RequestNotAfter int64            `json:"request_not_after,omitempty"`
 	SessionID       string           `json:"session_id,omitempty"`
-	KeyPath         string           `json:"key_path,omitempty"`
-	HostAlias       string           `json:"host_alias,omitempty"`
 	HostAddress     string           `json:"host_address,omitempty"`
 	GuestAddress    string           `json:"guest_address,omitempty"`
-	TunnelIndex     int              `json:"tunnel_index,omitempty"`
 }
 
 type leaseRecord struct {
@@ -63,194 +57,51 @@ type helperResponse struct {
 	OK           bool   `json:"ok"`
 	Error        string `json:"error,omitempty"`
 	Interface    string `json:"interface,omitempty"`
-	HostAlias    string `json:"host_alias,omitempty"`
 	HostAddress  string `json:"host_address,omitempty"`
 	GuestAddress string `json:"guest_address,omitempty"`
-	TunnelIndex  int    `json:"tunnel_index,omitempty"`
 }
 
-type maintenanceChild struct {
-	cmd        *exec.Cmd
-	deadline   time.Time
-	request    helperRequest
-	knownHosts string
-	done       chan error
+type maintenanceSessionLease struct{ deadline time.Time }
+
+func validateMaintenanceDeadline(deadline, requestNotAfter time.Time) error {
+	now := time.Now()
+	if !deadline.After(now) || deadline.After(now.Add(maximumKernelLease)) {
+		return errors.New("maintenance session deadline is outside the kernel bound")
+	}
+	if !requestNotAfter.IsZero() && !requestNotAfter.After(now) {
+		return errors.New("host network helper request has expired")
+	}
+	return nil
 }
 
-func startMaintenanceTunnel(req helperRequest, used map[int]bool, runtimeDir string) (*maintenanceChild, MaintenanceSession, error) {
-	if len(req.SessionID) < 16 || len(req.SessionID) > 64 || !filepath.IsAbs(req.KeyPath) {
-		return nil, MaintenanceSession{}, errors.New("invalid maintenance session identity or SSH key path")
-	}
-	keyInfo, err := os.Stat(req.KeyPath)
-	if err != nil || !keyInfo.Mode().IsRegular() || keyInfo.Mode().Perm()&0077 != 0 {
-		return nil, MaintenanceSession{}, errors.New("maintenance SSH key is not a private regular file")
-	}
-	deadline := time.Unix(0, req.Deadline)
-	if !deadline.After(time.Now()) || deadline.After(time.Now().Add(maximumKernelLease)) {
-		return nil, MaintenanceSession{}, errors.New("maintenance session deadline is invalid")
-	}
-	slot := -1
-	for candidate := 0; candidate < maximumMaintenanceSessions; candidate++ {
-		if !used[candidate] {
-			slot = candidate
-			break
-		}
-	}
-	if slot < 0 {
-		return nil, MaintenanceSession{}, errors.New("maintenance tunnel limit reached for this VM launch")
-	}
-	identity := sha256.Sum256([]byte(req.SessionID))
-	knownHostsPath := filepath.Join(runtimeDir, "maintenance-"+hex.EncodeToString(identity[:])+".known_hosts")
-	knownHosts, err := os.OpenFile(knownHostsPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if err != nil {
-		return nil, MaintenanceSession{}, fmt.Errorf("create private maintenance host-key store: %w", err)
-	}
-	if err := knownHosts.Close(); err != nil {
-		_ = os.Remove(knownHostsPath)
-		return nil, MaintenanceSession{}, fmt.Errorf("close private maintenance host-key store: %w", err)
-	}
-	keepKnownHosts := false
-	defer func() {
-		if !keepKnownHosts {
-			_ = os.Remove(knownHostsPath)
-		}
-	}()
-	// Avoid guest .15 and slirp's reserved .2/.3 addresses.
-	alias := netip.AddrFrom4([4]byte{10, 0, 2, byte(64 + slot)})
-	hostIP := netip.AddrFrom4([4]byte{10, 0, 4, byte(1 + slot*2)})
-	guestIP := netip.AddrFrom4([4]byte{10, 0, 4, byte(2 + slot*2)})
-	if err := setAddressLease("maintenance_network", guestIP.String(), deadline, helperRequestDeadline(req)); err != nil {
-		return nil, MaintenanceSession{}, err
-	}
-	if err := setAddressLease("maintenance_outer", alias.String(), deadline, helperRequestDeadline(req)); err != nil {
-		_ = setAddressLease("maintenance_network", guestIP.String(), time.Time{}, time.Time{})
-		return nil, MaintenanceSession{}, err
-	}
-	tap, err := netlink.LinkByName(guestTapName)
-	if err != nil {
-		_ = setAddressLease("maintenance_network", guestIP.String(), time.Time{}, time.Time{})
-		_ = setAddressLease("maintenance_outer", alias.String(), time.Time{}, time.Time{})
-		return nil, MaintenanceSession{}, err
-	}
-	aliasAddr, _ := netlink.ParseAddr(alias.String() + "/24")
-	if err := netlink.AddrAdd(tap, aliasAddr); err != nil {
-		_ = setAddressLease("maintenance_network", guestIP.String(), time.Time{}, time.Time{})
-		_ = setAddressLease("maintenance_outer", alias.String(), time.Time{}, time.Time{})
-		return nil, MaintenanceSession{}, fmt.Errorf("add maintenance SSH source alias: %w", err)
-	}
-	committed := false
-	var tunnel netlink.Link
-	defer func() {
-		if committed {
-			return
-		}
-		if tunnel != nil {
-			_ = netlink.LinkDel(tunnel)
-		}
-		_ = netlink.AddrDel(tap, aliasAddr)
-		_ = setAddressLease("maintenance_network", guestIP.String(), time.Time{}, time.Time{})
-		_ = setAddressLease("maintenance_outer", alias.String(), time.Time{}, time.Time{})
-	}()
-	ssh, err := exec.LookPath("ssh")
-	if err != nil {
-		return nil, MaintenanceSession{}, err
-	}
-	args := []string{"-F", "/dev/null", "-n", "-N", "-o", "Tunnel=point-to-point", "-w", fmt.Sprintf("%d:%d", slot, slot), "-b", alias.String(), "-i", req.KeyPath,
-		"-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "UserKnownHostsFile=" + knownHostsPath, "-o", "GlobalKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
-		"-o", "ControlMaster=no", "-o", "ForwardAgent=no", "-o", "ForwardX11=no", "-o", "PermitLocalCommand=no",
-		"-o", "ExitOnForwardFailure=yes", "-o", "ConnectTimeout=5", "root@10.0.2.15"}
-	cmd := exec.Command(ssh, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Pdeathsig: syscall.SIGKILL}
-	var sshDiagnostics bytes.Buffer
-	cmd.Stdout, cmd.Stderr = io.Discard, &sshDiagnostics
-	if err := cmd.Start(); err != nil {
-		_ = netlink.AddrDel(tap, aliasAddr)
-		_ = setAddressLease("maintenance_network", guestIP.String(), time.Time{}, time.Time{})
-		_ = setAddressLease("maintenance_outer", alias.String(), time.Time{}, time.Time{})
-		return nil, MaintenanceSession{}, fmt.Errorf("start authenticated SSH tunnel: %w", err)
-	}
-	child := &maintenanceChild{cmd: cmd, deadline: deadline, knownHosts: knownHostsPath, request: helperRequest{SessionID: req.SessionID, TunnelIndex: slot, HostAlias: alias.String(), HostAddress: hostIP.String(), GuestAddress: guestIP.String()}, done: make(chan error, 1)}
-	go func() { child.done <- cmd.Wait(); close(child.done) }()
-	deadlineWait := time.Now().Add(8 * time.Second)
-	for time.Now().Before(deadlineWait) {
-		select {
-		case waitErr, ok := <-child.done:
-			if !ok || waitErr == nil {
-				waitErr = errors.New("SSH tunnel exited before interface readiness")
-			}
-			_ = cmd.Process.Kill()
-			_ = netlink.AddrDel(tap, aliasAddr)
-			_ = setAddressLease("maintenance_network", guestIP.String(), time.Time{}, time.Time{})
-			_ = setAddressLease("maintenance_outer", alias.String(), time.Time{}, time.Time{})
-			return nil, MaintenanceSession{}, fmt.Errorf("authenticated SSH tunnel failed: %w: %s", waitErr, strings.TrimSpace(sshDiagnostics.String()))
-		default:
-		}
-		link, linkErr := netlink.LinkByName("tun" + strconv.Itoa(slot))
-		if linkErr == nil {
-			tunnel = link
-			localNet, _ := netlink.ParseIPNet(hostIP.String() + "/32")
-			peerNet, _ := netlink.ParseIPNet(guestIP.String() + "/32")
-			addr := &netlink.Addr{IPNet: localNet, Peer: peerNet}
-			if err := netlink.AddrAdd(link, addr); err != nil {
-				_ = cmd.Process.Kill()
-				<-child.done
-				return nil, MaintenanceSession{}, fmt.Errorf("configure maintenance tunnel address: %w: %s", err, strings.TrimSpace(sshDiagnostics.String()))
-			}
-			if err := netlink.LinkSetUp(link); err != nil {
-				_ = cmd.Process.Kill()
-				<-child.done
-				return nil, MaintenanceSession{}, fmt.Errorf("bring up maintenance tunnel: %w: %s", err, strings.TrimSpace(sshDiagnostics.String()))
-			}
-			committed = true
-			keepKnownHosts = true
-			return child, MaintenanceSession{TunnelIndex: slot, HostAlias: alias, HostAddress: hostIP, GuestAddress: guestIP}, nil
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	_ = cmd.Process.Kill()
-	<-child.done
-	_ = netlink.AddrDel(tap, aliasAddr)
-	_ = setAddressLease("maintenance_network", guestIP.String(), time.Time{}, time.Time{})
-	_ = setAddressLease("maintenance_outer", alias.String(), time.Time{}, time.Time{})
-	return nil, MaintenanceSession{}, fmt.Errorf("authenticated SSH tunnel interface did not become ready: %s", strings.TrimSpace(sshDiagnostics.String()))
-}
-
-func setAddressLease(name, raw string, deadline, requestNotAfter time.Time) error {
-	addr, err := netip.ParseAddr(raw)
-	if err != nil || !addr.Is4() {
-		return errors.New("invalid maintenance lease address")
+func setMaintenanceNetworkLease(deadline, requestNotAfter time.Time) error {
+	if !requestNotAfter.IsZero() && !requestNotAfter.After(time.Now()) {
+		return errors.New("host network helper request has expired")
 	}
 	c, err := nftables.New()
 	if err != nil {
 		return err
 	}
 	t := &nftables.Table{Name: nftTableName, Family: nftables.TableFamilyINet}
-	s, err := c.GetSetByName(t, name)
+	s, err := c.GetSetByName(t, "maintenance_network")
 	if err != nil {
 		return err
 	}
-	if !requestNotAfter.IsZero() && !requestNotAfter.After(time.Now()) {
-		return errors.New("host network helper request has expired")
-	}
+	addr := netip.MustParseAddr(MaintenanceGuestAddress)
 	elem := nftables.SetElement{Key: addr.AsSlice()}
-	existing, err := c.GetSetElements(s)
+	items, err := c.GetSetElements(s)
 	if err != nil {
 		return err
 	}
-	found := false
-	for _, item := range existing {
+	for _, item := range items {
 		if string(item.Key) == string(elem.Key) {
-			found = true
+			if err := c.SetDeleteElements(s, []nftables.SetElement{elem}); err != nil {
+				return err
+			}
 			break
 		}
 	}
-	if found {
-		if err := c.SetDeleteElements(s, []nftables.SetElement{elem}); err != nil {
-			return err
-		}
-	}
-	if deadline.IsZero() {
-	} else {
+	if !deadline.IsZero() {
 		ttl := deadline.Sub(time.Now())
 		if ttl <= 0 || ttl > maximumKernelLease {
 			return errors.New("maintenance lease deadline is outside the kernel bound")
@@ -266,52 +117,84 @@ func setAddressLease(name, raw string, deadline, requestNotAfter time.Time) erro
 	return c.Flush()
 }
 
-func cleanupMaintenanceChild(child *maintenanceChild, requestNotAfter time.Time) error {
-	var cleanupErr error
-	cleanupErr = errors.Join(cleanupErr, setAddressLease("maintenance_network", child.request.GuestAddress, time.Time{}, requestNotAfter))
-	cleanupErr = errors.Join(cleanupErr, setAddressLease("maintenance_outer", child.request.HostAlias, time.Time{}, requestNotAfter))
-	if child.cmd.Process != nil {
-		if err := child.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			cleanupErr = errors.Join(cleanupErr, err)
+func maintenanceMaxDeadline(sessions map[string]maintenanceSessionLease, now time.Time) time.Time {
+	var max time.Time
+	for id, session := range sessions {
+		if !session.deadline.After(now) {
+			delete(sessions, id)
+			continue
+		}
+		if session.deadline.After(max) {
+			max = session.deadline
 		}
 	}
-	select {
-	case <-child.done:
-	case <-time.After(2 * time.Second):
-		cleanupErr = errors.Join(cleanupErr, errors.New("maintenance SSH tunnel did not exit after kill"))
+	return max
+}
+
+func maintenanceStart(req helperRequest, sessions map[string]maintenanceSessionLease) (MaintenanceSession, error) {
+	if len(req.SessionID) < 16 || len(req.SessionID) > 64 {
+		return MaintenanceSession{}, errors.New("invalid maintenance session identity")
 	}
-	if tunnel, err := netlink.LinkByName("tun" + strconv.Itoa(child.request.TunnelIndex)); err == nil {
-		cleanupErr = errors.Join(cleanupErr, netlink.LinkDel(tunnel))
-	} else {
-		var missing netlink.LinkNotFoundError
-		if !errors.As(err, &missing) {
-			cleanupErr = errors.Join(cleanupErr, err)
+	deadline := time.Unix(0, req.Deadline)
+	reqDeadline := helperRequestDeadline(req)
+	if err := validateMaintenanceDeadline(deadline, reqDeadline); err != nil {
+		return MaintenanceSession{}, err
+	}
+	wasActive := maintenanceMaxDeadline(sessions, time.Now()).After(time.Now())
+	if _, ok := sessions[req.SessionID]; ok {
+		return MaintenanceSession{}, errors.New("maintenance session ID is already active")
+	}
+	if len(sessions) >= maximumMaintenanceSessions {
+		return MaintenanceSession{}, errors.New("maintenance session limit reached")
+	}
+	if !wasActive {
+		if err := setMaintenanceNetworkLease(time.Time{}, reqDeadline); err != nil {
+			return MaintenanceSession{}, err
+		}
+		if err := deleteTrackedSourceAddress(netip.MustParseAddr(MaintenanceGuestAddress)); err != nil {
+			return MaintenanceSession{}, err
 		}
 	}
-	cleanupErr = errors.Join(cleanupErr, deleteTrackedSourceAddress(netip.MustParseAddr(child.request.GuestAddress)))
-	cleanupErr = errors.Join(cleanupErr, deleteTrackedSourceAddress(netip.MustParseAddr(child.request.HostAlias)))
-	if tap, err := netlink.LinkByName(guestTapName); err == nil {
-		alias := netip.MustParseAddr(child.request.HostAlias)
-		addresses, listErr := netlink.AddrList(tap, netlink.FAMILY_V4)
-		if listErr != nil {
-			cleanupErr = errors.Join(cleanupErr, listErr)
-		} else {
-			for _, addr := range addresses {
-				if addr.IPNet != nil && addr.IPNet.IP.Equal(net.IP(alias.AsSlice())) {
-					cleanupErr = errors.Join(cleanupErr, netlink.AddrDel(tap, &addr))
-					break
-				}
-			}
-		}
-	} else {
-		cleanupErr = errors.Join(cleanupErr, err)
+	sessions[req.SessionID] = maintenanceSessionLease{deadline: deadline}
+	if err := setMaintenanceNetworkLease(maintenanceMaxDeadline(sessions, time.Now()), reqDeadline); err != nil {
+		delete(sessions, req.SessionID)
+		return MaintenanceSession{}, err
 	}
-	if child.knownHosts != "" {
-		if err := os.Remove(child.knownHosts); err != nil && !errors.Is(err, os.ErrNotExist) {
-			cleanupErr = errors.Join(cleanupErr, err)
-		}
+	return MaintenanceSession{HostAddress: netip.MustParseAddr(MaintenanceHostAddress), GuestAddress: netip.MustParseAddr(MaintenanceGuestAddress)}, nil
+}
+
+func maintenanceRenew(req helperRequest, sessions map[string]maintenanceSessionLease) error {
+	if len(req.SessionID) < 16 || len(req.SessionID) > 64 {
+		return errors.New("invalid maintenance session identity")
 	}
-	return cleanupErr
+	item, ok := sessions[req.SessionID]
+	if !ok {
+		return errors.New("maintenance session does not exist")
+	}
+	if !item.deadline.After(time.Now()) {
+		delete(sessions, req.SessionID)
+		_ = setMaintenanceNetworkLease(maintenanceMaxDeadline(sessions, time.Now()), helperRequestDeadline(req))
+		return errors.New("maintenance session expired and cannot be renewed")
+	}
+	deadline := time.Unix(0, req.Deadline)
+	if err := validateMaintenanceDeadline(deadline, helperRequestDeadline(req)); err != nil {
+		return err
+	}
+	item.deadline = deadline
+	sessions[req.SessionID] = item
+	return setMaintenanceNetworkLease(maintenanceMaxDeadline(sessions, time.Now()), helperRequestDeadline(req))
+}
+
+func maintenanceStop(req helperRequest, sessions map[string]maintenanceSessionLease) error {
+	if len(req.SessionID) < 16 || len(req.SessionID) > 64 {
+		return errors.New("invalid maintenance session identity")
+	}
+	delete(sessions, req.SessionID)
+	max := maintenanceMaxDeadline(sessions, time.Now())
+	if err := setMaintenanceNetworkLease(max, helperRequestDeadline(req)); err != nil {
+		return err
+	}
+	return nil
 }
 
 const descriptorReadyMarker = "Z"
@@ -395,8 +278,16 @@ func RunHelper(socketPath, launchID string, expectedHostUID, expectedParentPID i
 		return fmt.Errorf("open guest TAP: %w", err)
 	}
 	defer tap.Close()
+	maintenanceTap, err := openTap(maintenanceTapName)
+	if err != nil {
+		return fmt.Errorf("open maintenance TAP: %w", err)
+	}
+	defer maintenanceTap.Close()
 	if err := configureGuestTap(guestTapName); err != nil {
 		return fmt.Errorf("configure guest TAP: %w", err)
+	}
+	if err := configureMaintenanceTap(maintenanceTapName); err != nil {
+		return fmt.Errorf("configure maintenance TAP: %w", err)
 	}
 	if err := installDefaultPolicy(launchID); err != nil {
 		return fmt.Errorf("install default host policy: %w", err)
@@ -426,7 +317,7 @@ func RunHelper(socketPath, launchID string, expectedHostUID, expectedParentPID i
 		return err
 	}
 	defer tcpFile.Close()
-	if err := sendFDs(conn, []*os.File{tap, udpFile, tcpFile}, descriptorReadyMarker); err != nil {
+	if err := sendFDs(conn, []*os.File{tap, maintenanceTap, udpFile, tcpFile}, descriptorReadyMarker); err != nil {
 		return err
 	}
 	enc := json.NewEncoder(conn)
@@ -439,8 +330,7 @@ func RunHelper(socketPath, launchID string, expectedHostUID, expectedParentPID i
 	var networkLeaseDeadline time.Time
 	var conntrackGrants = make(map[netip.Addr]bool)
 	dnsFlows := newDNSFlowState()
-	maintenance := make(map[string]*maintenanceChild)
-	usedMaintenanceSlots := make(map[int]bool)
+	maintenance := make(map[string]maintenanceSessionLease)
 	for {
 		if !scanner.Scan() {
 			if err := scanner.Err(); err != nil {
@@ -533,55 +423,21 @@ func RunHelper(socketPath, launchID string, expectedHostUID, expectedParentPID i
 					resp.Error = err.Error()
 				}
 			case "start-maintenance-session":
-				child, session, startErr := startMaintenanceTunnel(req, usedMaintenanceSlots, filepath.Dir(socketPath))
+				session, startErr := maintenanceStart(req, maintenance)
 				if startErr != nil {
 					resp.Error = startErr.Error()
 					break
 				}
-				maintenance[req.SessionID] = child
-				usedMaintenanceSlots[session.TunnelIndex] = true
-				resp.TunnelIndex = session.TunnelIndex
-				resp.HostAlias = session.HostAlias.String()
 				resp.HostAddress = session.HostAddress.String()
 				resp.GuestAddress = session.GuestAddress.String()
 			case "renew-maintenance-session":
-				child := maintenance[req.SessionID]
-				if child == nil {
-					resp.Error = "maintenance session does not exist"
-					break
-				}
-				var exited bool
-				select {
-				case <-child.done:
-					exited = true
-				default:
-				}
-				deadline := time.Unix(0, req.Deadline)
-				if exited || !child.deadline.After(time.Now()) {
-					resp.Error = "maintenance session expired or its SSH tunnel exited"
-					break
-				}
-				if err := setAddressLease("maintenance_network", child.request.GuestAddress, deadline, helperRequestDeadline(req)); err != nil {
+				if err := maintenanceRenew(req, maintenance); err != nil {
 					resp.Error = err.Error()
-					break
 				}
-				if err := setAddressLease("maintenance_outer", child.request.HostAlias, deadline, helperRequestDeadline(req)); err != nil {
-					resp.Error = err.Error()
-					break
-				}
-				child.deadline = deadline
 			case "stop-maintenance-session":
-				child := maintenance[req.SessionID]
-				if child == nil {
-					break
+				if err := maintenanceStop(req, maintenance); err != nil {
+					resp.Error = err.Error()
 				}
-				stopErr := cleanupMaintenanceChild(child, helperRequestDeadline(req))
-				if stopErr != nil {
-					resp.Error = fmt.Sprintf("stop maintenance tunnel: %v", stopErr)
-					break
-				}
-				delete(maintenance, req.SessionID)
-				delete(usedMaintenanceSlots, child.request.TunnelIndex)
 			case "set-network-lease":
 				if req.Generation != generation || req.Deadline == 0 || !time.Unix(0, req.Deadline).After(time.Now()) {
 					resp.Error = "network lease identity, generation, or deadline is invalid"
@@ -699,6 +555,21 @@ func configureGuestTap(name string) error {
 	return netlink.LinkSetUp(link)
 }
 
+func configureMaintenanceTap(name string) error {
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		return err
+	}
+	addr, _ := netlink.ParseAddr(MaintenanceHostAddress + "/24")
+	if err := netlink.AddrAdd(link, addr); err != nil && !errors.Is(err, syscall.EEXIST) {
+		return err
+	}
+	if err := netlink.LinkSetMTU(link, 1500); err != nil {
+		return err
+	}
+	return netlink.LinkSetUp(link)
+}
+
 func configureUplink() error {
 	link, err := netlink.LinkByName(uplinkTapName)
 	if err != nil {
@@ -741,11 +612,12 @@ func installDefaultPolicy(launchID string) error {
 	conn.AddSet(&nftables.Set{Table: t, Name: "dns_flow_marks", KeyType: nftables.TypeMark, HasTimeout: true}, nil)
 	conn.AddSet(&nftables.Set{Table: t, Name: "full_network", KeyType: nftables.TypeInteger, HasTimeout: true}, nil)
 	conn.AddSet(&nftables.Set{Table: t, Name: "maintenance_network", KeyType: nftables.TypeIPAddr, HasTimeout: true}, nil)
-	conn.AddSet(&nftables.Set{Table: t, Name: "maintenance_outer", KeyType: nftables.TypeIPAddr, HasTimeout: true}, nil)
-	conn.AddSet(&nftables.Set{Table: t, Name: "maintenance_aliases", KeyType: nftables.TypeIPAddr}, nil)
 	conn.AddSet(&nftables.Set{Table: t, Name: "network_live", KeyType: nftables.TypeInteger, HasTimeout: true}, nil)
 	conn.AddSet(&nftables.Set{Table: t, Name: "tcp_forward_ports", KeyType: nftables.TypeInetService}, nil)
 	conn.AddSet(&nftables.Set{Table: t, Name: "udp_forward_ports", KeyType: nftables.TypeInetService}, nil)
+	for _, name := range []string{"maintenance_gate_accept_to_uplink", "maintenance_gate_accept_from_uplink", "maintenance_gate_drop_to_uplink", "maintenance_gate_drop_from_uplink"} {
+		conn.AddObj(&nftables.CounterObj{Table: t, Name: name})
+	}
 	if err := conn.Flush(); err != nil {
 		return fmt.Errorf("install host network nftables skeleton: %w", err)
 	}
@@ -783,37 +655,32 @@ func installDefaultPolicy(launchID string) error {
 	addStartupRule(&nftables.Rule{Table: t, Chain: input, Exprs: []expr.Any{
 		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifName("lo")}, &expr.Verdict{Kind: expr.VerdictAccept},
 	}})
-	// OpenSSH's point-to-point tunnel transport is a host-owned connection
-	// from one reserved source alias to guest sshd. Both directions recheck
-	// the short-lived alias set so a frozen owner cannot keep the channel open.
-	for _, proto := range []byte{6} {
-		addStartupRule(&nftables.Rule{Table: t, Chain: input, Exprs: join(matchIIF(guestTapName), networkLive(), matchIPv4(12, netip.MustParseAddr("10.0.2.15")), lookupIPv4(16, "maintenance_outer"), matchL4(proto), matchConntrackState(expr.CtStateBitESTABLISHED), matchConntrackOriginalDestination("10.0.2.15"), matchConntrackOriginalPort(22), accept())})
-		addStartupRule(&nftables.Rule{Table: t, Chain: output, Exprs: join(matchOIF(guestTapName), networkLive(), lookupIPv4(12, "maintenance_aliases"), lookupIPv4(12, "maintenance_outer"), matchIPv4(16, netip.MustParseAddr("10.0.2.15")), matchL4(proto), matchPort(2, 22), accept())})
-	}
-	addStartupRule(&nftables.Rule{Table: t, Chain: output, Exprs: join(matchOIF(guestTapName), lookupIPv4(12, "maintenance_aliases"), drop())})
 	// DNS is reachable only on the guest-facing interface and only at the
 	// broker address. The frontend sockets are inherited from this namespace.
 	for _, proto := range []byte{6, 17} {
 		exprs := join(matchIIF(guestTapName), networkLive(), matchIPv4(12, netip.MustParseAddr("10.0.2.15")), matchL4(proto), matchIPv4(16, netip.MustParseAddr("10.0.2.3")), matchPort(2, 53), accept())
 		addStartupRule(&nftables.Rule{Table: t, Chain: input, Exprs: exprs})
 	}
-	// A maintenance namespace resolves through the same host DNS broker as
-	// the ordinary guest, preserving capture and exact-domain telemetry.
+	// The shared maintenance namespace uses its dedicated host DNS endpoint.
 	for _, proto := range []byte{6, 17} {
-		for slot := 0; slot < maximumMaintenanceSessions; slot++ {
-			iface := "tun" + strconv.Itoa(slot)
-			guestIP := netip.AddrFrom4([4]byte{10, 0, 4, byte(2 + slot*2)})
-			addStartupRule(&nftables.Rule{Table: t, Chain: input, Exprs: join(matchIIF(iface), networkLive(), matchIPv4(12, guestIP), lookupIPv4(12, "maintenance_network"), matchL4(proto), matchIPv4(16, netip.MustParseAddr("10.0.2.3")), matchPort(2, 53), accept())})
-			addStartupRule(&nftables.Rule{Table: t, Chain: output, Exprs: join(networkLive(), matchIPv4(12, netip.MustParseAddr("10.0.2.3")), matchPort(0, 53), matchIPv4(16, guestIP), lookupIPv4(16, "maintenance_network"), matchL4(proto), accept())})
-		}
+		addStartupRule(gateRule(t, input, join(matchIIF(maintenanceTapName), networkLive(), matchNFProto(unix.NFPROTO_IPV4), matchIPv4(12, netip.MustParseAddr(MaintenanceGuestAddress)), lookupIPv4(12, "maintenance_network"), matchL4(proto), matchIPv4(16, netip.MustParseAddr("10.0.2.3")), matchPort(2, 53)), "maintenance_dns_accept_in"))
+		addStartupRule(gateRule(t, output, join(matchOIF(maintenanceTapName), networkLive(), matchNFProto(unix.NFPROTO_IPV4), matchIPv4(12, netip.MustParseAddr("10.0.2.3")), matchPort(0, 53), matchIPv4(16, netip.MustParseAddr(MaintenanceGuestAddress)), lookupIPv4(16, "maintenance_network"), matchL4(proto)), "maintenance_dns_accept_out"))
 	}
+	addStartupRule(gateDrop(t, input, join(matchIIF(maintenanceTapName)), "maintenance_gate_drop_to_uplink"))
+	addStartupRule(gateDrop(t, output, join(matchOIF(maintenanceTapName)), "maintenance_gate_drop_from_uplink"))
 	if err := flushStartupRules(); err != nil {
-		return fmt.Errorf("install maintenance SSH and DNS nftables rules: %w", err)
+		return fmt.Errorf("install maintenance DNS nftables rules: %w", err)
 	}
 	// Drop non-IPv4 and direct uplink traffic before NAT. The guest-facing
 	// 10.0.2.2 alias is the only way to reach the host; it is DNATed to slirp's
 	// host alias only while that exact original destination is granted.
 	guard := conn.AddChain(&nftables.Chain{Name: "pre_guard", Table: t, Hooknum: nftables.ChainHookPrerouting, Priority: nftables.ChainPriorityRef(-101), Type: nftables.ChainTypeFilter})
+	// Reject wrong source, inactive lease, and IPv6 at prerouting before any
+	// anti-spoof or NAT rules can process ingress from the maintenance TAP.
+	addStartupRule(gateDrop(t, guard, join(matchIIF(maintenanceTapName), matchNFProto(unix.NFPROTO_IPV6)), "maintenance_gate_drop_to_uplink"))
+	addStartupRule(gateDrop(t, guard, join(matchIIF(maintenanceTapName), matchNFProto(unix.NFPROTO_IPV4), matchIPv4Not(12, netip.MustParseAddr(MaintenanceGuestAddress))), "maintenance_gate_drop_to_uplink"))
+	addStartupRule(gateDrop(t, guard, join(matchIIF(maintenanceTapName), matchNFProto(unix.NFPROTO_IPV4), lookupIPv4Not(12, "maintenance_network")), "maintenance_gate_drop_to_uplink"))
+	addStartupRule(gateDrop(t, guard, join(matchIIF(maintenanceTapName), matchNFProto(unix.NFPROTO_IPV4), matchIPv4(12, netip.MustParseAddr(MaintenanceGuestAddress)), lookupIPv4(12, "maintenance_network"), networkLiveNot()), "maintenance_gate_drop_to_uplink"))
 	// NFTRACE is observer-only. Tag guest-originated packets before anti-spoof,
 	// NAT, and policy rules so the kernel can report the original destination
 	// together with the actual terminal input/forward verdict. Conntrack reply
@@ -830,33 +697,23 @@ func installDefaultPolicy(launchID string) error {
 	for _, proto := range []byte{6, 17} {
 		addStartupRule(&nftables.Rule{Table: t, Chain: guard, Exprs: join(matchIIF(guestTapName), matchNFProto(unix.NFPROTO_IPV4), matchIPv4(12, netip.MustParseAddr("10.0.2.15")), matchL4(proto), matchConntrackState(expr.CtStateBitESTABLISHED), matchConntrackOriginalDestination("10.0.3.100"), accept())})
 	}
-	// The host side of each SSH TUN is a routed guest interface. Only packets
-	// whose inner source/destination remains in the live per-session lease set
-	// can use the broad slirp uplink; deleting the set element cuts both paths.
-	for slot := 0; slot < maximumMaintenanceSessions; slot++ {
-		iface := "tun" + strconv.Itoa(slot)
-		guestIP := netip.AddrFrom4([4]byte{10, 0, 4, byte(2 + slot*2)})
-		for _, proto := range []byte{6, 17} {
-			addStartupRule(&nftables.Rule{Table: t, Chain: fwd, Exprs: join(matchIIF(iface), networkLive(), matchNFProto(unix.NFPROTO_IPV4), matchIPv4(12, guestIP), lookupIPv4(12, "maintenance_network"), matchL4(proto), accept())})
-			addStartupRule(&nftables.Rule{Table: t, Chain: fwd, Exprs: join(matchIIF(uplinkTapName), networkLive(), matchNFProto(unix.NFPROTO_IPV4), matchIPv4(16, guestIP), lookupIPv4(16, "maintenance_network"), matchL4(proto), matchConntrackOriginalSourceLookup("maintenance_network"), accept())})
-		}
+	// Each forwarded data packet checks owner liveness and the timed singleton
+	// lease, including established return packets.
+	for _, proto := range []byte{6, 17} {
+		addStartupRule(gateRule(t, fwd, join(matchIIF(maintenanceTapName), matchOIF(uplinkTapName), networkLive(), matchNFProto(unix.NFPROTO_IPV4), matchIPv4(12, netip.MustParseAddr(MaintenanceGuestAddress)), lookupIPv4(12, "maintenance_network"), matchL4(proto)), "maintenance_gate_accept_to_uplink"))
+		addStartupRule(gateRule(t, fwd, join(matchIIF(uplinkTapName), matchOIF(maintenanceTapName), networkLive(), matchNFProto(unix.NFPROTO_IPV4), matchIPv4(16, netip.MustParseAddr(MaintenanceGuestAddress)), lookupIPv4(16, "maintenance_network"), matchL4(proto), matchConntrackState(expr.CtStateBitESTABLISHED), matchConntrackOriginalSourceLookup("maintenance_network")), "maintenance_gate_accept_from_uplink"))
 	}
+	addStartupRule(gateDrop(t, fwd, join(matchIIF(maintenanceTapName)), "maintenance_gate_drop_to_uplink"))
+	addStartupRule(gateDrop(t, fwd, join(matchOIF(maintenanceTapName)), "maintenance_gate_drop_from_uplink"))
 	if err := flushStartupRules(); err != nil {
-		return fmt.Errorf("install host network maintenance routing rules: %w", err)
+		return fmt.Errorf("install maintenance TAP routing gates: %w", err)
 	}
 	addStartupRule(&nftables.Rule{Table: t, Chain: guard, Exprs: join(matchIIF(guestTapName), matchNFProto(unix.NFPROTO_IPV4), matchIPv4Masked(16, "10.0.3.0", "255.255.255.0"), drop())})
 	addStartupRule(&nftables.Rule{Table: t, Chain: guard, Exprs: join(matchIIF(guestTapName), matchNFProto(unix.NFPROTO_IPV4), matchIPv4(16, netip.MustParseAddr(UplinkHost)), drop())})
 	// Guest packets with any source other than the assigned address are dropped
 	// before routing, including spoofed management source-port attempts.
 	addStartupRule(&nftables.Rule{Table: t, Chain: guard, Exprs: join(matchIIF(guestTapName), matchNFProto(unix.NFPROTO_IPV4), matchIPv4Not(12, netip.MustParseAddr("10.0.2.15")), drop())})
-	for slot := 0; slot < maximumMaintenanceSessions; slot++ {
-		iface := "tun" + strconv.Itoa(slot)
-		guestIP := netip.AddrFrom4([4]byte{10, 0, 4, byte(2 + slot*2)})
-		addStartupRule(&nftables.Rule{Table: t, Chain: guard, Exprs: join(matchIIF(iface), matchNFProto(unix.NFPROTO_IPV6), drop())})
-		addStartupRule(&nftables.Rule{Table: t, Chain: guard, Exprs: join(matchIIF(iface), matchNFProto(unix.NFPROTO_IPV4), matchIPv4Not(12, guestIP), drop())})
-		addStartupRule(&nftables.Rule{Table: t, Chain: guard, Exprs: join(matchIIF(iface), matchNFProto(unix.NFPROTO_IPV4), lookupIPv4(12, "maintenance_network"), matchIPv4Masked(16, "10.0.3.0", "255.255.255.0"), drop())})
-		addStartupRule(&nftables.Rule{Table: t, Chain: pre, Exprs: join(matchIIF(iface), networkLive(), matchIPv4(12, guestIP), matchIPv4(16, netip.MustParseAddr(GuestGateway)), lookupIPv4(12, "maintenance_network"), natTo(expr.NATTypeDestNAT, UplinkHost))})
-	}
+	addStartupRule(&nftables.Rule{Table: t, Chain: guard, Exprs: join(matchIIF(maintenanceTapName), matchNFProto(unix.NFPROTO_IPV4), matchIPv4(12, netip.MustParseAddr(MaintenanceGuestAddress)), matchIPv4Masked(16, "10.0.3.0", "255.255.255.0"), drop())})
 	if err := flushStartupRules(); err != nil {
 		return fmt.Errorf("install maintenance interface anti-spoof and NAT rules: %w", err)
 	}
@@ -870,6 +727,7 @@ func installDefaultPolicy(launchID string) error {
 		number byte
 		set    string
 	}{{6, "tcp_forward_ports"}, {17, "udp_forward_ports"}} {
+		addStartupRule(&nftables.Rule{Table: t, Chain: pre, Exprs: join(matchIIF(maintenanceTapName), networkLive(), matchNFProto(unix.NFPROTO_IPV4), matchIPv4(12, netip.MustParseAddr(MaintenanceGuestAddress)), lookupIPv4(12, "maintenance_network"), matchL4(proto.number), matchIPv4(16, netip.MustParseAddr(GuestGateway)), natTo(expr.NATTypeDestNAT, UplinkHost))})
 		addStartupRule(&nftables.Rule{Table: t, Chain: pre, Exprs: join(matchIIF(uplinkTapName), matchL4(proto.number), matchIPv4(16, netip.MustParseAddr("10.0.3.100")), lookupPort(2, proto.set), natTo(expr.NATTypeDestNAT, "10.0.2.15"))})
 	}
 	// Explicit host alias: only TCP/UDP and only if the original destination
@@ -934,13 +792,6 @@ func installDefaultPolicy(launchID string) error {
 	// SNAT guest-originated egress to the slirp-side TAP address.
 	addStartupRule(&nftables.Rule{Table: t, Chain: post, Exprs: join(matchIPv4(12, netip.MustParseAddr("10.0.2.15")), natTo(expr.NATTypeSourceNAT, "10.0.3.100"))})
 	addStartupRule(&nftables.Rule{Table: t, Chain: post, Exprs: join(matchIPv4Masked(12, "10.0.4.0", "255.255.255.0"), natTo(expr.NATTypeSourceNAT, "10.0.3.100"))})
-	aliases := make([]nftables.SetElement, 0, 100)
-	for slot := 0; slot < maximumMaintenanceSessions; slot++ {
-		aliases = append(aliases, nftables.SetElement{Key: netip.AddrFrom4([4]byte{10, 0, 2, byte(64 + slot)}).AsSlice()})
-	}
-	if err := conn.SetAddElements(&nftables.Set{Table: t, Name: "maintenance_aliases", KeyType: nftables.TypeIPAddr}, aliases); err != nil {
-		return err
-	}
 	if err := flushStartupRules(); err != nil {
 		return err
 	}
@@ -985,6 +836,25 @@ func matchIPv4(offset uint32, addr netip.Addr) []expr.Any {
 }
 func matchIPv4Not(offset uint32, addr netip.Addr) []expr.Any {
 	return []expr.Any{&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offset, Len: 4}, &expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: addr.AsSlice()}}
+}
+func lookupIPv4Not(offset uint32, set string) []expr.Any {
+	return []expr.Any{&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offset, Len: 4}, &expr.Lookup{SourceRegister: 1, SetName: set, Invert: true}}
+}
+func gateRule(table *nftables.Table, chain *nftables.Chain, exprs []expr.Any, comment string) *nftables.Rule {
+	exprs = append(exprs, gateCounterExpr(comment), &expr.Verdict{Kind: expr.VerdictAccept})
+	return &nftables.Rule{Table: table, Chain: chain, Exprs: exprs, UserData: userdata.AppendString(nil, userdata.TypeComment, comment)}
+}
+func gateDrop(table *nftables.Table, chain *nftables.Chain, exprs []expr.Any, comment string) *nftables.Rule {
+	exprs = append(exprs, gateCounterExpr(comment), &expr.Verdict{Kind: expr.VerdictDrop})
+	return &nftables.Rule{Table: table, Chain: chain, Exprs: exprs, UserData: userdata.AppendString(nil, userdata.TypeComment, comment)}
+}
+func gateCounterExpr(comment string) expr.Any {
+	switch comment {
+	case "maintenance_gate_accept_to_uplink", "maintenance_gate_accept_from_uplink", "maintenance_gate_drop_to_uplink", "maintenance_gate_drop_from_uplink":
+		return &expr.Objref{Type: int(nftables.ObjTypeCounter), Name: comment}
+	default:
+		return &expr.Counter{}
+	}
 }
 func matchPort(offset uint32, port uint16) []expr.Any {
 	return []expr.Any{&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: offset, Len: 2}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{byte(port >> 8), byte(port)}}}
@@ -1087,6 +957,10 @@ func helperRequestDeadline(req helperRequest) time.Time {
 
 func networkLive() []expr.Any {
 	return []expr.Any{&expr.Immediate{Register: 1, Data: []byte{0, 0, 0, 0}}, &expr.Lookup{SourceRegister: 1, SetName: "network_live"}}
+}
+
+func networkLiveNot() []expr.Any {
+	return []expr.Any{&expr.Immediate{Register: 1, Data: []byte{0, 0, 0, 0}}, &expr.Lookup{SourceRegister: 1, SetName: "network_live", Invert: true}}
 }
 
 func setNetworkLiveLease(previous *time.Time, deadline time.Time, requestNotAfter time.Time) error {

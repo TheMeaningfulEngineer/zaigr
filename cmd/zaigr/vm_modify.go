@@ -614,15 +614,6 @@ func ensureUserSSHAccessContext(ctx context.Context, port string) error {
 		"chown root:root \"$config_tmp\"\n" +
 		"chmod 0644 \"$config_tmp\"\n" +
 		"mv -fT -- \"$config_tmp\" /etc/ssh/sshd_config.d/00-zaigr-managed-keys.conf\n" +
-		"tunnel_config=/etc/ssh/zaigr-maintenance-tunnel.conf\n" +
-		"tunnel_tmp=\"$(mktemp /etc/ssh/.zaigr-maintenance-tunnel.XXXXXX)\"\n" +
-		"printf '%s\\n' 'Match User root' '  PermitTunnel point-to-point' > \"$tunnel_tmp\"\n" +
-		"chown root:root \"$tunnel_tmp\"\n" +
-		"chmod 0644 \"$tunnel_tmp\"\n" +
-		"mv -fT -- \"$tunnel_tmp\" \"$tunnel_config\"\n" +
-		"main_config=/etc/ssh/sshd_config\n" +
-		"include_line='Include /etc/ssh/zaigr-maintenance-tunnel.conf'\n" +
-		"grep -Fqx -- \"$include_line\" \"$main_config\" || printf '%s\\n' \"$include_line\" >> \"$main_config\"\n" +
 		"sshd -t\n" +
 		"systemctl reload ssh\n" +
 		"trap - EXIT"

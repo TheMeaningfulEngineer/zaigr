@@ -1208,6 +1208,7 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 	var networkHandle *hostNetworkHandle
 	var networkExitWriter *os.File
 	var qemuTap *os.File
+	var qemuMaintenanceTap *os.File
 	var recordMu sync.Mutex
 	networkCleanupFailed := false
 	defer func() {
@@ -1221,6 +1222,10 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 		if qemuTap != nil {
 			_ = qemuTap.Close()
 			qemuTap = nil
+		}
+		if qemuMaintenanceTap != nil {
+			_ = qemuMaintenanceTap.Close()
+			qemuMaintenanceTap = nil
 		}
 		if retErr != nil && !committed {
 			_, _ = fmt.Fprintf(ready, "{\"state\":\"error\",\"message\":%q}\n", retErr.Error())
@@ -1267,11 +1272,11 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 			}
 		case "qemu":
 			if spec.NetworkBackend == vmNetworkBackendHost {
-				if qemuTap == nil {
+				if qemuTap == nil || qemuMaintenanceTap == nil {
 					_ = log.Close()
-					return errors.New("host network TAP descriptor is unavailable")
+					return errors.New("host network TAP descriptors are unavailable")
 				}
-				child.ExtraFiles = []*os.File{qemuTap}
+				child.ExtraFiles = []*os.File{qemuTap, qemuMaintenanceTap}
 			}
 		}
 		child.Stdout, child.Stderr = log, log
@@ -1282,6 +1287,8 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 		if name == "qemu" && qemuTap != nil {
 			_ = qemuTap.Close()
 			qemuTap = nil
+			_ = qemuMaintenanceTap.Close()
+			qemuMaintenanceTap = nil
 		}
 		_ = log.Close()
 		identity, err := vmProcessIdentity(child.Process.Pid)
@@ -1316,8 +1323,9 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 		}
 		networkExitWriter = networkHandle.TakeSupervisorExitWriter()
 		qemuTap = networkHandle.TakeTapFile()
-		if networkExitWriter == nil || qemuTap == nil {
-			return errors.New("host network backend did not provide TAP and supervisor exit descriptors")
+		qemuMaintenanceTap = networkHandle.TakeMaintenanceTapFile()
+		if networkExitWriter == nil || qemuTap == nil || qemuMaintenanceTap == nil {
+			return errors.New("host network backend did not provide guest and maintenance TAPs and supervisor exit descriptor")
 		}
 		status, err := networkHandle.Status(context.Background())
 		if err != nil {

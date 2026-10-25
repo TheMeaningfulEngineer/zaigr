@@ -23,38 +23,39 @@ import (
 )
 
 type linuxRuntime struct {
-	mu            sync.Mutex
-	opts          Options
-	launchID      string
-	generation    uint64
-	grants        []netip.Addr
-	conn          *net.UnixConn
-	responses     *bufio.Scanner
-	tap           *os.File
-	dnsUDP        *os.File
-	dnsTCP        *os.File
-	exitWriter    *os.File
-	helper        *exec.Cmd
-	slirp         *exec.Cmd
-	apiSocket     string
-	eventRead     *os.File
-	eventMu       sync.Mutex
-	eventChanged  chan struct{}
-	events        []FirewallEvent
-	eventSequence uint64
-	recentEvents  map[string]firewallEventState
-	eventClosed   bool
-	forward       []Forward
-	forwardIDs    map[Forward]string
-	stopped       bool
-	identities    map[string]ProcessIdentity
-	exits         chan ChildExit
-	helperDone    chan error
-	slirpDone     chan error
-	helperExited  chan struct{}
-	slirpExited   chan struct{}
-	helperExitErr error
-	slirpExitErr  error
+	mu             sync.Mutex
+	opts           Options
+	launchID       string
+	generation     uint64
+	grants         []netip.Addr
+	conn           *net.UnixConn
+	responses      *bufio.Scanner
+	tap            *os.File
+	maintenanceTap *os.File
+	dnsUDP         *os.File
+	dnsTCP         *os.File
+	exitWriter     *os.File
+	helper         *exec.Cmd
+	slirp          *exec.Cmd
+	apiSocket      string
+	eventRead      *os.File
+	eventMu        sync.Mutex
+	eventChanged   chan struct{}
+	events         []FirewallEvent
+	eventSequence  uint64
+	recentEvents   map[string]firewallEventState
+	eventClosed    bool
+	forward        []Forward
+	forwardIDs     map[Forward]string
+	stopped        bool
+	identities     map[string]ProcessIdentity
+	exits          chan ChildExit
+	helperDone     chan error
+	slirpDone      chan error
+	helperExited   chan struct{}
+	slirpExited    chan struct{}
+	helperExitErr  error
+	slirpExitErr   error
 }
 
 func startLinux(ctx context.Context, opts Options) (Runtime, error) {
@@ -146,8 +147,8 @@ func startLinux(ctx context.Context, opts Options) (Runtime, error) {
 	}
 	r.conn = conn
 	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
-	// The first framed helper message carries the TAP descriptor. The descriptor
-	// is never exposed in guest storage or to the DNS frontend.
+	// The first framed helper message carries both TAP descriptors and the DNS
+	// sockets. TAP descriptors are never exposed in guest storage or to DNS.
 	buf := make([]byte, 4096)
 	oob := make([]byte, unix.CmsgSpace(4*unix.SizeofInt))
 	n, oobn, flags, _, err := conn.ReadMsgUnix(buf, oob)
@@ -182,16 +183,17 @@ func startLinux(ctx context.Context, opts Options) (Runtime, error) {
 		return nil, errors.New("invalid host network descriptor readiness marker")
 	}
 	_ = conn.SetReadDeadline(time.Time{})
-	if len(received) != 3 {
+	if len(received) != 4 {
 		closeReceived()
-		return nil, fmt.Errorf("host network helper transferred %d descriptors, want TAP and DNS sockets", len(received))
+		return nil, fmt.Errorf("host network helper transferred %d descriptors, want two TAPs and DNS sockets", len(received))
 	}
 	for _, fd := range received {
 		unix.CloseOnExec(fd)
 	}
 	r.tap = os.NewFile(uintptr(received[0]), "zaigr-guest-tap")
-	r.dnsUDP = os.NewFile(uintptr(received[1]), "zaigr-dns-udp")
-	r.dnsTCP = os.NewFile(uintptr(received[2]), "zaigr-dns-tcp")
+	r.maintenanceTap = os.NewFile(uintptr(received[1]), "zaigr-maintenance-tap")
+	r.dnsUDP = os.NewFile(uintptr(received[2]), "zaigr-dns-udp")
+	r.dnsTCP = os.NewFile(uintptr(received[3]), "zaigr-dns-tcp")
 	r.responses = bufio.NewScanner(conn)
 	r.responses.Buffer(make([]byte, 4096), 1<<20)
 	// Start slirp with a dedicated read end. The only writer is returned to the
@@ -310,6 +312,13 @@ func (r *linuxRuntime) TakeTapFile() *os.File {
 	r.tap = nil
 	return f
 }
+func (r *linuxRuntime) TakeMaintenanceTapFile() *os.File {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	f := r.maintenanceTap
+	r.maintenanceTap = nil
+	return f
+}
 func (r *linuxRuntime) TakeDNSSockets() (*os.File, *os.File) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -360,20 +369,16 @@ func (r *linuxRuntime) SetFullNetworkLease(ctx context.Context, launchID string,
 	return r.requestContext(ctx, helperRequest{Operation: "set-full-network-lease", LaunchID: launchID, Generation: r.generation, Deadline: deadlineNano})
 }
 
-func (r *linuxRuntime) StartMaintenanceSession(ctx context.Context, launchID, sessionID, keyPath string, deadline time.Time) (MaintenanceSession, error) {
+func (r *linuxRuntime) StartMaintenanceSession(ctx context.Context, launchID, sessionID string, deadline time.Time) (MaintenanceSession, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if launchID != r.launchID || sessionID == "" || !filepath.IsAbs(keyPath) {
-		return MaintenanceSession{}, errors.New("maintenance session identity or SSH key path is invalid")
+	if launchID != r.launchID || sessionID == "" {
+		return MaintenanceSession{}, errors.New("maintenance session identity is invalid")
 	}
 	if !deadline.After(time.Now()) || deadline.After(time.Now().Add(maximumKernelLease)) {
 		return MaintenanceSession{}, errors.New("maintenance session deadline is outside the kernel bound")
 	}
-	response, err := r.requestContextReply(ctx, helperRequest{Operation: "start-maintenance-session", LaunchID: launchID, Generation: r.generation, SessionID: sessionID, KeyPath: keyPath, Deadline: deadline.UnixNano()})
-	if err != nil {
-		return MaintenanceSession{}, err
-	}
-	alias, err := netip.ParseAddr(response.HostAlias)
+	response, err := r.requestContextReply(ctx, helperRequest{Operation: "start-maintenance-session", LaunchID: launchID, Generation: r.generation, SessionID: sessionID, Deadline: deadline.UnixNano()})
 	if err != nil {
 		return MaintenanceSession{}, err
 	}
@@ -385,7 +390,10 @@ func (r *linuxRuntime) StartMaintenanceSession(ctx context.Context, launchID, se
 	if err != nil {
 		return MaintenanceSession{}, err
 	}
-	return MaintenanceSession{TunnelIndex: response.TunnelIndex, HostAlias: alias, HostAddress: host, GuestAddress: guest}, nil
+	if host.String() != MaintenanceHostAddress || guest.String() != MaintenanceGuestAddress {
+		return MaintenanceSession{}, errors.New("helper returned unexpected maintenance addresses")
+	}
+	return MaintenanceSession{HostAddress: host, GuestAddress: guest}, nil
 }
 
 func (r *linuxRuntime) RenewMaintenanceSession(ctx context.Context, launchID, sessionID string, deadline time.Time) error {
@@ -726,6 +734,10 @@ func (r *linuxRuntime) Stop(ctx context.Context) error {
 	if r.tap != nil {
 		_ = r.tap.Close()
 		r.tap = nil
+	}
+	if r.maintenanceTap != nil {
+		_ = r.maintenanceTap.Close()
+		r.maintenanceTap = nil
 	}
 	closeFiles(r.dnsUDP, r.dnsTCP)
 	r.dnsUDP = nil

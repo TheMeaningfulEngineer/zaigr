@@ -988,6 +988,7 @@ func buildQEMUArgsWithContext(imagePath, kernelPath, format string, snapshot boo
 	}
 
 	netdev := "tap,id=net0,fd=3"
+	maintenanceNetdev := "tap,id=maintenance,fd=4"
 	args := []string{
 		"qemu-system-x86_64",
 		"-M", "microvm,acpi=off,auto-kernel-cmdline=on,isa-serial=on",
@@ -1009,6 +1010,8 @@ func buildQEMUArgsWithContext(imagePath, kernelPath, format string, snapshot boo
 		"-append", strings.Join(appendParts, " "),
 		"-netdev", netdev,
 		"-device", "virtio-net-device,netdev=net0",
+		"-netdev", maintenanceNetdev,
+		"-device", "virtio-net-device,netdev=maintenance,mac=52:54:00:5a:47:52",
 	}
 
 	if snapshot {

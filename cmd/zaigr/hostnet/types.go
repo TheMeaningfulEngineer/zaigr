@@ -12,11 +12,13 @@ import (
 )
 
 const (
-	GuestAddress = "10.0.2.15/24"
-	GuestGateway = "10.0.2.2"
-	GuestDNS     = "10.0.2.3"
-	UplinkCIDR   = "10.0.3.0/24"
-	UplinkHost   = "10.0.3.2"
+	GuestAddress            = "10.0.2.15/24"
+	GuestGateway            = "10.0.2.2"
+	GuestDNS                = "10.0.2.3"
+	UplinkCIDR              = "10.0.3.0/24"
+	UplinkHost              = "10.0.3.2"
+	MaintenanceHostAddress  = "10.0.4.1"
+	MaintenanceGuestAddress = "10.0.4.2"
 )
 
 // Options describes the trusted, host-owned inputs needed to create one
@@ -76,19 +78,17 @@ type FirewallEvent struct {
 	Reason          string     `json:"reason,omitempty"`
 }
 
-// MaintenanceSession identifies one authenticated point-to-point SSH tunnel.
-// The addresses are allocated by the host helper and are never guest inputs.
+// MaintenanceSession identifies one shared maintenance-network lease. These
+// fixed addresses are host-owned and are never selected by guest input.
 type MaintenanceSession struct {
-	TunnelIndex  int
-	HostAlias    netip.Addr
 	HostAddress  netip.Addr
 	GuestAddress netip.Addr
 }
 
-// Runtime is the host controller handle for a running network. TapFD is
-// TakeTapFile transfers the one host-side descriptor to its caller exactly
-// once. The caller must close it after QEMU inherits it. Runtime.Stop never
-// closes a descriptor after that transfer.
+// Runtime is the host controller handle for a running network. TakeTapFile
+// and TakeMaintenanceTapFile each transfer one host-side descriptor to the
+// caller exactly once. The caller must close them after QEMU inherits them.
+// Runtime.Stop never closes a descriptor after that transfer.
 type Runtime interface {
 	LaunchID() string
 	Generation() uint64
@@ -96,12 +96,13 @@ type Runtime interface {
 	ChildExits() <-chan ChildExit
 	NextFirewallEvent(context.Context, uint64) (FirewallEvent, error)
 	TakeTapFile() *os.File
+	TakeMaintenanceTapFile() *os.File
 	TakeDNSSockets() (*os.File, *os.File)
 	TakeSupervisorExitWriter() *os.File
 	ApplyPolicy(context.Context, PolicySnapshot) error
 	SetNetworkLease(context.Context, string, time.Time) error
 	SetFullNetworkLease(context.Context, string, time.Time) error
-	StartMaintenanceSession(context.Context, string, string, string, time.Time) (MaintenanceSession, error)
+	StartMaintenanceSession(context.Context, string, string, time.Time) (MaintenanceSession, error)
 	RenewMaintenanceSession(context.Context, string, string, time.Time) error
 	StopMaintenanceSession(context.Context, string, string) error
 	ReplaceDNSLeases(context.Context, string, uint64, map[string]map[netip.Addr]time.Time, map[string]time.Time) error

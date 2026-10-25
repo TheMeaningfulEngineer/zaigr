@@ -251,16 +251,17 @@ Run this command on the host:
 zaigr shell --root --full-network
 ```
 
-It opens a root maintenance shell in a private network namespace, with temporary
-broad IPv4 TCP/UDP access, including private networks and host data services.
-Only that shell and its descendants use the maintenance tunnel. Existing model
-processes and ordinary shells retain their normal network policy.
+It opens a root maintenance shell in the VM's shared maintenance network
+namespace, with temporary broad IPv4 TCP/UDP access, including private networks
+and host data services. Existing model processes and ordinary shells retain
+their normal network policy. Concurrent maintenance sessions share the same
+network namespace; a process left running after one session exits keeps access
+while another maintenance session remains active.
 
 The filesystem is shared, so tools you install remain available afterward.
-Exit the shell to revoke its network access; if the owning host command dies,
-a host-kernel deadline expires the grant. `--root` alone keeps restricted
-networking. `--full-network` requires `--root` and cannot be combined with
-`--preset` or `--setup`.
+Access ends when the last maintenance session exits or its host-kernel lease
+expires. `--root` alone keeps restricted networking. `--full-network` requires
+`--root` and cannot be combined with `--preset` or `--setup`.
 
 Maintenance requires that the model cannot become guest root. The built-in
 `docker` and `k3s` setups give the model root-equivalent access, so images with

@@ -279,10 +279,14 @@ def test_full_network_is_private_to_root_maintenance_session_and_revoked(
 
 
 @pytest.mark.timeout(240)
-def test_full_network_sessions_are_independent(project, host_network_endpoints, request):
-    """Closing one root maintenance session leaves its concurrent peer authorized."""
+def test_full_network_sessions_share_one_maintenance_lease(
+    project, host_network_endpoints, host_network_dns, dns_probe_binary, request
+):
+    """An ended shell retains access only while another shared-lease shell remains open."""
     zaigr = project.zaigr_bin
     endpoint = host_network_endpoints
+    resolver = host_network_dns["resolver"]
+    assert dns_probe_binary.is_file()
     host_url = f"http://10.0.2.2:{endpoint['tcp_port']}/"
     checked_run([zaigr, "project", "vm", "start"], cwd=project.cwd, env=project.env,
                 input="y\n", timeout=180)
@@ -300,17 +304,43 @@ def test_full_network_sessions_are_independent(project, host_network_endpoints, 
     )
     assert endpoint["token"] in run_in_shell(first, f"curl --noproxy '*' -4fsS {host_url}")
     assert endpoint["token"] in run_in_shell(second, f"curl --noproxy '*' -4fsS {host_url}")
+    first_public_dns = run_in_shell(first, "cd /home/user/workspace && ./dns_probe udp arbitrary.test")
+    first_private_dns = run_in_shell(first, "cd /home/user/workspace && ./dns_probe udp private.test")
+    assert "rcode=0" in first_public_dns and "a=93.184.216.34" in first_public_dns, first_public_dns
+    assert "rcode=0" in first_private_dns and "a=192.168.1.12" in first_private_dns, first_private_dns
     assert_full_network_sessions(
         checked_run([zaigr, "project", "firewall", "show"], cwd=project.cwd, env=project.env),
         2, full_network=0, maintenance=2,
     )
 
+    # The guest maintenance NIC and namespace are shared by all sessions.
+    # A background process outlives its shell but keeps the shared lease.
+    shared_stream = project.cwd / "full-network-shared-namespace-stream.log"
+    run_in_shell(
+        first,
+        f"nohup curl --noproxy '*' -4fsSN --max-time 120 {host_url}stream "
+        f"> /home/user/workspace/{shared_stream.name} 2>&1 < /dev/null &",
+    )
+    wait_text(shared_stream, endpoint["token"])
     exit_shell(first)
     assert_full_network_sessions(
         checked_run([zaigr, "project", "firewall", "show"], cwd=project.cwd, env=project.env),
         1, full_network=0, maintenance=1,
     )
+    shared_length = len(shared_stream.read_bytes())
+    time.sleep(0.5)
+    assert len(shared_stream.read_bytes()) > shared_length, (
+        "an ended shell's background process lost maintenance access while another shell remained"
+    )
     assert endpoint["token"] in run_in_shell(second, f"curl --noproxy '*' -4fsS {host_url}")
+    shared_public_dns = run_in_shell(
+        second, "cd /home/user/workspace && ./dns_probe udp arbitrary.test"
+    )
+    shared_private_dns = run_in_shell(
+        second, "cd /home/user/workspace && ./dns_probe udp private.test"
+    )
+    assert "rcode=0" in shared_public_dns and "a=93.184.216.34" in shared_public_dns, shared_public_dns
+    assert "rcode=0" in shared_private_dns and "a=192.168.1.12" in shared_private_dns, shared_private_dns
     ordinary = checked_run(
         [zaigr, "project", "vm", "exec", "--", "bash", "-c",
          (f"if curl --noproxy '*' -4fsS --connect-timeout 2 --max-time 4 {host_url}; "
@@ -324,6 +354,16 @@ def test_full_network_sessions_are_independent(project, host_network_endpoints, 
         checked_run([zaigr, "project", "firewall", "show"], cwd=project.cwd, env=project.env),
         0, full_network=0, maintenance=0,
     )
+    denied_after_last_session = _run(
+        [zaigr, "project", "vm", "exec", "--", "curl", "--noproxy", "*", "-4fsS",
+         "--connect-timeout", "2", "--max-time", "4", host_url],
+        cwd=project.cwd, env=project.env, timeout=20,
+    )
+    assert denied_after_last_session[2] != 0, err_msg(
+        denied_after_last_session[0], denied_after_last_session[1]
+    )
+    assert endpoint["token"] not in denied_after_last_session[0] + denied_after_last_session[1]
+    assert resolver.count("arbitrary.test") >= 2 and resolver.count("private.test") >= 2
 
 
 @pytest.mark.timeout(240)
@@ -874,246 +914,238 @@ def test_full_network_lease_expires_when_owner_supervisor_is_stopped(
     assert endpoint["token"] not in denied[0] + denied[1]
 
 
-@pytest.mark.timeout(480)
-def test_maintenance_outer_ssh_payload_is_gated_after_owner_expiry(
+def host_maintenance_nft(project, record, *arguments):
+    """Run nft in the host helper's private network namespace."""
+    helper_pid = record["network_processes"]["hostnet-helper"]["pid"]
+    command = [
+        "nsenter", "--target", str(helper_pid), "--user", "--net",
+        "--preserve-credentials", "/usr/sbin/nft", *arguments,
+    ]
+    stdout, stderr, code = _run(command, cwd=project.cwd, env=project.env, timeout=15)
+    assert code == 0, err_msg(stdout, stderr)
+    return stdout
+
+
+def maintenance_gate_counters(project, record):
+    """Read the four shared named counter objects used by the production gate."""
+    expected = (
+        "maintenance_gate_accept_to_uplink",
+        "maintenance_gate_accept_from_uplink",
+        "maintenance_gate_drop_to_uplink",
+        "maintenance_gate_drop_from_uplink",
+    )
+    counts = {}
+    for name in expected:
+        output = host_maintenance_nft(
+            project, record, "-j", "list", "counter", "inet", "zaigr", name
+        )
+        ruleset = json.loads(output)
+        matches = [
+            entry["counter"] for entry in ruleset["nftables"]
+            if "counter" in entry and entry["counter"].get("name") == name
+        ]
+        assert len(matches) == 1, (name, output)
+        counts[name] = int(matches[0]["packets"])
+    return counts
+
+
+def guest_udp_counts(path):
+    """Return the latest send and receive totals written by the guest UDP probe."""
+    if not path.exists():
+        return 0, 0
+    rows = re.findall(
+        r"(?m)^GUEST_SENT=(\d+) GUEST_RECEIVED=(\d+)\r?$",
+        path.read_text(errors="replace"),
+    )
+    return tuple(map(int, rows[-1])) if rows else (0, 0)
+
+
+@pytest.mark.timeout(300)
+def test_maintenance_nic_lease_expires_with_bidirectional_udp_accounting(
     project, host_network_endpoints, request
 ):
-    """Expired maintenance leases drop queued SSH-tunnel payload at the host gate."""
+    """Every datagram admitted by tap-maint before expiry is the full residual."""
     zaigr = project.zaigr_bin
     endpoint = host_network_endpoints
-    stream_url = f"http://10.0.2.2:{endpoint['tcp_port']}/stream"
-    stream_file = project.cwd / "maintenance-outer-ssh-gate-stream.log"
-    guest_stream_file = f"/home/user/workspace/{stream_file.name}"
-    table = "zaigr_maintenance_outer_gate"
-    supervisor_stopped = False
-    table_created = False
+    source = "tests/cli/host_network_fixture/udp_lease_stream.c"
+    probe = project.cwd / "maintenance-udp-lease-stream"
+    stdout, stderr, code = _run(
+        ["gcc", "-static", "-O2", "-Wall", "-Wextra", "-Werror", "-o", probe, source],
+        timeout=30,
+    )
+    assert code == 0, err_msg(stdout, stderr)
 
     checked_run(
-        [zaigr, "project", "vm", "start"],
-        cwd=project.cwd,
-        env=project.env,
-        input="y\n",
-        timeout=180,
+        [zaigr, "project", "vm", "start"], cwd=project.cwd, env=project.env,
+        input="y\n", timeout=180,
     )
+    control = open_shell(shlex.quote(str(zaigr)) + " shell", project, request)
     maintenance = open_shell(
-        shlex.quote(str(zaigr)) + " shell --root --full-network",
-        project,
-        request,
-        full_network=True,
-        root=True,
+        shlex.quote(str(zaigr)) + " shell --root --full-network", project, request,
+        full_network=True, root=True,
     )
+    udp_log = project.cwd / "maintenance-udp-lease-stream.log"
+    record = json.loads((project.store_dir / "vm-supervisor.json").read_text())
+    assert record["supervisor"]["pid"] > 1, record
+    assert "hostnet-helper" in record["network_processes"], record
+    set_before = host_maintenance_nft(
+        project, record, "list", "set", "inet", "zaigr", "maintenance_network"
+    )
+    assert re.search(r"(?<!\d)10\.0\.4\.2(?!\d)", set_before), set_before
+    command_output = run_in_shell(
+        maintenance,
+        f"nohup /home/user/workspace/{probe.name} 10.0.2.2 {endpoint['udp_port']} "
+        f"45123 > /home/user/workspace/{udp_log.name} 2>&1 < /dev/null & "
+        "printf 'UDP_STREAM_PID=%s\\n' \"$!\"",
+    )
+    pid_match = re.search(r"(?m)^UDP_STREAM_PID=(\d+)\r?$", command_output)
+    assert pid_match, command_output
+    stream_pid = pid_match.group(1)
+    endpoint["start_udp_peer"]()
 
-    def guest_root(*command):
-        return checked_run(
-            [zaigr, "project", "vm", "exec", "--root", "--", *command],
-            cwd=project.cwd,
-            env=project.env,
-            input="y\n",
-            timeout=30,
-        )
+    positive_deadline = time.monotonic() + 12
+    positive = maintenance_gate_counters(project, record)
+    while time.monotonic() < positive_deadline:
+        guest_sent, guest_received = guest_udp_counts(udp_log)
+        host_counts = endpoint["request_counts"]()
+        positive = maintenance_gate_counters(project, record)
+        if guest_sent > 10 and guest_received > 10 and host_counts["udp"] > 10:
+            break
+        time.sleep(0.2)
+    guest_sent, guest_received = guest_udp_counts(udp_log)
+    host_counts = endpoint["request_counts"]()
+    assert guest_sent > 10 and guest_received > 10, udp_log.read_text()
+    assert host_counts["udp"] > 10 and host_counts["udp_peer_sent"] > 10, host_counts
+    assert positive["maintenance_gate_accept_to_uplink"] > 0, positive
+    assert positive["maintenance_gate_accept_from_uplink"] > 0, positive
+    assert "CONTROL_POSITIVE" in run_in_shell(control, "printf CONTROL_POSITIVE")
 
-    def chain_packets(chain):
-        output = run_in_shell(
-            maintenance,
-            f"nsenter -t 1 -n nft list chain inet {table} {chain}",
-        )
-        counters = re.findall(r"counter packets (\d+) bytes (\d+)", output)
-        assert len(counters) == 1, output
-        packets, byte_count = (int(value) for value in counters[0])
-        assert packets == 0 or byte_count >= packets * 129, output
-        return packets, byte_count
-
-    def add_hold_chain(outer_alias):
-        guest_root(
-            "bash",
-            "-c",
-            f"nft 'add chain inet {table} hold {{ type filter hook prerouting priority -301; policy accept; }}'",
-        )
-        guest_root(
-            "nft",
-            "add",
-            "rule",
-            "inet",
-            table,
-            "hold",
-            "ip",
-            "saddr",
-            outer_alias,
-            "tcp",
-            "dport",
-            "22",
-            "meta",
-            "length",
-            "gt",
-            "128",
-            "counter",
-            "drop",
-        )
-
+    supervisor_stopped = False
+    helper_stopped = False
     try:
-        # nftables is not part of the minimal guest image. Install it through
-        # the root maintenance shell, as in the user's ad-hoc tool workflow.
-        run_in_shell(maintenance, "apt-get update")
-        run_in_shell(
-            maintenance,
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y nftables",
-        )
-        assert "/nft" in run_in_shell(maintenance, "command -v nft")
-
-        run_in_shell(
-            maintenance,
-            f"nohup curl --noproxy '*' -4fsSN --max-time 120 {shlex.quote(stream_url)} "
-            f"> {shlex.quote(guest_stream_file)} 2>&1 < /dev/null &",
-        )
-        wait_text(stream_file, endpoint["token"])
-        assert stream_file.stat().st_size > 0
-
-        # Read the actual established peer so the guest-only hold targets the
-        # dedicated tunnel, not the separate management SSH connection.
-        established = guest_root(
-            "ss", "-Htn", "state", "established", "( sport = :22 )"
-        )
-        outer_aliases = set(
-            re.findall(r"\b10\.0\.2\.(?:6[4-9]|7[01]):\d+\b", established)
-        )
-        assert len(outer_aliases) == 1, established
-        outer_alias = next(iter(outer_aliases)).rsplit(":", 1)[0]
-        guest_root("nft", "add", "table", "inet", table)
-        table_created = True
-        guest_root(
-            "bash",
-            "-c",
-            f"nft 'add chain inet {table} observe {{ type filter hook prerouting priority -302; policy accept; }}'",
-        )
-        guest_root(
-            "nft",
-            "add",
-            "rule",
-            "inet",
-            table,
-            "observe",
-            "ip",
-            "saddr",
-            outer_alias,
-            "tcp",
-            "dport",
-            "22",
-            "meta",
-            "length",
-            "gt",
-            "128",
-            "counter",
-        )
-        add_hold_chain(outer_alias)
-
-        initial_body = stream_file.stat().st_size
-        initial_observed, initial_observed_bytes = chain_packets("observe")
-        initial_dropped, initial_dropped_bytes = chain_packets("hold")
-        deadline = time.monotonic() + 15
-        while initial_dropped == 0 and time.monotonic() < deadline:
-            time.sleep(0.25)
-            initial_observed, initial_observed_bytes = chain_packets("observe")
-            initial_dropped, initial_dropped_bytes = chain_packets("hold")
-        assert initial_dropped > 0, "guest hold did not drop outer SSH payload packets"
-        assert initial_observed >= initial_dropped > 0
-        assert endpoint["request_counts"]()["stream_pushes"] > 0
-        print(
-            "OUTER_GATE_HELD "
-            f"peer={outer_alias} observed_packets={initial_observed} "
-            f"observed_bytes={initial_observed_bytes} dropped_packets={initial_dropped} "
-            f"dropped_bytes={initial_dropped_bytes} body_bytes={initial_body}"
-        )
-
-        # Removing only the guest hold before expiry is a live positive
-        # control: the observer and downloaded body both advance.
-        run_in_shell(
-            maintenance,
-            f"nsenter -t 1 -n nft delete chain inet {table} hold",
-        )
-        time.sleep(1)
-        assert stream_file.stat().st_size > initial_body
-        live_control_packets, live_control_bytes = chain_packets("observe")
-        assert live_control_packets > initial_observed
-        live_control_body = stream_file.stat().st_size
-        print(
-            "OUTER_GATE_LIVE_CONTROL "
-            f"observed_packets={live_control_packets} observed_bytes={live_control_bytes} "
-            f"body_bytes={live_control_body}"
-        )
-        add_hold_chain(outer_alias)
-        hold_packets, hold_bytes = chain_packets("hold")
-        hold_deadline = time.monotonic() + 10
-        while hold_packets == 0 and time.monotonic() < hold_deadline:
-            time.sleep(0.25)
-            hold_packets, hold_bytes = chain_packets("hold")
-        assert hold_packets > 0, "reinstalled guest hold saw no outer SSH payload"
-        held_body = stream_file.stat().st_size
-        print(
-            "OUTER_GATE_REFROZEN "
-            f"observed_packets={live_control_packets} hold_packets={hold_packets} "
-            f"hold_bytes={hold_bytes} body_bytes={held_body}"
-        )
-
-        record = json.loads((project.store_dir / "vm-supervisor.json").read_text())
-        assert record["supervisor"]["pid"] > 1, record
         signal_recorded_process(record, "supervisor", signal.SIGSTOP)
         supervisor_stopped = True
-
-        # The host helper and its SSH child remain alive while the supervisor
-        # cannot renew the bounded host lease.
-        freeze_started = time.monotonic()
-        time.sleep(12)
-        freeze_elapsed = time.monotonic() - freeze_started
-        observed_before_release, observed_bytes_before_release = chain_packets("observe")
-        dropped_after_expiry, dropped_bytes_after_expiry = chain_packets("hold")
-        body_before_release = stream_file.stat().st_size
-        assert dropped_after_expiry >= hold_packets
-        assert body_before_release == held_body, (
-            "the guest download progressed while the exact outer SSH flow was held"
+        signal_recorded_process(
+            record, "hostnet-helper", signal.SIGSTOP, network_process=True
         )
-        print(
-            "OUTER_GATE_EXPIRED "
-            f"frozen_seconds={freeze_elapsed:.2f} observed_packets={observed_before_release} "
-            f"observed_bytes={observed_bytes_before_release} "
-            f"held_packets={dropped_after_expiry} held_bytes={dropped_bytes_after_expiry} "
-            f"body_bytes={body_before_release}"
-        )
+        helper_stopped = True
+        assert "CONTROL_HELD" in run_in_shell(control, "printf CONTROL_HELD")
 
-        # Remove the guest-only hold after the host lease deadline. If outer
-        # packets are still authorized, this active response will resume.
-        run_in_shell(
+        expiry_deadline = time.monotonic() + 18
+        set_at_expiry = set_before
+        while time.monotonic() < expiry_deadline:
+            set_at_expiry = host_maintenance_nft(
+                project, record, "list", "set", "inet", "zaigr", "maintenance_network"
+            )
+            if not re.search(r"(?<!\d)10\.0\.4\.2(?!\d)", set_at_expiry):
+                break
+            time.sleep(0.2)
+        assert not re.search(r"(?<!\d)10\.0\.4\.2(?!\d)", set_at_expiry), set_at_expiry
+        accepted_at_expiry = maintenance_gate_counters(project, record)
+        assert accepted_at_expiry["maintenance_gate_accept_to_uplink"] > 0, accepted_at_expiry
+        assert accepted_at_expiry["maintenance_gate_accept_from_uplink"] > 0, accepted_at_expiry
+        counts_at_expiry = endpoint["request_counts"]()
+        guest_at_expiry = guest_udp_counts(udp_log)
+        assert "CONTROL_EXPIRED" in run_in_shell(control, "printf CONTROL_EXPIRED")
+        new_connection = run_in_shell(
             maintenance,
-            f"nsenter -t 1 -n nft delete chain inet {table} hold",
+            f"if curl --noproxy '*' -4fsS --connect-timeout 2 --max-time 4 "
+            f"http://10.0.2.2:{endpoint['tcp_port']}/; then "
+            "printf 'PROBE_RESULT=ALLOWED\\n'; else printf 'PROBE_RESULT=DENIED\\n'; fi",
         )
-        time.sleep(12)
-        observed_after_release, observed_bytes_after_release = chain_packets("observe")
-        body_after_release = stream_file.stat().st_size
-        print(
-            "OUTER_GATE_AFTER_RELEASE "
-            f"observed_packets={observed_after_release} observed_bytes={observed_bytes_after_release} "
-            f"body_bytes={body_after_release}"
+        assert_probe_marker(new_connection, "DENIED")
+        assert endpoint["token"] not in new_connection
+        signal_recorded_process(
+            record, "hostnet-helper", signal.SIGCONT, network_process=True
         )
-        assert observed_after_release == observed_before_release, (
-            "outer SSH payload reached the guest after the host maintenance lease expired: "
-            f"before={observed_before_release}, after={observed_after_release}"
+        helper_stopped = False
+        signal_recorded_process(record, "supervisor", signal.SIGCONT)
+        supervisor_stopped = False
+
+        assert "CONTROL_RELEASED" in run_in_shell(control, "printf CONTROL_RELEASED")
+        assert "CONTROL_RELEASED" in run_in_shell(maintenance, "printf CONTROL_RELEASED")
+        live_deadline = time.monotonic() + 8
+        network_live = ""
+        while time.monotonic() < live_deadline:
+            network_live = host_maintenance_nft(
+                project, record, "list", "set", "inet", "zaigr", "network_live"
+            )
+            if re.search(r"elements\s*=\s*\{\s*0(?:\s|[,}])", network_live):
+                break
+            time.sleep(0.2)
+        assert re.search(r"elements\s*=\s*\{\s*0(?:\s|[,}])", network_live), network_live
+        release_deadline = time.monotonic() + 8
+        set_after_release = set_at_expiry
+        while time.monotonic() < release_deadline:
+            set_after_release = host_maintenance_nft(
+                project, record, "list", "set", "inet", "zaigr", "maintenance_network"
+            )
+            if not re.search(r"(?<!\d)10\.0\.4\.2(?!\d)", set_after_release):
+                break
+            time.sleep(0.2)
+        assert not re.search(r"(?<!\d)10\.0\.4\.2(?!\d)", set_after_release), set_after_release
+        counters_after_release = maintenance_gate_counters(project, record)
+        time.sleep(1.2)
+        counters_later = maintenance_gate_counters(project, record)
+        assert counters_later["maintenance_gate_accept_to_uplink"] == accepted_at_expiry[
+            "maintenance_gate_accept_to_uplink"
+        ], (accepted_at_expiry, counters_later)
+        assert counters_later["maintenance_gate_accept_from_uplink"] == accepted_at_expiry[
+            "maintenance_gate_accept_from_uplink"
+        ], (accepted_at_expiry, counters_later)
+        drops_after_release = (
+            counters_after_release["maintenance_gate_drop_to_uplink"],
+            counters_after_release["maintenance_gate_drop_from_uplink"],
         )
-        assert body_after_release == body_before_release, (
-            "maintenance download received body bytes after the host lease expired: "
-            f"before={body_before_release}, after={body_after_release}"
+        drops_later = (
+            counters_later["maintenance_gate_drop_to_uplink"],
+            counters_later["maintenance_gate_drop_from_uplink"],
         )
+        assert drops_later[0] > drops_after_release[0], (drops_after_release, drops_later)
+        assert drops_later[1] > drops_after_release[1], (drops_after_release, drops_later)
+        assert endpoint["request_counts"]()["udp_peer_sent"] > counts_at_expiry["udp_peer_sent"]
+        guest_after_release = guest_udp_counts(udp_log)
+        assert guest_after_release[0] > guest_at_expiry[0], (
+            "guest UDP sender stopped while the host gate was denying its packets"
+        )
+        endpoint["stop_udp_peer"]()
+        run_in_shell(maintenance, f"kill -USR1 {stream_pid}")
+        drain_deadline = time.monotonic() + 6
+        while time.monotonic() < drain_deadline and "GUEST_STREAM_DRAINED=1" not in udp_log.read_text():
+            time.sleep(0.2)
+        assert "GUEST_STREAM_DRAINED=1" in udp_log.read_text(), udp_log.read_text()
+        final_guest_counts = guest_udp_counts(udp_log)
+        assert final_guest_counts[0] > 0, udp_log.read_text()
+        assert endpoint["request_counts"]()["udp"] <= accepted_at_expiry[
+            "maintenance_gate_accept_to_uplink"
+        ], endpoint["request_counts"]()
+        assert final_guest_counts[1] <= accepted_at_expiry[
+            "maintenance_gate_accept_from_uplink"
+        ], (final_guest_counts, accepted_at_expiry)
+        assert "CONTROL_AFTER_EXPIRY" in run_in_shell(control, "printf CONTROL_AFTER_EXPIRY")
+        request.node.user_properties.append((
+            "maintenance_udp_gate",
+            json.dumps({
+                "accepted_at_expiry": accepted_at_expiry,
+                "counters_later": counters_later,
+                "final_guest_counts": {
+                    "sent": final_guest_counts[0],
+                    "received": final_guest_counts[1],
+                },
+                "host_request_counts": endpoint["request_counts"](),
+            }, sort_keys=True),
+        ))
     finally:
+        if helper_stopped:
+            signal_recorded_process(
+                record, "hostnet-helper", signal.SIGCONT, network_process=True
+            )
         if supervisor_stopped:
             signal_recorded_process(record, "supervisor", signal.SIGCONT)
-        if table_created:
-            _run(
-                [zaigr, "project", "vm", "exec", "--root", "--", "nft", "delete", "table", "inet", table],
-                cwd=project.cwd,
-                env=project.env,
-                input="y\n",
-                timeout=30,
-            )
         if maintenance.isalive():
             exit_shell(maintenance)
+        if control.isalive():
+            exit_shell(control)
 
 
 @pytest.mark.timeout(300)
@@ -1171,7 +1203,7 @@ def test_full_network_lease_expires_when_owner_cli_dies(project, host_network_en
 def test_full_network_helper_failure_cuts_off_active_maintenance_stream(
     project, host_network_endpoints, request
 ):
-    """A failed host tunnel helper cuts off networking and may stop the VM."""
+    """A failed host network helper cuts off networking and may stop the VM."""
     zaigr = project.zaigr_bin
     endpoint = host_network_endpoints
     host_url = f"http://10.0.2.2:{endpoint['tcp_port']}/"

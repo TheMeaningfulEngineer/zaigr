@@ -100,12 +100,12 @@ type Server struct {
 	discoveryUntil    time.Time
 	fullAccessUntil   time.Time
 	fullAccessEpoch   uint64
-	maintenanceAccess map[netip.Addr]maintenanceLease
+	maintenanceAccess map[netip.Addr]*maintenanceLease
 }
 
 type maintenanceLease struct {
-	sessionID string
-	deadline  time.Time
+	sessions map[string]time.Time
+	epoch    uint64
 }
 
 // FrontendLimits bounds work performed by the capless guest-facing process.
@@ -171,7 +171,7 @@ func StartBroker(parent context.Context, cfg Config, backend LeaseBackend) (*Ser
 		workers: make(chan struct{}, cfg.MaxConcurrent),
 		names:   policyNames, active: make(map[string]*activeName), lookupEpoch: make(map[string]uint64),
 		generation: cfg.Generation, peers: make(map[int]uint64), fatal: make(chan error, 1),
-		maintenanceAccess: make(map[netip.Addr]maintenanceLease),
+		maintenanceAccess: make(map[netip.Addr]*maintenanceLease),
 		eventChanged:      make(chan struct{}),
 	}
 	if cfg.FrontendPID > 0 {
@@ -346,7 +346,7 @@ func (s *Server) SetFullNetworkAccess(ctx context.Context, launchID string, gene
 }
 
 // SetMaintenanceAccess authorizes DNS discovery only for a source address on
-// one host-owned maintenance tunnel. These answers are observed, but the
+// one host-owned maintenance network. These answers are observed, but the
 // session's broad route already supplies transport access, so no guest-wide
 // DNS address lease is created.
 func (s *Server) SetMaintenanceAccess(ctx context.Context, launchID string, generation uint64, address netip.Addr, sessionID string, deadline time.Time) error {
@@ -367,7 +367,16 @@ func (s *Server) SetMaintenanceAccess(ctx context.Context, launchID string, gene
 	if generation != s.generation {
 		return fmt.Errorf("host DNS maintenance lease: stale policy generation %d (current %d)", generation, s.generation)
 	}
-	s.maintenanceAccess[address] = maintenanceLease{sessionID: sessionID, deadline: deadline}
+	current := s.maintenanceAccess[address]
+	if current == nil {
+		current = &maintenanceLease{sessions: make(map[string]time.Time)}
+		s.maintenanceAccess[address] = current
+	}
+	wasActive := maintenanceLeaseActive(current, time.Now())
+	current.sessions[sessionID] = deadline
+	if !wasActive {
+		current.epoch++
+	}
 	return nil
 }
 
@@ -386,10 +395,30 @@ func (s *Server) ClearMaintenanceAccess(ctx context.Context, launchID string, ge
 	if generation != s.generation {
 		return errors.New("host DNS maintenance lease: stale policy generation")
 	}
-	if current := s.maintenanceAccess[address]; current.sessionID == sessionID {
-		delete(s.maintenanceAccess, address)
+	current := s.maintenanceAccess[address]
+	if current != nil {
+		wasActive := maintenanceLeaseActive(current, time.Now())
+		delete(current.sessions, sessionID)
+		if wasActive && !maintenanceLeaseActive(current, time.Now()) {
+			current.epoch++
+		}
 	}
 	return nil
+}
+
+func maintenanceLeaseActive(lease *maintenanceLease, now time.Time) bool {
+	if lease == nil {
+		return false
+	}
+	active := false
+	for id, deadline := range lease.sessions {
+		if !deadline.After(now) {
+			delete(lease.sessions, id)
+		} else {
+			active = true
+		}
+	}
+	return active
 }
 
 // UpdatePolicyWith serializes the external manual-policy replacement and DNS

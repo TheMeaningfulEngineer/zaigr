@@ -193,14 +193,14 @@ func (h *hostNetworkHandle) releaseFullNetworkLease(ctx context.Context, leaseID
 	return h.updateFullNetworkLease(ctx, leaseID, "release", time.Time{})
 }
 
-func (h *hostNetworkHandle) startMaintenanceSession(ctx context.Context, sessionID, keyPath string, deadline time.Time) (hostnet.MaintenanceSession, error) {
+func (h *hostNetworkHandle) startMaintenanceSession(ctx context.Context, sessionID string, deadline time.Time) (hostnet.MaintenanceSession, error) {
 	h.updateMu.Lock()
 	defer h.updateMu.Unlock()
 	if err := h.checkOperation(ctx); err != nil {
 		return hostnet.MaintenanceSession{}, err
 	}
-	if !validHostPolicyScopeID(sessionID) || filepath.Clean(keyPath) != filepath.Clean(rootSSHKeyPath()) {
-		return hostnet.MaintenanceSession{}, errors.New("invalid maintenance session identity or SSH key")
+	if !validHostPolicyScopeID(sessionID) {
+		return hostnet.MaintenanceSession{}, errors.New("invalid maintenance session identity")
 	}
 	if _, exists := h.maintenanceSessions[sessionID]; exists {
 		return hostnet.MaintenanceSession{}, errors.New("maintenance session ID is already used")
@@ -208,7 +208,7 @@ func (h *hostNetworkHandle) startMaintenanceSession(ctx context.Context, session
 	if !deadline.After(time.Now()) || deadline.After(time.Now().Add(fullNetworkOwnerTTL)) {
 		return hostnet.MaintenanceSession{}, errors.New("maintenance session deadline is outside the owner lease bound")
 	}
-	session, err := h.network.StartMaintenanceSession(ctx, h.network.LaunchID(), sessionID, keyPath, deadline)
+	session, err := h.network.StartMaintenanceSession(ctx, h.network.LaunchID(), sessionID, deadline)
 	if err != nil {
 		return hostnet.MaintenanceSession{}, err
 	}
@@ -456,6 +456,9 @@ func (h *hostNetworkHandle) checkChildLiveness() error {
 
 func (h *hostNetworkHandle) Network() hostnet.Runtime { return h.network }
 func (h *hostNetworkHandle) TakeTapFile() *os.File    { return h.network.TakeTapFile() }
+func (h *hostNetworkHandle) TakeMaintenanceTapFile() *os.File {
+	return h.network.TakeMaintenanceTapFile()
+}
 func (h *hostNetworkHandle) TakeSupervisorExitWriter() *os.File {
 	return h.network.TakeSupervisorExitWriter()
 }
@@ -881,7 +884,6 @@ type hostNetworkControlRequest struct {
 	FullNetworkDeadline int64           `json:"full_network_deadline,omitempty"`
 	RequestNotAfter     int64           `json:"request_not_after,omitempty"`
 	SessionID           string          `json:"session_id,omitempty"`
-	KeyPath             string          `json:"key_path,omitempty"`
 }
 
 type hostNetworkControlResponse struct {
@@ -1001,7 +1003,7 @@ func (h *hostNetworkHandle) handleControl(conn *net.UnixConn) {
 			response.Error = errorString(h.releaseFullNetworkLease(ctx, request.LeaseID))
 		case "maintenance-start":
 			var session hostnet.MaintenanceSession
-			session, err = h.startMaintenanceSession(ctx, request.SessionID, request.KeyPath, time.Unix(0, request.FullNetworkDeadline))
+			session, err = h.startMaintenanceSession(ctx, request.SessionID, time.Unix(0, request.FullNetworkDeadline))
 			if err == nil {
 				response.MaintenanceSession = &session
 			}

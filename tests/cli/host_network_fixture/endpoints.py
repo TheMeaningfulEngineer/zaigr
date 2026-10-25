@@ -47,12 +47,17 @@ class HTTPHandler(BaseHTTPRequestHandler):
 
 
 class UDPHandler(socketserver.BaseRequestHandler):
-    """Echo the fixture token after receiving one real datagram."""
+    """Handle legacy probes and remember the peer for lease UDP streams."""
 
     def handle(self):
         with self.server.calls_lock:
             self.server.calls["udp"] += 1
-        self.request[1].sendto(self.server.token.encode() + b":udp\n", self.client_address)
+            self.server.last_client = self.client_address
+            self.server.peer_ready.set()
+        payload = self.request[0]
+        if not payload.startswith(b"GUEST:"):
+            payload = self.server.token.encode() + b":udp\n"
+            self.request[1].sendto(payload, self.client_address)
 
 
 @pytest.fixture
@@ -115,6 +120,10 @@ def host_network_endpoints(project):
         private_http.calls = calls
         private_http.calls_lock = calls_lock
     udp.calls_lock = calls_lock
+    udp.peer_ready = threading.Event()
+    udp.last_client = None
+    udp.peer_stop = threading.Event()
+    udp.peer_thread = None
     http_thread = threading.Thread(target=http.serve_forever, daemon=True)
     private_http_thread = (
         threading.Thread(target=private_http.serve_forever, daemon=True)
@@ -130,6 +139,31 @@ def host_network_endpoints(project):
         with calls_lock:
             return dict(calls)
 
+    def start_udp_peer():
+        """Send sequenced UDP datagrams to the last guest sender at a steady rate."""
+        assert udp.peer_ready.wait(10), "guest did not establish the UDP peer"
+
+        def send_packets():
+            sequence = 0
+            while not udp.peer_stop.is_set():
+                with calls_lock:
+                    destination = udp.last_client
+                if destination is not None:
+                    udp.socket.sendto(f"HOST:{sequence}".encode(), destination)
+                    with calls_lock:
+                        calls["udp_peer_sent"] = calls.get("udp_peer_sent", 0) + 1
+                    sequence += 1
+                udp.peer_stop.wait(0.02)
+
+        udp.peer_thread = threading.Thread(target=send_packets, daemon=True)
+        udp.peer_thread.start()
+
+    def stop_udp_peer():
+        """Stop host-to-guest UDP datagrams after the guest sender is paused."""
+        udp.peer_stop.set()
+        if udp.peer_thread is not None:
+            udp.peer_thread.join(timeout=2)
+
     try:
         yield {
             "token": token,
@@ -138,8 +172,11 @@ def host_network_endpoints(project):
             "private_tcp_port": private_http.server_address[1] if private_http is not None else None,
             "udp_port": udp.server_address[1],
             "request_counts": request_counts,
+            "start_udp_peer": start_udp_peer,
+            "stop_udp_peer": stop_udp_peer,
         }
     finally:
+        stop_udp_peer()
         http.shutdown()
         udp.shutdown()
         http.server_close()

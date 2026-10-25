@@ -160,7 +160,11 @@ func (s *Server) handleQuery(parent context.Context, source netip.Addr, packet [
 	}
 	now := time.Now()
 	maintenanceLease := s.maintenanceAccess[source]
-	maintenanceAccess := maintenanceLease.deadline.After(now)
+	maintenanceEpoch := uint64(0)
+	maintenanceAccess := maintenanceLeaseActive(maintenanceLease, now)
+	if maintenanceLease != nil {
+		maintenanceEpoch = maintenanceLease.epoch
+	}
 	fullAccess := s.fullAccessUntil.After(now) || maintenanceAccess
 	fullAccessEpoch := s.fullAccessEpoch
 	allowed := maintenanceAccess || s.discoveryAllowsLocked(name, now)
@@ -303,7 +307,10 @@ func (s *Server) handleQuery(parent context.Context, source netip.Addr, packet [
 		// an answer, including after a release/reacquire of the same domain.
 		s.mu.Lock()
 		currentMaintenanceLease := s.maintenanceAccess[source]
-		maintenanceStillAuthorized := !maintenanceAccess || (currentMaintenanceLease.sessionID == maintenanceLease.sessionID && currentMaintenanceLease.deadline.After(time.Now()))
+		maintenanceStillAuthorized := true
+		if maintenanceAccess {
+			maintenanceStillAuthorized = currentMaintenanceLease != nil && maintenanceLeaseActive(currentMaintenanceLease, time.Now()) && currentMaintenanceLease.epoch == maintenanceEpoch
+		}
 		lookupStillCurrent := maintenanceAccess || s.lookupEpoch[name] == epoch
 		stillAuthorized := s.failed == nil && s.generation == generation && maintenanceStillAuthorized &&
 			(s.fullAccessUntil.After(time.Now()) && s.fullAccessEpoch == fullAccessEpoch || maintenanceAccess) && lookupStillCurrent

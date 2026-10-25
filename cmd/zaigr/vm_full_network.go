@@ -12,14 +12,14 @@ import (
 	"zaigr/cmd/zaigr/hostnet"
 )
 
-const maintenanceNetworkWarning = "WARNING: --full-network gives this root shell and its child processes broad IPv4 TCP/UDP access, including private network destinations. Other VM processes stay on their ordinary network policy. Access ends when the host session expires or shell exits."
+const maintenanceNetworkWarning = "WARNING: --full-network gives this root shell and its child processes broad IPv4 TCP/UDP access, including private network destinations. Other VM processes stay on their ordinary network policy. Access ends when the host session expires or shell exits. Processes left behind keep access while another maintenance session remains active."
 
 func maintenanceOperationWarning(operation string) string {
 	switch operation {
 	case "project setup run", "setup execution":
-		return "WARNING: Setup execution runs root setup scripts with broad IPv4 TCP/UDP access in a private network namespace. Other VM processes keep their ordinary network policy. Access ends when setup finishes or the host session expires."
+		return "WARNING: Setup execution runs root setup scripts with broad IPv4 TCP/UDP access in a shared maintenance network namespace. Other VM processes keep their ordinary network policy. Access ends when setup finishes or the last maintenance session expires; processes left behind keep access while another session remains active."
 	case "project setup capture":
-		return "WARNING: Setup capture runs its root shell with broad IPv4 TCP/UDP access in a private network namespace. Other VM processes keep their ordinary network policy. Access ends when capture finishes or the host session expires."
+		return "WARNING: Setup capture runs its root shell with broad IPv4 TCP/UDP access in a shared maintenance network namespace. Other VM processes keep their ordinary network policy. Access ends when capture finishes or the last maintenance session expires; processes left behind keep access while another session remains active."
 	default:
 		return maintenanceNetworkWarning
 	}
@@ -132,9 +132,9 @@ func fullNetworkLeaseLaunchStopped(runtimeDir, launchID string) bool {
 	return record.LaunchID != launchID
 }
 
-// withMaintenanceNetworkSession keeps broad routing behind a session-specific
-// SSH point-to-point tunnel. The VM's ordinary guest interface and firewall
-// grants are never changed by this operation.
+// withMaintenanceNetworkSession grants access through the launch's shared
+// maintenance namespace and the separately leased maintenance NIC. Ordinary
+// guest interfaces and firewall grants are unchanged.
 func withMaintenanceNetworkSession(store projectStore, port, operation string, run func(string) error) (retErr error) {
 	if err := ensureMaintenanceNetworkProjectSafe(store); err != nil {
 		return err
@@ -150,31 +150,26 @@ func withMaintenanceNetworkSession(store projectStore, port, operation string, r
 	if err != nil {
 		return fmt.Errorf("prepare root SSH key for maintenance network: %w", err)
 	}
-	if err := ensureRootMaintenanceTunnel(port, keyPath); err != nil {
-		return fmt.Errorf("enable root-only SSH packet tunnel: %w", err)
-	}
 	sessionID, err := newVMLaunchID()
 	if err != nil {
 		return fmt.Errorf("create maintenance session identity: %w", err)
 	}
 	deadline := time.Now().Add(fullNetworkOwnerTTL)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	response, err := hostNetworkControlRequestWithReply(ctx, store.runtimeDir(), record.LaunchID, hostNetworkControlRequest{Operation: "maintenance-start", SessionID: sessionID, KeyPath: keyPath}, deadline)
+	response, err := hostNetworkControlRequestWithReply(ctx, store.runtimeDir(), record.LaunchID, hostNetworkControlRequest{Operation: "maintenance-start", SessionID: sessionID}, deadline)
 	cancel()
 	if err != nil {
-		return fmt.Errorf("start authenticated maintenance tunnel: %w", err)
+		return fmt.Errorf("start maintenance network session: %w", err)
 	}
 	if response.MaintenanceSession == nil {
 		_ = stopMaintenanceControl(store.runtimeDir(), record.LaunchID, sessionID)
-		return errors.New("host network returned no maintenance tunnel details")
+		return errors.New("host network returned no maintenance network details")
 	}
 	session := *response.MaintenanceSession
-	name := "zaigr-maint-" + sessionID
-	cleanupNamespace := func() error {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cleanupCancel()
-		command := "ip netns del " + singleQuotedArg(name) + " 2>/dev/null || true; rm -rf -- " + singleQuotedArg("/etc/netns/"+name)
-		return sshRunCommandWithExitStatusContext(cleanupCtx, port, keyPath, "root", command)
+	name, err := maintenanceNamespaceName(record.LaunchID)
+	if err != nil {
+		_ = stopMaintenanceControl(store.runtimeDir(), record.LaunchID, sessionID)
+		return err
 	}
 	stopRenewal := make(chan struct{})
 	renewalDone := make(chan error, 1)
@@ -215,10 +210,10 @@ func withMaintenanceNetworkSession(store projectStore, port, operation string, r
 			// the missing endpoint equivalent to successful revocation.
 			return
 		}
-		retErr = errors.Join(retErr, stopErr, cleanupNamespace())
+		retErr = errors.Join(retErr, stopErr)
 	}()
-	if err := prepareMaintenanceNamespace(port, keyPath, name, session); err != nil {
-		return fmt.Errorf("prepare isolated maintenance namespace: %w", err)
+	if err := prepareMaintenanceNamespace(port, keyPath, name, record.LaunchID, session); err != nil {
+		return fmt.Errorf("prepare shared maintenance namespace: %w", err)
 	}
 	fmt.Fprintln(os.Stderr, maintenanceOperationWarning(operation))
 	retErr = run(name)
@@ -311,49 +306,47 @@ func stopMaintenanceControl(runtimeDir, launchID, sessionID string) error {
 	return nil
 }
 
-func prepareMaintenanceNamespace(port, keyPath, name string, session hostnet.MaintenanceSession) error {
-	if !validHostPolicyScopeID(strings.TrimPrefix(name, "zaigr-maint-")) {
-		return errors.New("invalid maintenance namespace name")
+func maintenanceNamespaceName(launchID string) (string, error) {
+	if !validHostPolicyScopeID(launchID) {
+		return "", errors.New("invalid maintenance network launch identity")
 	}
-	iface := fmt.Sprintf("tun%d", session.TunnelIndex)
-	command := "set -eu\n" +
-		"install -d -o root -g root -m 0700 /run/netns\n" +
-		"chmod 0700 /run/netns\n" +
-		"created=1\n" +
-		"cleanup() { if [ \"$created\" = 1 ]; then ip netns del " + singleQuotedArg(name) + " >/dev/null 2>&1 || true; fi; rm -rf -- " + singleQuotedArg("/etc/netns/"+name) + "; }\n" +
-		"trap cleanup EXIT\n" +
-		"ip netns add " + singleQuotedArg(name) + "\n" +
-		"for attempt in $(seq 1 50); do ip link show dev " + singleQuotedArg(iface) + " >/dev/null 2>&1 && break; sleep 0.1; done\n" +
-		"ip link show dev " + singleQuotedArg(iface) + " >/dev/null\n" +
-		"ip link set dev " + singleQuotedArg(iface) + " netns " + singleQuotedArg(name) + "\n" +
-		"ip -n " + singleQuotedArg(name) + " link set lo up\n" +
-		"ip -n " + singleQuotedArg(name) + " addr add " + session.GuestAddress.String() + "/32 peer " + session.HostAddress.String() + "/32 dev " + singleQuotedArg(iface) + "\n" +
-		"ip -n " + singleQuotedArg(name) + " link set dev " + singleQuotedArg(iface) + " up\n" +
-		"ip -n " + singleQuotedArg(name) + " route replace default dev " + singleQuotedArg(iface) + "\n" +
-		"install -d -o root -g root -m 0700 " + singleQuotedArg("/etc/netns/"+name) + "\n" +
-		"printf 'nameserver 10.0.2.3\\noptions timeout:1 attempts:1\\n' > " + singleQuotedArg("/etc/netns/"+name+"/resolv.conf") + "\n" +
-		"trap - EXIT\n"
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	defer cancel()
-	return sshRunCommandWithExitStatusContext(ctx, port, keyPath, "root", command)
+	return "zaigr-maint-" + launchID, nil
 }
 
-func ensureRootMaintenanceTunnel(port, keyPath string) error {
-	script := "set -eu\n" +
-		"config=/etc/ssh/sshd_config\n" +
-		"tunnel=/etc/ssh/zaigr-maintenance-tunnel.conf\n" +
-		"include='Include /etc/ssh/zaigr-maintenance-tunnel.conf'\n" +
-		"test ! -L \"$config\" -a -f \"$config\"\n" +
-		"if test -L \"$tunnel\"; then exit 1; fi\n" +
-		"tmp=\"$(mktemp /etc/ssh/.zaigr-maintenance-tunnel.XXXXXX)\"\n" +
-		"trap 'rm -f \"$tmp\"' EXIT\n" +
-		"printf '%s\\n' 'Match User root' '  PermitTunnel point-to-point' > \"$tmp\"\n" +
-		"chown root:root \"$tmp\"; chmod 0644 \"$tmp\"\n" +
-		"mv -fT -- \"$tmp\" \"$tunnel\"\n" +
-		"grep -Fqx -- \"$include\" \"$config\" || printf '%s\\n' \"$include\" >> \"$config\"\n" +
-		"sshd -t\n" +
-		"systemctl reload ssh\n"
-	command := "flock -x /run/lock/zaigr-maintenance-sshd-config.lock sh -eu -c " + singleQuotedArg(script)
+func prepareMaintenanceNamespace(port, keyPath, name, launchID string, session hostnet.MaintenanceSession) error {
+	if !validHostPolicyScopeID(launchID) || name != "zaigr-maint-"+launchID {
+		return errors.New("invalid maintenance namespace identity")
+	}
+	if session.HostAddress.String() != "10.0.4.1" || session.GuestAddress.String() != "10.0.4.2" {
+		return fmt.Errorf("host returned unexpected maintenance NIC addresses %s and %s", session.HostAddress, session.GuestAddress)
+	}
+	const maintenanceMAC = "52:54:00:5a:47:52"
+	lockPath := "/run/zaigr/maintenance-" + launchID + ".lock"
+	configPath := "/etc/netns/" + name + "/resolv.conf"
+	setup := "set -eu\n" +
+		"install -d -o root -g root -m 0700 /run/netns /run/zaigr /etc/netns\n" +
+		"find /etc/netns -mindepth 1 -maxdepth 1 -type d -name 'zaigr-maint-*' ! -name " + singleQuotedArg(name) + " -exec rm -rf -- {} +\n" +
+		"ip netns list | awk -v wanted=" + singleQuotedArg(name) + " '$1 == wanted { found = 1 } END { exit !found }' || ip netns add " + singleQuotedArg(name) + "\n" +
+		"find_mac() { ip -o link show | awk '$0 ~ /link\\/ether " + maintenanceMAC + "([[:space:]]|$)/ { name = $2; sub(/:$/, \"\", name); sub(/@.*/, \"\", name); count++ } END { if (count == 1) print name; else if (count > 1) print \"__duplicate__\" }'; }\n" +
+		"iface=\"$(find_mac)\"\n" +
+		"if [ -n \"$iface\" ]; then\n" +
+		"  if [ \"$iface\" = __duplicate__ ]; then printf 'multiple guest interfaces have the maintenance MAC\\n' >&2; exit 1; fi\n" +
+		"  in_namespace=\"$(ip -n " + singleQuotedArg(name) + " -o link show | awk '$0 ~ /link\\/ether " + maintenanceMAC + "([[:space:]]|$)/ { name = $2; sub(/:$/, \"\", name); sub(/@.*/, \"\", name); count++ } END { if (count == 1) print name; else if (count > 1) print \"__duplicate__\" }')\"\n" +
+		"  if [ \"$in_namespace\" = __duplicate__ ]; then printf 'multiple guest interfaces in maintenance namespace have the maintenance MAC\\n' >&2; exit 1; fi\n" +
+		"  if [ -n \"$in_namespace\" ]; then printf 'maintenance NIC appears in multiple namespaces\\n' >&2; exit 1; fi\n" +
+		"  ip link set dev \"$iface\" netns " + singleQuotedArg(name) + "\n" +
+		"else\n" +
+		"  iface=\"$(ip -n " + singleQuotedArg(name) + " -o link show | awk '$0 ~ /link\\/ether " + maintenanceMAC + "([[:space:]]|$)/ { name = $2; sub(/:$/, \"\", name); sub(/@.*/, \"\", name); count++ } END { if (count == 1) print name; else if (count > 1) print \"__duplicate__\" }')\"\n" +
+		"  if [ \"$iface\" = __duplicate__ ]; then printf 'multiple guest interfaces in maintenance namespace have the maintenance MAC\\n' >&2; exit 1; fi\n" +
+		"  if [ -z \"$iface\" ]; then printf 'maintenance NIC with expected MAC was not found\\n' >&2; exit 1; fi\n" +
+		"fi\n" +
+		"ip -n " + singleQuotedArg(name) + " link set lo up\n" +
+		"ip -n " + singleQuotedArg(name) + " addr replace " + session.GuestAddress.String() + "/24 dev \"$iface\"\n" +
+		"ip -n " + singleQuotedArg(name) + " link set dev \"$iface\" up\n" +
+		"ip -n " + singleQuotedArg(name) + " route replace default via " + session.HostAddress.String() + " dev \"$iface\"\n" +
+		"install -d -o root -g root -m 0700 " + singleQuotedArg("/etc/netns/"+name) + "\n" +
+		"printf 'nameserver 10.0.2.3\\noptions timeout:1 attempts:1\\n' > " + singleQuotedArg(configPath) + "\n"
+	command := "install -d -o root -g root -m 0700 /run/zaigr && flock -x " + singleQuotedArg(lockPath) + " sh -eu -c " + singleQuotedArg(setup)
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	return sshRunCommandWithExitStatusContext(ctx, port, keyPath, "root", command)
