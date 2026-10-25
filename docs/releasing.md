@@ -47,6 +47,21 @@ Scopes are supported, for example `fix(setups): ...`. Subjects marked with `!`
 are retained even for otherwise omitted commit types. Other subjects appear
 under Changed.
 
+When one commit contains several user-facing changes that are too intertwined
+to split safely, say so in the commit body and add one footer per extra change:
+`Also-added:`, `Also-changed:` or `Also-fixed:`. Each footer becomes its own
+entry in that section of the notes; the subject stays the main entry. Footers on
+omitted commit types are ignored. Prefer separate commits whenever splitting is
+safe.
+
+```text
+feat: bundle slirp4netns so hosts no longer need the package
+
+This commit contains two features that could not be separated safely: ...
+
+Also-added: Track all bundled dependency versions with make deps-check
+```
+
 Keep related corrections together so the notes describe the completed change
 rather than intermediate regressions. For example:
 
