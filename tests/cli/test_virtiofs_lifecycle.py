@@ -88,6 +88,9 @@ def test_supervisor_death_before_qemu_connects_reaps_daemons(project, test_root)
     wrapper.write_text(
         "#!/usr/bin/python3\n"
         "import os, sys, time\n"
+        f"real_qemu = {real_qemu!r}\n"
+        "if sys.argv[1:] in ([\"--version\"], [\"-device\", \"help\"], [\"-object\", \"help\"]):\n"
+        "    os.execv(real_qemu, [real_qemu, *sys.argv[1:]])\n"
         f"marker_tmp = {str(marker) + '.tmp'!r}\n"
         f"open(marker_tmp, 'w').close()\n"
         f"os.replace(marker_tmp, {str(marker)!r})\n"

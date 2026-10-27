@@ -186,9 +186,15 @@ def test_qemu_startup_failure_cleans_children_and_can_retry(project, test_root, 
     fake_bin = test_root / "qemu-failure-bin"
     fake_bin.mkdir()
     marker = test_root / "qemu-failure-invoked"
+    real_qemu = shutil.which("qemu-system-x86_64")
+    assert real_qemu
     wrapper = fake_bin / "qemu-system-x86_64"
     wrapper.write_text(
         "#!/usr/bin/python3\n"
+        "import os, sys\n"
+        f"real_qemu = {real_qemu!r}\n"
+        "if sys.argv[1:] in ([\"--version\"], [\"-device\", \"help\"], [\"-object\", \"help\"]):\n"
+        "    os.execv(real_qemu, [real_qemu, *sys.argv[1:]])\n"
         f"open({str(marker)!r}, 'w').close()\n"
         + wrapper_body,
         encoding="utf-8",
@@ -536,11 +542,16 @@ def test_attached_caller_death_before_qemu_connection_reaps_daemons(project, set
     fake_bin = test_root / "attached-qemu-delay"
     fake_bin.mkdir()
     marker = test_root / "attached-qemu-invoked"
+    real_qemu = shutil.which("qemu-system-x86_64")
+    assert real_qemu
     wrapper = fake_bin / "qemu-system-x86_64"
     wrapper.write_text(
         "#!/usr/bin/python3\n"
+        "import os, sys, time\n"
+        f"real_qemu = {real_qemu!r}\n"
+        "if sys.argv[1:] in ([\"--version\"], [\"-device\", \"help\"], [\"-object\", \"help\"]):\n"
+        "    os.execv(real_qemu, [real_qemu, *sys.argv[1:]])\n"
         "from pathlib import Path\n"
-        "import time\n"
         f"Path({str(marker)!r}).touch()\n"
         "time.sleep(60)\n",
         encoding="utf-8",

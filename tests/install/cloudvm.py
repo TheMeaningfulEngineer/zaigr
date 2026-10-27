@@ -67,11 +67,13 @@ DISTROS = {
 # Baseline packages in prepared distro images. slirp4netns remains installed
 # here so acceptance tests can cover both system-package states by removing it.
 # This is the prepared outer test VM's baseline package set, not Zaigr's
-# install prerequisites. The controller's SSH/scp/keygen live outside that VM;
-# product commands inside it use a restricted PATH without host OpenSSH tools.
+# install prerequisites. gcc and libsqlite3-dev support the virtiofs integrity
+# probe; uidmap and the subordinate ID ranges support the IP namespace fixture.
+# The controller's SSH/scp/keygen live outside that VM; product commands inside
+# it use a restricted PATH without host OpenSSH tools.
 GUEST_PACKAGES = (
-    "coreutils", "e2fsprogs", "openssh-client", "qemu-system-x86",
-    "qemu-utils", "slirp4netns", "util-linux",
+    "coreutils", "e2fsprogs", "gcc", "libsqlite3-dev", "openssh-client",
+    "qemu-system-x86", "qemu-utils", "slirp4netns", "uidmap", "util-linux",
 )
 KEEP_ENV = "ZAIGR_KEEP_CLOUDVM"
 _LIVE_VMS = set()
@@ -216,6 +218,20 @@ runcmd:
       systemctl mask --now "$unit" >/dev/null 2>&1 || true
     done
   - [mkdir, -p, /tmp/zaigr-home, /tmp/zaigr-project]
+  - |
+    touch /etc/subuid /etc/subgid
+    for map in subuid subgid; do
+      map_file="/etc/$map"
+      if ! awk -F: '$1 == "user" && $3 >= 65536 { found = 1 } END { exit !found }' "$map_file"; then
+        first=$(awk -F: 'BEGIN { first = 100000 } { start = $2; end = start + $3; if (start < first + 65536 && end > first) first = int((end + 65535) / 65536) * 65536 } END { print first }' "$map_file")
+        last=$((first + 65535))
+        if [ "$map" = subuid ]; then
+          usermod --add-subuids "$first-$last" user
+        else
+          usermod --add-subgids "$first-$last" user
+        fi
+      fi
+    done
   - |
     if command -v pro >/dev/null 2>&1; then
       pro disable esm-apps esm-infra || true

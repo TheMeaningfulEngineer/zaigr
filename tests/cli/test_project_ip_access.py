@@ -107,14 +107,19 @@ def test_stopped_permissions_validate_and_preserve_configuration(project):
     assert "already" in duplicate.lower() and "allow" in duplicate.lower()
     for address in ("192.168.2.11", "169.254.44.2", "10.0.2.2"):
         _assert_pending(run([zaigr, "project", "firewall", "allow", address], timeout=10))
+    _assert_pending(
+        run([zaigr, "project", "firewall", "allow", "192.0.2.42", "192.0.2.43"], timeout=10)
+    )
     before = run(f"{zaigr} project firewall show", timeout=180)
     assert before.count("192.0.2.41") == 1, before
+    assert before.count("192.0.2.42") == 1, before
+    assert before.count("192.0.2.43") == 1, before
     assert "IP" in before or "IPv4" in before, before
     assert "all ports" in before.lower(), before
     assert "project" in before.lower(), before
     assert "next" in before.lower() or "pending" in before.lower(), before
     invalid_arguments = [
-        [], ["192.0.2.42", "192.0.2.43"], ["example.com"],
+        [], ["example.com"],
         ["http://192.0.2.42"], ["192.0.2.42:22"], ["192.0.2.0/24"],
         ["192.0.2.*"], ["192.0.2.1-10"], ["::1"], ["::ffff:192.0.2.42"],
         ["192.0.2.999"], ["192.0.2"], ["3232235777"], ["0xc000022a"],

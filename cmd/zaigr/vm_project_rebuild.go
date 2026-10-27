@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 type setupScopeKey struct {
@@ -1086,21 +1087,8 @@ func preserveLegacyAgentState(sourceStore projectStore, stagedStore projectStore
 	}
 
 	destination := stagedStore.agentStateDir()
-	output, err := exec.Command(
-		"cp",
-		"--archive",
-		"--reflink=auto",
-		"--no-target-directory",
-		"--",
-		source,
-		destination,
-	).CombinedOutput()
-	if err != nil {
-		message := strings.TrimSpace(string(output))
-		if message == "" {
-			message = err.Error()
-		}
-		return fmt.Errorf("preserve legacy agent state at %s: %s", source, message)
+	if err := copyAgentStateTree(source, destination); err != nil {
+		return fmt.Errorf("preserve legacy agent state at %s: %w", source, err)
 	}
 	if err := syncPreservedTree(destination); err != nil {
 		return fmt.Errorf("sync preserved legacy agent state: %w", err)
@@ -1109,7 +1097,11 @@ func preserveLegacyAgentState(sourceStore projectStore, stagedStore projectStore
 }
 
 func syncPreservedTree(root string) error {
-	directories := make([]string, 0)
+	type directoryMetadata struct {
+		path      string
+		timestamp []unix.Timespec
+	}
+	directories := make([]directoryMetadata, 0)
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -1119,7 +1111,11 @@ func syncPreservedTree(root string) error {
 			return err
 		}
 		if info.IsDir() {
-			directories = append(directories, path)
+			stat, ok := info.Sys().(*syscall.Stat_t)
+			if !ok {
+				return fmt.Errorf("inspect preserved directory metadata at %s", path)
+			}
+			directories = append(directories, directoryMetadata{path: path, timestamp: agentStateTimestamps(stat)})
 			return nil
 		}
 		if !info.Mode().IsRegular() {
@@ -1133,13 +1129,23 @@ func syncPreservedTree(root string) error {
 			_ = file.Close()
 			return err
 		}
-		return file.Close()
+		if err := file.Close(); err != nil {
+			return err
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return fmt.Errorf("inspect preserved file timestamps at %s", path)
+		}
+		return unix.UtimesNanoAt(unix.AT_FDCWD, path, agentStateTimestamps(stat), 0)
 	})
 	if err != nil {
 		return err
 	}
 	for index := len(directories) - 1; index >= 0; index-- {
-		if err := syncDirectory(directories[index]); err != nil {
+		if err := syncDirectory(directories[index].path); err != nil {
+			return err
+		}
+		if err := unix.UtimesNanoAt(unix.AT_FDCWD, directories[index].path, directories[index].timestamp, 0); err != nil {
 			return err
 		}
 	}
@@ -1322,21 +1328,221 @@ func copyRebuildAgentState(source, destination string) error {
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("rebuild agent state is not a directory: %s", source)
 	}
-	output, err := exec.Command(
-		"cp",
-		"--archive",
-		"--reflink=auto",
-		"--no-target-directory",
-		"--",
-		source,
-		destination,
-	).CombinedOutput()
-	if err != nil {
-		message := strings.TrimSpace(string(output))
-		if message == "" {
-			message = err.Error()
+	if err := copyAgentStateTree(source, destination); err != nil {
+		return fmt.Errorf("stage rebuild agent state at %s: %w", source, err)
+	}
+	return nil
+}
+
+// copyAgentStateTree copies agent state and archive metadata. It preserves
+// hardlinks within the copied tree, but not links to inodes outside the tree or
+// sparse allocation. Socket entries become stale socket nodes without endpoints.
+func copyAgentStateTree(source, destination string) error {
+	type directoryMetadata struct {
+		source      string
+		destination string
+		mode        os.FileMode
+		stat        syscall.Stat_t
+	}
+	directories := make([]directoryMetadata, 0)
+	hardLinks := make(map[[2]uint64]string)
+	err := filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
-		return fmt.Errorf("stage rebuild agent state at %s: %s", source, message)
+		relative, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		target := destination
+		if relative != "." {
+			target = filepath.Join(destination, relative)
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			link, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			if err := os.Symlink(link, target); err != nil {
+				return err
+			}
+			stat, ok := info.Sys().(*syscall.Stat_t)
+			if !ok {
+				return fmt.Errorf("inspect symlink ownership at %s", path)
+			}
+			if err := os.Lchown(target, int(stat.Uid), int(stat.Gid)); err != nil {
+				return err
+			}
+			if err := copyAgentStateXattrs(path, target, true); err != nil {
+				return err
+			}
+			times := agentStateTimestamps(stat)
+			return unix.UtimesNanoAt(unix.AT_FDCWD, target, times, unix.AT_SYMLINK_NOFOLLOW)
+		}
+		if info.IsDir() {
+			if err := os.Mkdir(target, 0700); err != nil {
+				return err
+			}
+			stat, ok := info.Sys().(*syscall.Stat_t)
+			if !ok {
+				return fmt.Errorf("inspect agent state directory metadata at %s", path)
+			}
+			directories = append(directories, directoryMetadata{
+				source: path, destination: target, mode: info.Mode(), stat: *stat,
+			})
+			return nil
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return fmt.Errorf("inspect agent state metadata at %s", path)
+		}
+		mode := agentStateMode(info.Mode())
+		if info.Mode().IsRegular() {
+			key := [2]uint64{uint64(stat.Dev), stat.Ino}
+			if first, ok := hardLinks[key]; ok {
+				return unix.Link(first, target)
+			}
+			hardLinks[key] = target
+		} else if info.Mode()&os.ModeNamedPipe != 0 {
+			if err := unix.Mkfifo(target, mode); err != nil {
+				return err
+			}
+		} else if info.Mode()&os.ModeDevice != 0 {
+			deviceType := uint32(unix.S_IFCHR)
+			if info.Mode()&os.ModeCharDevice == 0 {
+				deviceType = unix.S_IFBLK
+			}
+			if err := unix.Mknod(target, deviceType|mode, int(stat.Rdev)); err != nil {
+				return err
+			}
+		} else if info.Mode()&os.ModeSocket != 0 {
+			if err := unix.Mknod(target, unix.S_IFSOCK|mode, 0); err != nil {
+				return err
+			}
+		} else {
+			return fmt.Errorf("cannot preserve agent state file type at %s: %s", path, info.Mode().Type())
+		}
+		if info.Mode().IsRegular() {
+			input, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			output, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+			if err != nil {
+				_ = input.Close()
+				return err
+			}
+			_, copyErr := io.Copy(output, input)
+			copyErr = errors.Join(copyErr, output.Sync(), output.Close(), input.Close())
+			if copyErr != nil {
+				_ = os.Remove(target)
+				return copyErr
+			}
+		}
+		if err := os.Chown(target, int(stat.Uid), int(stat.Gid)); err != nil {
+			return err
+		}
+		if err := copyAgentStateXattrs(path, target, false); err != nil {
+			return err
+		}
+		if err := unix.Chmod(target, mode); err != nil {
+			return err
+		}
+		times := agentStateTimestamps(stat)
+		return unix.UtimesNanoAt(unix.AT_FDCWD, target, times, 0)
+	})
+	if err != nil {
+		return err
+	}
+	for index := len(directories) - 1; index >= 0; index-- {
+		directory := directories[index]
+		if err := os.Chown(directory.destination, int(directory.stat.Uid), int(directory.stat.Gid)); err != nil {
+			return err
+		}
+		if err := copyAgentStateXattrs(directory.source, directory.destination, false); err != nil {
+			return err
+		}
+		if err := unix.Chmod(directory.destination, agentStateMode(directory.mode)); err != nil {
+			return err
+		}
+		times := agentStateTimestamps(&directory.stat)
+		if err := unix.UtimesNanoAt(unix.AT_FDCWD, directory.destination, times, 0); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func agentStateMode(mode os.FileMode) uint32 {
+	permissions := uint32(mode.Perm())
+	if mode&os.ModeSetuid != 0 {
+		permissions |= unix.S_ISUID
+	}
+	if mode&os.ModeSetgid != 0 {
+		permissions |= unix.S_ISGID
+	}
+	if mode&os.ModeSticky != 0 {
+		permissions |= unix.S_ISVTX
+	}
+	return permissions
+}
+
+func agentStateTimestamps(stat *syscall.Stat_t) []unix.Timespec {
+	return []unix.Timespec{
+		{Sec: stat.Atim.Sec, Nsec: stat.Atim.Nsec},
+		{Sec: stat.Mtim.Sec, Nsec: stat.Mtim.Nsec},
+	}
+}
+
+func copyAgentStateXattrs(source, destination string, symlink bool) error {
+	list := unix.Listxattr
+	get := unix.Getxattr
+	set := unix.Setxattr
+	if symlink {
+		list = unix.Llistxattr
+		get = unix.Lgetxattr
+		set = unix.Lsetxattr
+	}
+	size, err := list(source, nil)
+	if err != nil {
+		if errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) {
+			return nil
+		}
+		return fmt.Errorf("list agent state extended attributes at %s: %w", source, err)
+	}
+	names := make([]byte, size)
+	if size > 0 {
+		if _, err := list(source, names); err != nil {
+			return fmt.Errorf("read agent state extended attributes at %s: %w", source, err)
+		}
+	}
+	for len(names) > 0 {
+		end := 0
+		for end < len(names) && names[end] != 0 {
+			end++
+		}
+		if end == len(names) {
+			return fmt.Errorf("invalid extended attribute list at %s", source)
+		}
+		name := string(names[:end])
+		size, err := get(source, name, nil)
+		if err != nil {
+			return fmt.Errorf("read agent state extended attribute %s at %s: %w", name, source, err)
+		}
+		value := make([]byte, size)
+		if size > 0 {
+			if _, err := get(source, name, value); err != nil {
+				return fmt.Errorf("read agent state extended attribute %s at %s: %w", name, source, err)
+			}
+		}
+		if err := set(destination, name, value, 0); err != nil {
+			return fmt.Errorf("write agent state extended attribute %s at %s: %w", name, destination, err)
+		}
+		names = names[end+1:]
 	}
 	return nil
 }

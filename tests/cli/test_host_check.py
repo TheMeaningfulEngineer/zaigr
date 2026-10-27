@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 from functools import partial
 from pathlib import Path
 
@@ -55,6 +56,25 @@ def _path_without_unshare(test_root):
             continue
         for executable in Path(directory).iterdir():
             if executable.name in {"unshare", "slirp4netns", "ssh", "ssh-keygen", "setpriv"} or executable.name in linked_names:
+                continue
+            if not executable.is_file() or not os.access(executable, os.X_OK):
+                continue
+            (path / executable.name).symlink_to(executable.resolve())
+            linked_names.add(executable.name)
+    return path
+
+
+def _path_without_cp(test_root):
+    """Create a PATH containing available tools except cp."""
+    path = test_root / "without-cp-bin"
+    path.mkdir()
+    directories = [*os.environ.get("PATH", "").split(os.pathsep), "/usr/sbin", "/sbin"]
+    linked_names = set()
+    for directory in directories:
+        if not directory or not Path(directory).is_dir():
+            continue
+        for executable in Path(directory).iterdir():
+            if executable.name == "cp" or executable.name in linked_names:
                 continue
             if not executable.is_file() or not os.access(executable, os.X_OK):
                 continue
@@ -270,11 +290,26 @@ def test_running_vm_survives_batch_rebuild_preflight_and_reuses_without_qemu(
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
     run(f"{zaigr} project vm start", input="y\n", timeout=180)
 
+    state = project.store_dir / "agent-state" / "rebuild-copy-check"
+    state.mkdir(mode=0o700)
+    state_file = state / "payload"
+    state_file.write_bytes(b"rebuild-copy-state\n")
+    state_file.chmod(0o4750)
+    os.setxattr(state_file, "user.zaigr-rebuild-copy-check", b"preserved")
+    hardlink = state / "payload-hardlink"
+    os.link(state_file, hardlink)
+    state_symlink = state / "payload-symlink"
+    state_symlink.symlink_to("payload")
+    read_only_state = state / "read-only"
+    read_only_state.mkdir(mode=0o700)
+    read_only_payload = read_only_state / "payload"
+    read_only_payload.write_bytes(b"read-only-state\n")
+    read_only_state.chmod(0o500)
+
     restricted_path = _path_with_real_tools(
         test_root,
         (
-            "qemu-system-x86_64", "qemu-img", "debugfs", "e2fsck",
-            "resize2fs", "dumpe2fs", "true",
+            "qemu-img", "debugfs", "e2fsck", "resize2fs", "dumpe2fs", "true",
         ),
     )
     restricted_env = {**project.env, "PATH": str(restricted_path)}
@@ -301,6 +336,33 @@ def test_running_vm_survives_batch_rebuild_preflight_and_reuses_without_qemu(
         timeout=30,
     )
     assert "PRETTY_NAME=" in guest
+
+    no_cp_path = _path_without_cp(test_root)
+    no_cp_env = {**project.env, "PATH": str(no_cp_path)}
+    assert shutil.which("cp", path=str(no_cp_path)) is None
+    rebuilt = run(
+        [zaigr, "global", "projects", "rebuild", "--all", "--yes"],
+        env=no_cp_env,
+        timeout=300,
+    )
+    assert "rebuilt" in rebuilt.lower()
+
+    run([zaigr, "project", "vm", "start"], env=no_cp_env, input="y\n", timeout=180)
+    guest = run(
+        [zaigr, "project", "vm", "exec", "--", "cat", "/etc/os-release"],
+        env=no_cp_env,
+        timeout=30,
+    )
+    assert "PRETTY_NAME=" in guest
+
+    assert state_file.read_bytes() == b"rebuild-copy-state\n"
+    assert stat.S_IMODE(state_file.stat().st_mode) == 0o4750
+    assert state_file.stat().st_ino == hardlink.stat().st_ino
+    assert os.readlink(state_symlink) == "payload"
+    assert os.getxattr(state_file, "user.zaigr-rebuild-copy-check") == b"preserved"
+    assert read_only_payload.read_bytes() == b"read-only-state\n"
+    assert stat.S_IMODE(read_only_state.stat().st_mode) == 0o500
+    read_only_state.chmod(0o700)
 
 
 def _ubuntu_guidance(output):
@@ -336,7 +398,7 @@ def test_namespace_policy_guidance_matches_and_vm_networking_needs_no_host_ssh_t
         [str(zaigr), "misc", "check"], cwd=project.cwd, env=no_unshare_env, timeout=90
     )
     assert rc == 0, err_msg(stdout, stderr)
-    assert "Bundled slirp4netns version:" in stdout
+    assert "bundled slirp4netns " in stdout.lower()
     assert "7/7 checks passed" in stdout
     assert "disposable host namespace, TAP, nftables controller and slirp start/stop probe passed" in stdout
 
