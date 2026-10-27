@@ -61,6 +61,8 @@ func cmdProjectStartVM(ram string, cpu string) error {
 	if err := requireNoActiveSetupCapture("zaigr project vm start"); err != nil {
 		return err
 	}
+	showVMStopNotice(currentProjectStore())
+
 	running, err := prepareProjectForVMStart(ram, cpu)
 	if err != nil {
 		return err

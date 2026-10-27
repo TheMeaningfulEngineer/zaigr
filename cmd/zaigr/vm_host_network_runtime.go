@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -48,6 +49,8 @@ type hostNetworkHandle struct {
 	childExits          chan hostnet.ChildExit
 	frontendDone        chan error
 	frontendIdentity    hostnet.ProcessIdentity
+	checkFailures       chan hostNetworkCheckFailure
+	asyncCheckFailed    atomic.Bool
 	policyNames         []string
 	policyGrants        []netip.Addr
 	hostExclusions      []netip.Prefix
@@ -78,6 +81,11 @@ type hostNetworkStatus struct {
 type maintenanceSessionRecord struct {
 	session  hostnet.MaintenanceSession
 	deadline time.Time
+}
+
+type hostNetworkCheckFailure struct {
+	step string
+	err  error
 }
 
 // startHostNetworkRuntime performs the complete host-owned network bootstrap.
@@ -123,7 +131,7 @@ func startHostNetworkRuntime(ctx context.Context, opts hostnet.Options, store pr
 		return nil, err
 	}
 	ownedCtx, cancel := context.WithCancel(ctx)
-	h := &hostNetworkHandle{ctx: ownedCtx, cancel: cancel, store: store, runtimeDir: opts.RuntimeDir, network: hostRuntime, hostExclusions: exclusions, networkLiveUntil: initialLeaseDeadline, fatal: make(chan error, 1), childExits: make(chan hostnet.ChildExit, 4), frontendDone: make(chan error, 1), controlSlots: make(chan struct{}, 32), policyNames: append([]string(nil), trustedNames...), policyGrants: append([]netip.Addr(nil), trustedGrants...), policyScopes: make(map[string]hostNetworkPolicyScope), fullAccessLeases: make(map[string]time.Time), maintenanceSessions: make(map[string]maintenanceSessionRecord)}
+	h := &hostNetworkHandle{ctx: ownedCtx, cancel: cancel, store: store, runtimeDir: opts.RuntimeDir, network: hostRuntime, hostExclusions: exclusions, networkLiveUntil: initialLeaseDeadline, fatal: make(chan error, 1), childExits: make(chan hostnet.ChildExit, 4), frontendDone: make(chan error, 1), checkFailures: make(chan hostNetworkCheckFailure, 8), controlSlots: make(chan struct{}, 32), policyNames: append([]string(nil), trustedNames...), policyGrants: append([]netip.Addr(nil), trustedGrants...), policyScopes: make(map[string]hostNetworkPolicyScope), fullAccessLeases: make(map[string]time.Time), maintenanceSessions: make(map[string]maintenanceSessionRecord)}
 	defer func() {
 		if retErr != nil {
 			_ = h.Close(context.Background())
@@ -326,38 +334,93 @@ func (h *hostNetworkHandle) updateFullNetworkLease(ctx context.Context, leaseID,
 func (h *hostNetworkHandle) fullNetworkLeaseLoop() {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
+	var failureSince time.Time
+	var failureDeadline time.Time
+	lastFailure := ""
+	var failureTimer *time.Timer
+	var asyncFailure string
+	defer func() {
+		if failureTimer != nil {
+			failureTimer.Stop()
+		}
+	}()
+	failed := func(step string, err error) bool {
+		if failureSince.IsZero() {
+			failureSince = time.Now()
+			failureDeadline = failureSince.Add(60 * time.Second)
+			timedOutCheck := step
+			failureTimer = time.AfterFunc(time.Until(failureDeadline), func() {
+				h.reportFatal(fmt.Errorf("host network checks failed for 60 s: %s", timedOutCheck))
+			})
+		}
+		lastFailure = step
+		logWarn("host network check failed; retrying", "check", step, "error", err, "failed_for", time.Since(failureSince).Round(time.Second))
+		if !time.Now().Before(failureDeadline) {
+			h.reportFatal(fmt.Errorf("host network checks failed for 60 s: %s: %w", lastFailure, err))
+			return true
+		}
+		return false
+	}
 	for {
 		select {
 		case <-h.ctx.Done():
 			return
-		case <-ticker.C:
-			policyCtx, policyCancel := context.WithTimeout(h.ctx, 4*time.Second)
-			policyErr := h.ApplySavedPolicy(policyCtx)
-			policyCancel()
-			if policyErr != nil {
-				h.reportFatal(fmt.Errorf("periodic saved host policy check failed: %w", policyErr))
+		case issue := <-h.checkFailures:
+			h.asyncCheckFailed.Store(true)
+			asyncFailure = issue.step
+			if failed(issue.step, issue.err) {
 				return
 			}
-			currentExclusions, inventoryErr := hostDNSExcludedPrefixes()
-			if inventoryErr == nil && !equalHostDNSPrefixes(currentExclusions, h.hostExclusions) {
-				inventoryErr = errors.New("host interface/address/route inventory changed; stop and restart the VM to recompute host exclusions")
+		case <-ticker.C:
+			if h.asyncCheckFailed.Load() {
+				if asyncFailure == "" {
+					asyncFailure = "reconcile host DNS policy"
+				}
+				if failed(asyncFailure, errors.New("host DNS policy worker reported a terminal reconciliation failure")) {
+					return
+				}
+				continue
 			}
+			policyCtx, policyCancel := context.WithTimeout(h.ctx, 4*time.Second)
+			policyErr := h.applySavedPolicy(policyCtx, false)
+			policyCancel()
+			if policyErr != nil {
+				if failed("reconcile saved host policy", policyErr) {
+					return
+				}
+				continue
+			}
+			currentExclusions, inventoryErr := hostDNSExcludedPrefixes()
 			if inventoryErr != nil {
-				h.reportFatal(fmt.Errorf("host network topology check failed: %w", inventoryErr))
+				if failed("inspect host network topology", inventoryErr) {
+					return
+				}
+				continue
+			}
+			if !equalHostDNSPrefixes(currentExclusions, h.hostExclusions) {
+				h.reportFatal(errors.New("host network topology changed: host interface/address/route inventory changed; stop and restart the VM to recompute host exclusions"))
 				return
 			}
 			now := time.Now()
 			h.updateMu.Lock()
-			if err := h.checkChildLiveness(); err != nil {
-				h.reportFatal(err)
+			if err, childDied := h.checkChildLiveness(); err != nil {
 				h.updateMu.Unlock()
-				return
+				if childDied {
+					h.reportFatal(err)
+					return
+				}
+				if failed("check host network child liveness", err) {
+					return
+				}
+				continue
 			}
 			for id, deadline := range h.fullAccessLeases {
 				if !deadline.After(now) {
 					delete(h.fullAccessLeases, id)
 				}
 			}
+			var cycleErr error
+			cycleStep := ""
 			for id, record := range h.maintenanceSessions {
 				if record.deadline.After(now) {
 					continue
@@ -367,21 +430,19 @@ func (h *hostNetworkHandle) fullNetworkLeaseLoop() {
 				dnsErr := h.dns.ClearMaintenanceAccess(cleanupCtx, h.network.LaunchID(), h.network.Generation(), record.session.GuestAddress, id)
 				cleanupCancel()
 				if err := errors.Join(networkErr, dnsErr); err != nil {
-					h.reportFatal(fmt.Errorf("reap expired maintenance session %q: %w", id, err))
-					h.updateMu.Unlock()
-					return
+					cycleStep = "reap expired maintenance session"
+					cycleErr = fmt.Errorf("%s: %w", id, err)
+					break
 				}
 				delete(h.maintenanceSessions, id)
 			}
-			networkCtx, networkCancel := context.WithTimeout(h.ctx, 4*time.Second)
-			networkErr := h.network.SetNetworkLease(networkCtx, h.network.LaunchID(), time.Now().Add(fullNetworkOwnerTTL))
-			networkCancel()
-			if networkErr != nil {
-				h.reportFatal(fmt.Errorf("renew host network liveness gate: %w", networkErr))
+			if cycleErr != nil {
 				h.updateMu.Unlock()
-				return
+				if failed(cycleStep, cycleErr) {
+					return
+				}
+				continue
 			}
-			h.networkLiveUntil = time.Now().Add(fullNetworkOwnerTTL)
 			active := len(h.fullAccessLeases) > 0
 			if active != h.fullAccessLive || active {
 				ctx, cancel := context.WithTimeout(h.ctx, 4*time.Second)
@@ -392,14 +453,68 @@ func (h *hostNetworkHandle) fullNetworkLeaseLoop() {
 				}
 				cancel()
 				if err != nil {
-					h.reportFatal(fmt.Errorf("renew full-network host lease: %w", err))
 					h.updateMu.Unlock()
-					return
+					if failed("renew full-network host lease", err) {
+						return
+					}
+					continue
 				} else {
 					h.fullAccessLive = active
 				}
 			}
+			select {
+			case issue := <-h.checkFailures:
+				h.asyncCheckFailed.Store(true)
+				asyncFailure = issue.step
+				h.updateMu.Unlock()
+				if failed(issue.step, issue.err) {
+					return
+				}
+				continue
+			default:
+			}
+			if h.asyncCheckFailed.Load() {
+				h.updateMu.Unlock()
+				if failed("reconcile host DNS policy", errors.New("host DNS policy worker reported a terminal reconciliation failure")) {
+					return
+				}
+				continue
+			}
+			networkCtx, networkCancel := context.WithTimeout(h.ctx, 4*time.Second)
+			networkDeadline := time.Now().Add(fullNetworkOwnerTTL)
+			networkErr := h.network.SetNetworkLease(networkCtx, h.network.LaunchID(), networkDeadline)
+			networkCancel()
+			if networkErr != nil {
+				h.updateMu.Unlock()
+				if failed("renew host network liveness gate", networkErr) {
+					return
+				}
+				continue
+			}
+			h.networkLiveUntil = networkDeadline
 			h.updateMu.Unlock()
+			select {
+			case issue := <-h.checkFailures:
+				h.asyncCheckFailed.Store(true)
+				asyncFailure = issue.step
+				if failed(issue.step, issue.err) {
+					return
+				}
+			default:
+				if asyncFailure == "" && !h.asyncCheckFailed.Load() {
+					if !failureDeadline.IsZero() && !time.Now().Before(failureDeadline) {
+						h.reportFatal(fmt.Errorf("host network checks failed for 60 s: %s", lastFailure))
+						return
+					}
+					if failureTimer != nil {
+						failureTimer.Stop()
+						failureTimer = nil
+					}
+					failureSince = time.Time{}
+					failureDeadline = time.Time{}
+					lastFailure = ""
+				}
+			}
 		}
 	}
 }
@@ -433,7 +548,7 @@ func (h *hostNetworkHandle) latestFullAccessDeadlineLocked(now time.Time) time.T
 	return latest
 }
 
-func (h *hostNetworkHandle) checkChildLiveness() error {
+func (h *hostNetworkHandle) checkChildLiveness() (error, bool) {
 	identities := h.network.Processes()
 	if h.frontendIdentity.PID > 0 {
 		identities["host-dns-frontend"] = hostnet.ProcessIdentity{PID: h.frontendIdentity.PID, StartTime: fmt.Sprint(h.frontendIdentity.StartTime)}
@@ -441,17 +556,21 @@ func (h *hostNetworkHandle) checkChildLiveness() error {
 	for name, identity := range identities {
 		state, start, _, err := readQemuProcessState(identity.PID)
 		if err != nil {
-			return fmt.Errorf("host network child %s liveness check failed: %w", name, err)
+			wrapped := fmt.Errorf("host network child %s liveness check failed: %w", name, err)
+			return wrapped, errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH)
 		}
 		expected, parseErr := strconv.ParseUint(identity.StartTime, 10, 64)
 		if parseErr != nil || expected != start {
-			return fmt.Errorf("host network child %s process identity changed", name)
+			if parseErr != nil {
+				return fmt.Errorf("host network child %s process identity check failed: %w", name, parseErr), false
+			}
+			return fmt.Errorf("host network child %s process identity changed", name), true
 		}
-		if state == 'T' || state == 't' || state == 'Z' || state == 'X' {
-			return fmt.Errorf("host network child %s is stopped or exiting", name)
+		if state == 'Z' || state == 'X' {
+			return fmt.Errorf("host network child %s is exiting", name), true
 		}
 	}
-	return nil
+	return nil, false
 }
 
 func (h *hostNetworkHandle) Network() hostnet.Runtime { return h.network }
@@ -475,6 +594,10 @@ func (h *hostNetworkHandle) SetPolicyRecordUpdater(update func(uint64) error) {
 // ApplySavedPolicy reloads the complete authoritative project/global snapshot
 // in the supervisor. Callers cannot submit stale policy contents over IPC.
 func (h *hostNetworkHandle) ApplySavedPolicy(ctx context.Context) error {
+	return h.applySavedPolicy(ctx, true)
+}
+
+func (h *hostNetworkHandle) applySavedPolicy(ctx context.Context, fatalOnFailure bool) error {
 	h.updateMu.Lock()
 	defer h.updateMu.Unlock()
 	if err := h.checkOperation(ctx); err != nil {
@@ -483,7 +606,9 @@ func (h *hostNetworkHandle) ApplySavedPolicy(ctx context.Context) error {
 	names, _, grants, err := loadHostNetworkInitialPolicy(h.store)
 	if err != nil {
 		wrapped := fmt.Errorf("reload saved host network policy: %w", err)
-		h.reportFatal(wrapped)
+		if fatalOnFailure {
+			h.reportFatal(wrapped)
+		}
 		return wrapped
 	}
 	if equalStrings(names, h.policyNames) && equalHostNetworkAddresses(grants, h.policyGrants) {
@@ -498,17 +623,21 @@ func (h *hostNetworkHandle) ApplySavedPolicy(ctx context.Context) error {
 		return h.network.ApplyPolicy(applyCtx, hostnet.PolicySnapshot{LaunchID: h.network.LaunchID(), Generation: generation, IPGrants: allGrants})
 	})
 	if err != nil {
-		h.reportFatal(fmt.Errorf("apply saved host network policy: %w", err))
+		if fatalOnFailure {
+			h.reportFatal(fmt.Errorf("apply saved host network policy: %w", err))
+		}
 		return err
 	}
-	h.policyNames = append(h.policyNames[:0], names...)
-	h.policyGrants = append(h.policyGrants[:0], grants...)
 	if h.recordUpdater != nil {
 		if err := h.recordUpdater(generation); err != nil {
-			h.reportFatal(fmt.Errorf("persist host network policy generation: %w", err))
+			if fatalOnFailure {
+				h.reportFatal(fmt.Errorf("persist host network policy generation: %w", err))
+			}
 			return err
 		}
 	}
+	h.policyNames = append(h.policyNames[:0], names...)
+	h.policyGrants = append(h.policyGrants[:0], grants...)
 	return nil
 }
 
@@ -815,8 +944,12 @@ func (h *hostNetworkHandle) watchFatal() {
 		select {
 		case err := <-h.dns.Fatal():
 			if err != nil {
-				h.reportFatal(fmt.Errorf("host DNS policy failure: %w", err))
-				return
+				h.asyncCheckFailed.Store(true)
+				select {
+				case h.checkFailures <- hostNetworkCheckFailure{step: "reconcile host DNS policy", err: err}:
+				case <-h.ctx.Done():
+					return
+				}
 			}
 		case child := <-h.network.ChildExits():
 			select {

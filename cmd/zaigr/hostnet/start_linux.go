@@ -30,6 +30,11 @@ type linuxRuntime struct {
 	grants         []netip.Addr
 	conn           *net.UnixConn
 	responses      *bufio.Scanner
+	responseQueue  chan helperResponseResult
+	responseStop   chan struct{}
+	responseOnce   sync.Once
+	pending        int
+	pendingWrite   chan error
 	tap            *os.File
 	maintenanceTap *os.File
 	dnsUDP         *os.File
@@ -56,6 +61,11 @@ type linuxRuntime struct {
 	slirpExited    chan struct{}
 	helperExitErr  error
 	slirpExitErr   error
+}
+
+type helperResponseResult struct {
+	response helperResponse
+	err      error
 }
 
 func startLinux(ctx context.Context, opts Options) (Runtime, error) {
@@ -110,7 +120,7 @@ func startLinux(ctx context.Context, opts Options) (Runtime, error) {
 	if targetGeneration == 0 {
 		targetGeneration = 1
 	}
-	r := &linuxRuntime{opts: opts, launchID: opts.LaunchID, generation: 0, grants: nil, helper: helper, apiSocket: socketPath(opts.RuntimeDir, "slirp-api"), eventRead: eventReader, eventChanged: make(chan struct{}), recentEvents: make(map[string]firewallEventState), identities: make(map[string]ProcessIdentity), exits: make(chan ChildExit, 2), helperDone: make(chan error, 1), slirpDone: make(chan error, 1), helperExited: make(chan struct{}), slirpExited: make(chan struct{}), forwardIDs: make(map[Forward]string)}
+	r := &linuxRuntime{opts: opts, launchID: opts.LaunchID, generation: 0, grants: nil, helper: helper, apiSocket: socketPath(opts.RuntimeDir, "slirp-api"), eventRead: eventReader, eventChanged: make(chan struct{}), responseStop: make(chan struct{}), recentEvents: make(map[string]firewallEventState), identities: make(map[string]ProcessIdentity), exits: make(chan ChildExit, 2), helperDone: make(chan error, 1), slirpDone: make(chan error, 1), helperExited: make(chan struct{}), slirpExited: make(chan struct{}), forwardIDs: make(map[Forward]string)}
 	if err := r.trackChild("hostnet-helper", helper, r.helperDone); err != nil {
 		_ = helper.Process.Kill()
 		_ = helper.Wait()
@@ -196,6 +206,8 @@ func startLinux(ctx context.Context, opts Options) (Runtime, error) {
 	r.dnsTCP = os.NewFile(uintptr(received[3]), "zaigr-dns-tcp")
 	r.responses = bufio.NewScanner(conn)
 	r.responses.Buffer(make([]byte, 4096), 1<<20)
+	r.responseQueue = make(chan helperResponseResult, 1)
+	go r.readResponses()
 	// Start slirp with a dedicated read end. The only writer is returned to the
 	// supervisor for lifetime ownership and is not inherited by children.
 	exitRead, exitWrite, err := os.Pipe()
@@ -558,60 +570,129 @@ func (r *linuxRuntime) requestContextReply(ctx context.Context, req helperReques
 	if req.Operation == "start-maintenance-session" {
 		requestTimeout = 12 * time.Second
 	}
-	req.RequestNotAfter = deadlineFor(ctx, requestTimeout).UnixNano()
+	rpcCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+	req.RequestNotAfter = deadlineFor(rpcCtx, requestTimeout).UnixNano()
 	conn := r.conn
-	_ = conn.SetDeadline(deadlineFor(ctx, requestTimeout))
-	cancelDone := make(chan struct{})
-	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close(); close(cancelDone) })
-	var finishOnce sync.Once
-	stoppedCancel := false
-	finishCancel := func() bool {
-		finishOnce.Do(func() {
-			stoppedCancel = stopCancel()
-			if !stoppedCancel {
-				<-cancelDone
+	// A timed-out request remains in flight on the shared stream. The helper
+	// rejects it as expired when it resumes, and the response reader drains that
+	// reply before this method sends another request. Closing the stream here
+	// would make a temporarily stalled helper exit on EOF.
+	for r.pending > 0 {
+		if r.pendingWrite != nil {
+			select {
+			case err := <-r.pendingWrite:
+				r.pendingWrite = nil
+				if err != nil {
+					r.pending--
+					r.poisonControl(conn)
+					return helperResponse{}, err
+				}
+			case <-rpcCtx.Done():
+				return helperResponse{}, rpcCtx.Err()
 			}
-		})
-		return stoppedCancel
+		}
+		select {
+		case result := <-r.responseQueue:
+			r.pending--
+			if result.err != nil {
+				r.poisonControl(conn)
+				return helperResponse{}, result.err
+			}
+			// This is the response for a request whose caller already timed out.
+			// Its late result cannot satisfy the new request being prepared here.
+		case <-rpcCtx.Done():
+			return helperResponse{}, rpcCtx.Err()
+		}
 	}
-	defer finishCancel()
+	if err := rpcCtx.Err(); err != nil {
+		return helperResponse{}, err
+	}
 	b, err := json.Marshal(req)
 	if err != nil {
 		return helperResponse{}, err
 	}
 	b = append(b, '\n')
-	poison := func() {
-		_ = conn.Close()
-		if r.conn == conn {
-			r.conn = nil
-		}
-	}
-	if _, err := conn.Write(b); err != nil {
-		poison()
-		return helperResponse{}, err
-	}
-	var resp helperResponse
-	if !r.responses.Scan() {
-		poison()
-		if err := r.responses.Err(); err != nil {
+	r.pending++
+	writeDone := make(chan error, 1)
+	r.pendingWrite = writeDone
+	go func() { writeDone <- writeHelperRequest(conn, b) }()
+	select {
+	case err := <-writeDone:
+		r.pendingWrite = nil
+		if err != nil {
+			r.pending--
+			r.poisonControl(conn)
 			return helperResponse{}, err
 		}
-		return helperResponse{}, errors.New("host network helper closed control channel")
+	case <-rpcCtx.Done():
+		return helperResponse{}, rpcCtx.Err()
 	}
-	if err := json.Unmarshal(r.responses.Bytes(), &resp); err != nil {
-		poison()
-		return helperResponse{}, fmt.Errorf("decode bounded helper response: %w", err)
-	}
-	if !resp.OK {
-		return helperResponse{}, errors.New(resp.Error)
-	}
-	if !finishCancel() && ctx.Err() != nil {
-		if r.conn == conn {
-			r.conn = nil
+	select {
+	case result := <-r.responseQueue:
+		r.pending--
+		if result.err != nil {
+			r.poisonControl(conn)
+			return helperResponse{}, result.err
 		}
-		return helperResponse{}, ctx.Err()
+		if err := rpcCtx.Err(); err != nil {
+			return helperResponse{}, err
+		}
+		if !result.response.OK {
+			return helperResponse{}, errors.New(result.response.Error)
+		}
+		return result.response, nil
+	case <-rpcCtx.Done():
+		return helperResponse{}, rpcCtx.Err()
 	}
-	return resp, nil
+}
+
+func writeHelperRequest(conn *net.UnixConn, request []byte) error {
+	for len(request) > 0 {
+		n, err := conn.Write(request)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return errors.New("short write to host network helper")
+		}
+		request = request[n:]
+	}
+	return nil
+}
+
+func (r *linuxRuntime) poisonControl(conn *net.UnixConn) {
+	_ = conn.Close()
+	if r.conn == conn {
+		r.conn = nil
+	}
+}
+
+func (r *linuxRuntime) readResponses() {
+	for r.responses.Scan() {
+		var response helperResponse
+		if err := json.Unmarshal(r.responses.Bytes(), &response); err != nil {
+			r.queueResponse(helperResponseResult{err: fmt.Errorf("decode bounded helper response: %w", err)})
+			return
+		}
+		if !r.queueResponse(helperResponseResult{response: response}) {
+			return
+		}
+	}
+	err := r.responses.Err()
+	if err == nil {
+		err = errors.New("host network helper closed control channel")
+	}
+	r.queueResponse(helperResponseResult{err: err})
+}
+
+func (r *linuxRuntime) queueResponse(result helperResponseResult) bool {
+	select {
+	case r.responseQueue <- result:
+		return true
+	case <-r.responseStop:
+		return false
+	}
 }
 
 func deadlineFor(ctx context.Context, maximum time.Duration) time.Time {
@@ -687,9 +768,12 @@ func (r *linuxRuntime) Stop(ctx context.Context) error {
 	}
 	r.stopped = true
 	var errs []error
+	r.responseOnce.Do(func() { close(r.responseStop) })
 	if r.conn != nil {
-		_ = r.conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
-		_ = json.NewEncoder(r.conn).Encode(helperRequest{Operation: "stop", LaunchID: r.launchID, Generation: r.generation})
+		if r.pending == 0 {
+			_ = r.conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
+			_ = json.NewEncoder(r.conn).Encode(helperRequest{Operation: "stop", LaunchID: r.launchID, Generation: r.generation})
+		}
 		_ = r.conn.Close()
 		r.conn = nil
 	}

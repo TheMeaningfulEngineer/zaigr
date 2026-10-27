@@ -600,6 +600,41 @@ func writeVMSupervisorRecord(store projectStore, record vmSupervisorRecord) erro
 	return writeFileAtomically(store.vmSupervisorPath(), data, 0600)
 }
 
+func vmStopNoticePath(store projectStore) string {
+	return filepath.Join(store.Path, "vm-stop-notice")
+}
+
+func recordVMStop(store projectStore, log io.Writer, reason string) error {
+	line := fmt.Sprintf("The VM stopped at %s because %s", time.Now().UTC().Format(time.RFC3339), reason)
+	if _, err := fmt.Fprintln(log, line); err != nil {
+		return fmt.Errorf("write VM stop to supervisor log: %w", err)
+	}
+	if syncer, ok := log.(interface{ Sync() error }); ok {
+		if err := syncer.Sync(); err != nil {
+			return fmt.Errorf("sync VM stop to supervisor log: %w", err)
+		}
+	}
+	if err := writeFileAtomically(vmStopNoticePath(store), []byte(line+"\n"), 0600); err != nil {
+		return fmt.Errorf("persist VM stop notice: %w", err)
+	}
+	return nil
+}
+
+func showVMStopNotice(store projectStore) {
+	path := vmStopNoticePath(store)
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 {
+		return
+	}
+	line := strings.TrimSpace(string(data))
+	if line == "" {
+		return
+	}
+	if n, err := fmt.Fprintf(os.Stdout, ":: %s\n", line); err == nil && n == len(line)+4 {
+		_ = os.Remove(path)
+	}
+}
+
 func vmProcessIdentity(pid int) (vmOwnedProcess, error) {
 	start, err := processStartTime(pid)
 	if err != nil {
@@ -1446,6 +1481,7 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 	ready := os.NewFile(3, "ready")
 	var committed bool
 	var readyErrorReported bool
+	stopRecorded := false
 	defer func() {
 		// Some validation failures happen before the supervisor's normal
 		// teardown handler is installed. Report those through the same bounded
@@ -1577,6 +1613,17 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 		// Send the phase-specific startup error immediately after closing the
 		// uplink. Broker shutdown can take its own bounded grace period, but it
 		// must not hide the failure from the launcher until then.
+		if committed && !stopRecorded {
+			reason := "supervisor exited"
+			if retErr != nil {
+				reason = retErr.Error()
+			}
+			if err := recordVMStop(store, supervisorLog, reason); err != nil {
+				retErr = errors.Join(retErr, err)
+			} else {
+				stopRecorded = true
+			}
+		}
 		if retErr != nil && !committed {
 			state := "error"
 			var collision *vmGuestCIDCollisionError
@@ -2065,6 +2112,10 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 				}
 				_ = ready.Close()
 			case "stop":
+				if err := recordVMStop(store, supervisorLog, "requested by the user"); err != nil {
+					return err
+				}
+				stopRecorded = true
 				return nil
 			case "__eof__":
 				if !committed || spec.Mode == "attached" {
@@ -2075,13 +2126,20 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 			}
 		case ended := <-exit:
 			alive[ended.name] = false
-			_, _ = fmt.Fprintf(supervisorLog, "%s exited: %v\n", ended.name, ended.err)
+			if err := recordVMStop(store, supervisorLog, fmt.Sprintf("%s exited: %v", ended.name, ended.err)); err != nil {
+				_, _ = fmt.Fprintf(supervisorLog, "could not persist VM stop notice: %v\n", err)
+			} else {
+				stopRecorded = true
+			}
 			if ended.name == "qemu" {
 				return qemuExitResult(ended.err)
 			}
 			return fmt.Errorf("%s exited: %v", ended.name, ended.err)
 		case sig := <-signals:
-			_, _ = fmt.Fprintf(supervisorLog, "signal %s\n", sig)
+			if err := recordVMStop(store, supervisorLog, fmt.Sprintf("supervisor received %s", sig)); err != nil {
+				return err
+			}
+			stopRecorded = true
 			return nil
 		case <-precommitTimer.C:
 			return fmt.Errorf("VM startup commit deadline exceeded")

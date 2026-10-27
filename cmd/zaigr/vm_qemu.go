@@ -548,6 +548,7 @@ func cmdVMShell(ram string, cpu string, preset string, setups []string, root boo
 	if err := requireNoActiveSetupCapture("zaigr shell"); err != nil {
 		return err
 	}
+	showVMStopNotice(currentProjectStore())
 
 	presetDef, runScript, setupDefs, err := loadPresetPlan(preset, setups)
 	if err != nil {
