@@ -491,13 +491,15 @@ def test_malformed_stale_owner_record_blocks_cleanup_without_losing_evidence(pro
         marker.unlink(missing_ok=True)
 
 
-@pytest.mark.timeout(260)
+@pytest.mark.timeout(450)
 def test_attached_setup_continues_past_supervisor_startup_deadline(project, setup_factory):
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
     setup_factory("long-attached-virtiofs", "sleep 155\nprintf 'attached-setup-complete\\n'\n")
     started = time.monotonic()
-    output = run([zaigr, "project", "setup", "run", "long-attached-virtiofs"], input="y\n", timeout=240)
+    # The 420s command budget includes initialization, two VM boots, the 155s
+    # setup sleep, image finalization, and the post-setup VM checks.
+    output = run([zaigr, "project", "setup", "run", "long-attached-virtiofs"], input="y\n", timeout=420)
     assert time.monotonic() - started > 150
     assert "attached-setup-complete" in output
     record = json.loads((project.store_dir / "vm-supervisor.json").read_text())

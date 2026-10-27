@@ -983,7 +983,7 @@ func rebuildLegacyProjectStore(store projectStore, definitions []setupDefinition
 	defer func() {
 		stagedStore := projectStore{Path: filepath.Join(stagingDir, "store")}
 		if _, err := os.Stat(stagedStore.Path); os.IsNotExist(err) {
-			returnErr = errors.Join(returnErr, os.RemoveAll(stagingDir))
+			returnErr = errors.Join(returnErr, removeRebuildStagingTree(stagingDir))
 			return
 		} else if err != nil {
 			returnErr = errors.Join(returnErr, err)
@@ -993,7 +993,7 @@ func rebuildLegacyProjectStore(store projectStore, definitions []setupDefinition
 			returnErr = errors.Join(returnErr, err)
 			return
 		}
-		returnErr = errors.Join(returnErr, os.RemoveAll(stagingDir))
+		returnErr = errors.Join(returnErr, removeRebuildStagingTree(stagingDir))
 	}()
 	stagedStore := projectStore{Hash: store.Hash, Path: filepath.Join(stagingDir, "store")}
 	if err := os.MkdirAll(stagedStore.Path, 0755); err != nil {
@@ -1094,6 +1094,30 @@ func preserveLegacyAgentState(sourceStore projectStore, stagedStore projectStore
 		return fmt.Errorf("sync preserved legacy agent state: %w", err)
 	}
 	return syncDirectory(stagedStore.Path)
+}
+
+// removeRebuildStagingTree makes copied state directories owner-writable before
+// removing the unpublished staging tree. The staged copy must retain source
+// permissions while it is used for rebuild setup, including read-only modes;
+// cleanup can relax them because the whole tree is discarded.
+func removeRebuildStagingTree(root string) error {
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.IsDir() {
+			return nil
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		return os.Chmod(path, info.Mode().Perm()|0700)
+	})
+	if err != nil {
+		return err
+	}
+	return os.RemoveAll(root)
 }
 
 func syncPreservedTree(root string) error {
@@ -1238,7 +1262,7 @@ func buildRebuildCandidate(store projectStore, sourceStore projectStore, definit
 			returnErr = errors.Join(returnErr, err)
 			return
 		}
-		returnErr = errors.Join(returnErr, os.RemoveAll(stagingDir))
+		returnErr = errors.Join(returnErr, removeRebuildStagingTree(stagingDir))
 	}()
 	agentStateDir := filepath.Join(stagingDir, "agent-state")
 	if err := copyRebuildAgentState(sourceStore.agentStateDir(), agentStateDir); err != nil {
