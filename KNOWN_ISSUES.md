@@ -1,5 +1,17 @@
 # Known issues
 
+## Firewall change during a host network stall requires restarting the VM
+
+If the host network service stops responding while a firewall rule is being
+changed, zaigr may be unable to confirm that the rule reached the running VM.
+The saved rule remains on disk. Zaigr fails closed, starts blocking network
+access within 10 seconds, and stops the VM within 60 seconds. Start the VM again
+to apply the saved firewall rules.
+
+Zaigr cannot recover this DNS and firewall policy update as one all-or-nothing
+operation yet. A later change is needed before it can safely recover without a
+VM restart.
+
 ## Secondary guest accounts and host-side UID inspection are not mapped
 
 Virtiofs translates ownership on the shared workspace and agent-state mounts

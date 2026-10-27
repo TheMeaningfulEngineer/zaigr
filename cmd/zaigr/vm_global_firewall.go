@@ -242,7 +242,7 @@ func reconcileGlobalHostFirewallPolicy() error {
 			failures = append(failures, fmt.Errorf("project %s: %w", store.Hash, err))
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
 		_, syncErr := hostNetworkControl(ctx, store.runtimeDir(), record.LaunchID, "policy-reconcile", hostnet.Forward{})
 		cancel()
 		_ = lock.release()

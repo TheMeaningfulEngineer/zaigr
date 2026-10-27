@@ -574,6 +574,16 @@ func (s *Server) Close() error {
 // remain ordinary fail-closed DNS responses and do not signal this channel.
 func (s *Server) Fatal() <-chan error { return s.fatal }
 
+// Failure returns the sticky kernel-policy failure, if one has occurred.
+// Unlike consuming Fatal, this snapshot is safe for synchronous callers that
+// need to distinguish a terminal policy failure from ordinary validation
+// errors while the supervisor also observes the asynchronous notification.
+func (s *Server) Failure() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.failed
+}
+
 func (s *Server) failClosed(err error) {
 	s.mu.Lock()
 	first := false

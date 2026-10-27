@@ -329,7 +329,7 @@ func cmdProjectFirewallDomainChange(raw string, allow bool) error {
 		if !host {
 			return errors.New("domain firewall changes require host-enforced networking; stop and restart this legacy VM")
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
 		_, err = hostNetworkControl(ctx, store.runtimeDir(), record.LaunchID, "policy-reconcile", hostnet.Forward{})
 		cancel()
 		if err != nil {

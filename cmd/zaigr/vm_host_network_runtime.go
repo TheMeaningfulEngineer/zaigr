@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -51,6 +52,9 @@ type hostNetworkHandle struct {
 	frontendIdentity    hostnet.ProcessIdentity
 	checkFailures       chan hostNetworkCheckFailure
 	asyncCheckFailed    atomic.Bool
+	asyncCheckErrMu     sync.Mutex
+	asyncCheckErr       error
+	asyncCheckStep      string
 	policyNames         []string
 	policyGrants        []netip.Addr
 	hostExclusions      []netip.Prefix
@@ -86,6 +90,12 @@ type maintenanceSessionRecord struct {
 type hostNetworkCheckFailure struct {
 	step string
 	err  error
+}
+
+const terminalDNSPolicyFailurePrefix = "terminal host DNS policy failure: "
+
+func terminalDNSPolicyFailure(err error) error {
+	return fmt.Errorf("Couldn't confirm the saved firewall policy ("+terminalDNSPolicyFailurePrefix+"%w). Network access is being blocked (within 10 seconds); the VM will stop within 60 seconds. Your saved firewall rules will be applied when you start the VM again.", err)
 }
 
 // startHostNetworkRuntime performs the complete host-owned network bootstrap.
@@ -339,6 +349,7 @@ func (h *hostNetworkHandle) fullNetworkLeaseLoop() {
 	lastFailure := ""
 	var failureTimer *time.Timer
 	var asyncFailure string
+	var lastFailureErr error
 	defer func() {
 		if failureTimer != nil {
 			failureTimer.Stop()
@@ -349,14 +360,28 @@ func (h *hostNetworkHandle) fullNetworkLeaseLoop() {
 			failureSince = time.Now()
 			failureDeadline = failureSince.Add(60 * time.Second)
 			timedOutCheck := step
+			timedOutErr := err
 			failureTimer = time.AfterFunc(time.Until(failureDeadline), func() {
-				h.reportFatal(fmt.Errorf("host network checks failed for 60 s: %s", timedOutCheck))
+				if dnsFailure := h.asyncCheckFailure(); dnsFailure != nil {
+					if strings.Contains(dnsFailure.err.Error(), terminalDNSPolicyFailurePrefix) {
+						h.reportFatal(fmt.Errorf("%w; stopped after 60-second grace", dnsFailure.err))
+					} else {
+						h.reportFatal(fmt.Errorf("host network checks failed for 60 s: %s: %w", dnsFailure.step, dnsFailure.err))
+					}
+					return
+				}
+				h.reportFatal(fmt.Errorf("host network checks failed for 60 s: %s: %w", timedOutCheck, timedOutErr))
 			})
 		}
 		lastFailure = step
+		lastFailureErr = err
 		logWarn("host network check failed; retrying", "check", step, "error", err, "failed_for", time.Since(failureSince).Round(time.Second))
 		if !time.Now().Before(failureDeadline) {
-			h.reportFatal(fmt.Errorf("host network checks failed for 60 s: %s: %w", lastFailure, err))
+			if issue := h.asyncCheckFailure(); issue != nil && strings.Contains(issue.err.Error(), terminalDNSPolicyFailurePrefix) {
+				h.reportFatal(fmt.Errorf("%w; stopped after 60-second grace", issue.err))
+			} else {
+				h.reportFatal(fmt.Errorf("host network checks failed for 60 s: %s: %w", lastFailure, lastFailureErr))
+			}
 			return true
 		}
 		return false
@@ -366,17 +391,18 @@ func (h *hostNetworkHandle) fullNetworkLeaseLoop() {
 		case <-h.ctx.Done():
 			return
 		case issue := <-h.checkFailures:
-			h.asyncCheckFailed.Store(true)
 			asyncFailure = issue.step
 			if failed(issue.step, issue.err) {
 				return
 			}
 		case <-ticker.C:
 			if h.asyncCheckFailed.Load() {
-				if asyncFailure == "" {
-					asyncFailure = "reconcile host DNS policy"
+				issue := h.asyncCheckFailure()
+				if issue == nil {
+					issue = &hostNetworkCheckFailure{step: "reconcile host DNS policy", err: errors.New("host DNS policy worker reported a terminal reconciliation failure")}
 				}
-				if failed(asyncFailure, errors.New("host DNS policy worker reported a terminal reconciliation failure")) {
+				asyncFailure = issue.step
+				if failed(issue.step, issue.err) {
 					return
 				}
 				continue
@@ -464,7 +490,6 @@ func (h *hostNetworkHandle) fullNetworkLeaseLoop() {
 			}
 			select {
 			case issue := <-h.checkFailures:
-				h.asyncCheckFailed.Store(true)
 				asyncFailure = issue.step
 				h.updateMu.Unlock()
 				if failed(issue.step, issue.err) {
@@ -475,7 +500,11 @@ func (h *hostNetworkHandle) fullNetworkLeaseLoop() {
 			}
 			if h.asyncCheckFailed.Load() {
 				h.updateMu.Unlock()
-				if failed("reconcile host DNS policy", errors.New("host DNS policy worker reported a terminal reconciliation failure")) {
+				issue := h.asyncCheckFailure()
+				if issue == nil {
+					issue = &hostNetworkCheckFailure{step: "reconcile host DNS policy", err: errors.New("host DNS policy worker reported a terminal reconciliation failure")}
+				}
+				if failed(issue.step, issue.err) {
 					return
 				}
 				continue
@@ -495,7 +524,6 @@ func (h *hostNetworkHandle) fullNetworkLeaseLoop() {
 			h.updateMu.Unlock()
 			select {
 			case issue := <-h.checkFailures:
-				h.asyncCheckFailed.Store(true)
 				asyncFailure = issue.step
 				if failed(issue.step, issue.err) {
 					return
@@ -503,7 +531,15 @@ func (h *hostNetworkHandle) fullNetworkLeaseLoop() {
 			default:
 				if asyncFailure == "" && !h.asyncCheckFailed.Load() {
 					if !failureDeadline.IsZero() && !time.Now().Before(failureDeadline) {
-						h.reportFatal(fmt.Errorf("host network checks failed for 60 s: %s", lastFailure))
+						if issue := h.asyncCheckFailure(); issue != nil {
+							if strings.Contains(issue.err.Error(), terminalDNSPolicyFailurePrefix) {
+								h.reportFatal(fmt.Errorf("%w; stopped after 60-second grace", issue.err))
+							} else {
+								h.reportFatal(fmt.Errorf("host network checks failed for 60 s: %s: %w", issue.step, issue.err))
+							}
+						} else {
+							h.reportFatal(fmt.Errorf("host network checks failed for 60 s: %s: %w", lastFailure, lastFailureErr))
+						}
 						return
 					}
 					if failureTimer != nil {
@@ -597,10 +633,54 @@ func (h *hostNetworkHandle) ApplySavedPolicy(ctx context.Context) error {
 	return h.applySavedPolicy(ctx, true)
 }
 
+func (h *hostNetworkHandle) recordAsyncCheckFailure(step string, err error) {
+	h.asyncCheckErrMu.Lock()
+	if h.asyncCheckErr == nil {
+		h.asyncCheckErr = err
+		h.asyncCheckStep = step
+	}
+	issue := hostNetworkCheckFailure{step: h.asyncCheckStep, err: h.asyncCheckErr}
+	first := !h.asyncCheckFailed.Load()
+	h.asyncCheckFailed.Store(true)
+	h.asyncCheckErrMu.Unlock()
+	if !first {
+		return
+	}
+	select {
+	case h.checkFailures <- issue:
+	case <-h.ctx.Done():
+	}
+}
+
+func (h *hostNetworkHandle) currentTerminalDNSPolicyFailure() error {
+	dnsFailure := h.dns.Failure()
+	if dnsFailure == nil {
+		return nil
+	}
+	terminalErr := terminalDNSPolicyFailure(dnsFailure)
+	h.recordAsyncCheckFailure("reconcile host DNS policy", terminalErr)
+	return terminalErr
+}
+
+func (h *hostNetworkHandle) asyncCheckFailure() *hostNetworkCheckFailure {
+	h.asyncCheckErrMu.Lock()
+	defer h.asyncCheckErrMu.Unlock()
+	if h.asyncCheckErr == nil {
+		return nil
+	}
+	return &hostNetworkCheckFailure{step: h.asyncCheckStep, err: h.asyncCheckErr}
+}
+
 func (h *hostNetworkHandle) applySavedPolicy(ctx context.Context, fatalOnFailure bool) error {
 	h.updateMu.Lock()
 	defer h.updateMu.Unlock()
+	if terminalErr := h.currentTerminalDNSPolicyFailure(); terminalErr != nil {
+		return terminalErr
+	}
 	if err := h.checkOperation(ctx); err != nil {
+		if terminalErr := h.currentTerminalDNSPolicyFailure(); terminalErr != nil {
+			return terminalErr
+		}
 		return err
 	}
 	names, _, grants, err := loadHostNetworkInitialPolicy(h.store)
@@ -623,6 +703,9 @@ func (h *hostNetworkHandle) applySavedPolicy(ctx context.Context, fatalOnFailure
 		return h.network.ApplyPolicy(applyCtx, hostnet.PolicySnapshot{LaunchID: h.network.LaunchID(), Generation: generation, IPGrants: allGrants})
 	})
 	if err != nil {
+		if terminalErr := h.currentTerminalDNSPolicyFailure(); terminalErr != nil {
+			return terminalErr
+		}
 		if fatalOnFailure {
 			h.reportFatal(fmt.Errorf("apply saved host network policy: %w", err))
 		}
@@ -944,12 +1027,7 @@ func (h *hostNetworkHandle) watchFatal() {
 		select {
 		case err := <-h.dns.Fatal():
 			if err != nil {
-				h.asyncCheckFailed.Store(true)
-				select {
-				case h.checkFailures <- hostNetworkCheckFailure{step: "reconcile host DNS policy", err: err}:
-				case <-h.ctx.Done():
-					return
-				}
+				h.recordAsyncCheckFailure("reconcile host DNS policy", terminalDNSPolicyFailure(err))
 			}
 		case child := <-h.network.ChildExits():
 			select {
@@ -1212,6 +1290,12 @@ func hostNetworkControlRequestWithReply(ctx context.Context, runtimeDir, launchI
 	}
 	defer conn.Close()
 	controlTimeout := 4 * time.Second
+	if operation == "policy-reconcile" {
+		// The supervisor's policy operation is bounded at four seconds, but the
+		// caller needs time to read its terminal-failure response after that
+		// deadline. The supervisor keeps its Unix socket open one extra second.
+		controlTimeout = 6 * time.Second
+	}
 	if operation == "maintenance-start" {
 		controlTimeout = 12 * time.Second
 	}
