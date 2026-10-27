@@ -786,7 +786,9 @@ func waitForExpectedExecutable(expected vmOwnedProcess, executable vmExecutableI
 	return vmOwnedProcess{}, fmt.Errorf("PID %d did not transition to the expected executable before startup deadline", expected.PID)
 }
 
-func waitForQEMUProcessIdentity(launcher vmOwnedProcess, spec vmLaunchSpec, deadline time.Time) (vmOwnedProcess, bool, error) {
+func waitForQEMUProcessIdentity(launcher vmOwnedProcess, spec vmLaunchSpec, deadline time.Time, commands <-chan string, signals <-chan os.Signal) (vmOwnedProcess, bool, error) {
+	poll := time.NewTicker(20 * time.Millisecond)
+	defer poll.Stop()
 	for time.Now().Before(deadline) {
 		state, err := processState(launcher.PID)
 		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
@@ -837,7 +839,13 @@ func waitForQEMUProcessIdentity(launcher vmOwnedProcess, spec vmLaunchSpec, dead
 				return actual, true, nil
 			}
 		}
-		time.Sleep(20 * time.Millisecond)
+		select {
+		case line := <-commands:
+			return vmOwnedProcess{}, false, fmt.Errorf("launcher command %q before QEMU process identity was confirmed", line)
+		case sig := <-signals:
+			return vmOwnedProcess{}, false, fmt.Errorf("supervisor received %s while waiting for QEMU process identity", sig)
+		case <-poll.C:
+		}
 	}
 	return vmOwnedProcess{}, false, fmt.Errorf("QEMU process PID %d did not exec with the expected QMP socket and vsock CID before startup deadline", launcher.PID)
 }
@@ -1920,7 +1928,7 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 		return fmt.Errorf("start QEMU (%s): %w", filepath.Join(spec.LogRoot, "vm-qemu.log"), err)
 	}
 	qemuLauncher := record.QEMU
-	qemuIdentity, qemuExecConfirmed, err := waitForQEMUProcessIdentity(qemuLauncher, spec, startupDeadline)
+	qemuIdentity, qemuExecConfirmed, err := waitForQEMUProcessIdentity(qemuLauncher, spec, startupDeadline, commands, signals)
 	if err != nil {
 		return fmt.Errorf("identify QEMU process: %w", err)
 	}
