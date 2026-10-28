@@ -138,7 +138,7 @@ func ensureKernelQuiet(noCache bool) (string, error) {
 func ensureKernelWithWriter(noCache bool, out io.Writer) (string, error) {
 	ver := embeddedVersion(embeddedKernel, "zaigr-")
 	digest := sha256.Sum256(embeddedKernel)
-	path := filepath.Join(zaigDir(), fmt.Sprintf("bzImage-%s-%x", ver, digest))
+	path := filepath.Join(zaigDir(), fmt.Sprintf("bzImage-%s-%x", ver, digest[:6]))
 
 	if !noCache {
 		if _, err := os.Stat(path); err == nil {
@@ -170,7 +170,7 @@ func virtiofsdVersion() string { return strings.TrimSpace(embeddedVirtiofsdVersi
 
 func ensureVirtiofsdWithWriter(noCache bool, out io.Writer) (string, error) {
 	digest := sha256.Sum256(embeddedVirtiofsd)
-	path := filepath.Join(zaigDir(), fmt.Sprintf("virtiofsd-%s-%x", virtiofsdVersion(), digest))
+	path := filepath.Join(zaigDir(), fmt.Sprintf("virtiofsd-%s-%x", virtiofsdVersion(), digest[:6]))
 	if err := os.MkdirAll(zaigDir(), 0755); err != nil {
 		return "", fmt.Errorf("create virtiofsd cache: %w", err)
 	}
@@ -224,7 +224,7 @@ func ensureSlirp4netnsWithWriter(noCache bool, out io.Writer) (string, error) {
 	if version == "" {
 		return "", errors.New("embedded slirp4netns version is empty")
 	}
-	path := filepath.Join(zaigDir(), fmt.Sprintf("slirp4netns-%s-%x", version, digest))
+	path := filepath.Join(zaigDir(), fmt.Sprintf("slirp4netns-%s-%x", version, digest[:6]))
 	if err := os.MkdirAll(zaigDir(), 0755); err != nil {
 		return "", fmt.Errorf("create slirp4netns cache: %w", err)
 	}
