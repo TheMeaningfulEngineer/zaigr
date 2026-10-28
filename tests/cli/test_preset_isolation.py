@@ -146,6 +146,7 @@ def test_preset_launch_cleans_environment_fds_and_ignores_host_ssh_config(
     run(
         [
             "gcc",
+            "-static",
             "-O2",
             "-Wall",
             "-Wextra",

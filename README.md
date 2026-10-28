@@ -570,7 +570,7 @@ guest assets and both host tools in the Go binary. Zaigr extracts slirp4netns un
 checksum-pinned libcap-ng and libseccomp sources from `deps.lock` and builds
 their static musl libraries; host development copies of those libraries are not used. The
 kernel build additionally needs GCC, flex, bison, and bc. The rootfs build
-needs mmdebstrap, fakeroot, zstd, openssl, and e2fsprogs. See
+needs mmdebstrap, fakeroot, zstd, and e2fsprogs. See
 [`vm_prep/build-virtiofsd.sh`](vm_prep/build-virtiofsd.sh) for exact source
 revisions, checksums, and validation.
 
