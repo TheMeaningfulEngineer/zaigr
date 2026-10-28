@@ -15,6 +15,8 @@ import (
 	"zaigr/cmd/zaigr/hostnet"
 )
 
+var errHostDNSEventStreamEnded = errors.New("host DNS event stream ended unexpectedly")
+
 // StreamDomainEvents sends launch-scoped host DNS observations as JSON lines.
 // A history-gap event is explicit: callers must mark capture output incomplete
 // rather than silently treating a wrapped ring as a complete observation.
@@ -138,7 +140,7 @@ func streamHostNetworkDomainEventsReady(ctx context.Context, runtimeDir, launchI
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	return errors.New("host DNS event stream ended unexpectedly")
+	return errHostDNSEventStreamEnded
 }
 
 // streamHostNetworkFirewallEvents is the interactive CLI client for packet

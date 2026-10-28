@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -21,6 +20,7 @@ import (
 	"github.com/miekg/dns"
 	"zaigr/cmd/zaigr/hostdns"
 	"zaigr/cmd/zaigr/hostnet"
+	"zaigr/cmd/zaigr/vmssh"
 )
 
 const setupCaptureGuestAgentStateDir = "/home/user/.zaigr-agent-state"
@@ -161,10 +161,13 @@ func startNewSetupCapture(store projectStore, confirmRunningVM bool) (returnErr 
 		stopDomainLog()
 		return err
 	}
+	intentionalTeardown := false
 	defer func() {
 		stopDomainLog()
 		if waitErr := domainLog.Wait(); waitErr != nil {
-			returnErr = errors.Join(returnErr, fmt.Errorf("setup capture endpoint stream is incomplete: %w", waitErr))
+			if !(intentionalTeardown && errors.Is(waitErr, errHostDNSEventStreamEnded)) {
+				returnErr = errors.Join(returnErr, fmt.Errorf("setup capture endpoint stream is incomplete: %w", waitErr))
+			}
 		}
 		if closeErr := closeDomainLog(); closeErr != nil {
 			returnErr = errors.Join(returnErr, closeErr)
@@ -176,7 +179,11 @@ func startNewSetupCapture(store projectStore, confirmRunningVM bool) (returnErr 
 		return err
 	}
 	return withMaintenanceNetworkSession(store, endpoint, "project setup capture", func(namespace string) error {
-		return runProjectSetupCaptureShell(endpoint, token, namespace)
+		shellErr := runProjectSetupCaptureShell(endpoint, token, namespace)
+		if shellErr == nil {
+			intentionalTeardown = setupCaptureLaunchResolved(store, meta, endpoint.LaunchID)
+		}
+		return shellErr
 	})
 }
 
@@ -662,23 +669,34 @@ func intentionalCaptureTeardown(waitErr error, store projectStore, meta setupCap
 	if waitErr == nil || !captureActive || meta.OverlayImagePath == "" || launchID == "" {
 		return false
 	}
-	var exitErr *exec.ExitError
-	if !errors.As(waitErr, &exitErr) || exitErr.ExitCode() != 255 {
+	var unknown *vmssh.OutcomeUnknownError
+	if !errors.As(waitErr, &unknown) {
 		return false
 	}
+	// A transport loss alone is never success. Accept it only after the exact
+	// capture launch is gone and its overlay and active metadata were resolved.
 	deadline := time.Now().Add(12 * time.Second)
 	for {
-		stopped := fullNetworkLeaseLaunchStopped(store.runtimeDir(), launchID)
-		_, exists, metadataErr := store.readSetupCaptureMetadata()
-		_, overlayErr := os.Stat(meta.OverlayImagePath)
-		if stopped && metadataErr == nil && !exists && os.IsNotExist(overlayErr) {
+		if setupCaptureLaunchResolved(store, meta, launchID) {
 			return true
 		}
-		if metadataErr != nil || time.Now().After(deadline) {
+		if _, _, metadataErr := store.readSetupCaptureMetadata(); metadataErr != nil || time.Now().After(deadline) {
 			return false
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+func setupCaptureLaunchResolved(store projectStore, meta setupCaptureMetadata, launchID string) bool {
+	if launchID == "" || meta.OverlayImagePath == "" || !fullNetworkLeaseLaunchStopped(store.runtimeDir(), launchID) {
+		return false
+	}
+	_, exists, err := store.readSetupCaptureMetadata()
+	if err != nil || exists {
+		return false
+	}
+	_, err = os.Stat(meta.OverlayImagePath)
+	return os.IsNotExist(err)
 }
 
 func setupCaptureShellCommand(token string) string {
