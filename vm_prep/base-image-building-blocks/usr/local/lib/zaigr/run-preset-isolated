@@ -45,7 +45,7 @@ require_preset_state() {
 	else
 		mkdir -- "$state_dir" || fatal "cannot create preset state"
 	fi
-	setpriv --reuid=user --regid=user --init-groups -- \
+	setpriv --no-new-privs --reuid=user --regid=user --init-groups -- \
 		test -r "$state_dir" -a -w "$state_dir" -a -x "$state_dir" || \
 		fatal "preset state is not accessible to user"
 }
@@ -161,7 +161,7 @@ run_inside_isolation() {
 	terminal="${TERM:-xterm-256color}"
 
 	set +e
-	setpriv --reuid=user --regid=user --init-groups -- \
+	setpriv --no-new-privs --reuid=user --regid=user --init-groups -- \
 		env -i \
 		HOME=/home/user \
 		USER=user \

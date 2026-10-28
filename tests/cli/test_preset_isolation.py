@@ -135,10 +135,35 @@ def test_preset_launch_cleans_environment_fds_and_ignores_host_ssh_config(
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
 
+    suid_probe_source = project.cwd / "preset-suid-probe.c"
+    suid_probe = project.cwd / "preset-suid-probe"
+    suid_probe_source.write_text(
+        "#include <stdio.h>\n"
+        "#include <unistd.h>\n"
+        "int main(void) { printf(\"SUID_EUID=%ld\\n\", (long)geteuid()); return 0; }\n",
+        encoding="utf-8",
+    )
+    run(
+        [
+            "gcc",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-o",
+            suid_probe,
+            suid_probe_source,
+        ],
+        timeout=30,
+    )
+
     setup_factory(
         setup_name="preset-launch-leaks",
         script_content=r"""
 printf 'launcher-fd-secret\n' > /root/launcher-fd-secret
+install -o root -g root -m 4755 \
+    /home/user/workspace/preset-suid-probe \
+    /usr/local/bin/preset-suid-probe
 cat > /usr/local/lib/zaigr/test-root-shell <<'EOF'
 #!/bin/bash
 export ZAIGR_TEST_INHERITED_ENV=launcher-environment-secret
@@ -178,6 +203,12 @@ if [[ -v ZAIGR_TEST_INHERITED_ENV || -v PRESET_HOST_SECRET || -v SSH_AUTH_SOCK ]
 else
     printf 'INHERITED_CREDENTIAL_ENV_CLEAN\n'
 fi
+if grep -Eq '^NoNewPrivs:[[:space:]]+1$' /proc/self/status; then
+    printf 'PRESET_NO_NEW_PRIVS=1\n'
+else
+    printf 'PRESET_NO_NEW_PRIVS=0\n'
+fi
+/usr/local/bin/preset-suid-probe
 if (: <> /dev/tcp/127.0.0.1/__REMOTE_FORWARD_PORT__) 2>/dev/null; then
     printf 'REMOTE_FORWARD_PRESENT\n'
 else
@@ -199,6 +230,10 @@ read -r _
         input="y\n",
         timeout=180,
     )
+    assert run(
+        f"{zaigr} project vm exec -- /usr/local/bin/preset-suid-probe",
+        timeout=20,
+    ).strip() == "SUID_EUID=0"
 
     ssh_dir = project.home / ".ssh"
     ssh_dir.mkdir(mode=0o700)
@@ -246,6 +281,8 @@ read -r _
             shell.expect_exact("ENV_ALLOWLIST_OK", timeout=180)
             shell.expect_exact("LAUNCHER_FDS_CLEAN", timeout=20)
             shell.expect_exact("INHERITED_CREDENTIAL_ENV_CLEAN", timeout=20)
+            shell.expect_exact("PRESET_NO_NEW_PRIVS=1", timeout=20)
+            shell.expect_exact("SUID_EUID=1000", timeout=20)
             shell.expect_exact("REMOTE_FORWARD_ABSENT", timeout=20)
             assert not ssh_invocation_marker.exists()
             shell.expect(
