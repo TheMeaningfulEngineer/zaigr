@@ -31,9 +31,6 @@ mkdir -p "$(dirname "$ROOTFS_ZST")" "$(dirname "$ROOTFS_IMG")"
 ROOTFS_DIR=$(mktemp -d)
 trap 'rm -rf "$ROOTFS_DIR" "$ROOTFS_TAR" "$ROOTFS_IMG"' EXIT
 
-# Generate a random root password — only the hash enters the image
-ROOT_PW=$(openssl rand -hex 16)
-
 echo ":: Building base image rootfs (mmdebstrap) ..."
 
 # Minimal packages — just enough to boot systemd, run a shell, and network.
@@ -60,7 +57,7 @@ mmdebstrap \
     --customize-hook='chroot "$1" chown user:user /home/user/workspace' \
     --customize-hook='printf "export PATH=\"\$HOME/.local/bin:\$PATH\"\ncd ~/workspace 2>/dev/null\n" >> "$1/home/user/.bashrc"' \
     --customize-hook='chroot "$1" passwd -l user' \
-    --customize-hook="echo 'root:$ROOT_PW' | chroot \"\$1\" chpasswd" \
+    --customize-hook='chroot "$1" passwd -l root' \
     --customize-hook='rm -rf "$1"/var/cache/apt/archives/*.deb' \
     --customize-hook='rm -rf "$1"/usr/share/doc/*' \
     --customize-hook='rm -rf "$1"/usr/share/man/*' \

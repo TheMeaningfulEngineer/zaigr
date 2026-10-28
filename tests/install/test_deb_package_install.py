@@ -79,6 +79,62 @@ def test_install_deb_and_run_documented_workflow(cloudvm_factory, distro):
         input="y\n", timeout=240, user="user", env=product_env,
     )
     assert started[2] == 0, f"project VM failed to start:\n{started[0]}{started[1]}"
+
+    root_status = checked(
+        vm,
+        "zaigr project vm exec --root -- passwd -S root",
+        cwd="/home/user/zaigr-install-project",
+        input="y\n",
+        timeout=30,
+        user="user",
+        env=product_env,
+    )
+    assert re.search(r"^root\s+L(?:\s|$)", root_status, re.MULTILINE), root_status
+
+    su_stdout, su_stderr, su_rc = vm.run(
+        "zaigr project vm exec -- su - -c 'id -u'",
+        cwd="/home/user/zaigr-install-project",
+        input="not-the-root-password\n",
+        timeout=30,
+        user="user",
+        env=product_env,
+    )
+    assert su_rc != 0, f"unprivileged su unexpectedly opened a root login shell:\n{su_stdout}{su_stderr}"
+    assert "Authentication failure" in su_stdout + su_stderr, su_stdout + su_stderr
+
+    root_exec_uid = checked(
+        vm,
+        "zaigr project vm exec --root -- id -u",
+        cwd="/home/user/zaigr-install-project",
+        input="y\n",
+        timeout=30,
+        user="user",
+        env=product_env,
+    )
+    assert root_exec_uid.strip() == "0", root_exec_uid
+
+    root_shell = vm.ssh_command(
+        "zaigr shell --root",
+        timeout=180,
+        user="user",
+        cwd="/home/user/zaigr-install-project",
+        env=product_env,
+    )
+    try:
+        root_shell.expect(r"Continue with root shell\? \[y/N\]", timeout=30)
+        root_shell.sendline("y")
+        root_shell.expect(r"root@[^:]+:.*# ", timeout=60)
+        root_shell.sendline("printf 'ROOT_SHELL_UID=%s\\n' \"$(id -u)\"")
+        root_shell.expect("ROOT_SHELL_UID=0", timeout=20)
+        root_shell.expect(r"root@[^:]+:.*# ", timeout=20)
+        root_shell.sendline("exit")
+        root_shell.expect(pexpect.EOF, timeout=20)
+    finally:
+        if root_shell.isalive():
+            root_shell.close(force=True)
+    root_shell_transcript = root_shell.transcript.getvalue()
+    assert "ROOT_SHELL_UID=0" in root_shell_transcript, root_shell_transcript
+
     allowed = vm.run(
         "zaigr project firewall allow deb.debian.org", cwd="/home/user/zaigr-install-project",
         timeout=30, user="user", env=product_env,
