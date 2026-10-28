@@ -581,6 +581,11 @@ func stopProjectVMInStore(store projectStore, abrupt bool) (projectVMStopResult,
 	if err := stopAndWaitForVMSupervisor(store); err != nil {
 		return projectVMStopResult{}, err
 	}
+	// The supervisor sees QEMU exit before it hears about the stop; a requested
+	// stop needs no notice at the next start.
+	if err := os.Remove(vmStopNoticePath(store)); err != nil && !os.IsNotExist(err) {
+		return projectVMStopResult{}, err
+	}
 	if err := store.clearRuntimeState(); err != nil {
 		return projectVMStopResult{}, err
 	}

@@ -1152,7 +1152,8 @@ def test_applied_firewall_survives_repeated_vm_lifecycle(project, setup_factory,
         assert "Project VM stopped" in stopped
         status = run(f"{zaigr} project status", timeout=10)
         assert "status: not running" in status
-        run(f"{zaigr} project vm start", timeout=120)
+        started = run(f"{zaigr} project vm start", timeout=120)
+        assert "The VM stopped" not in started, started
 
     final_probe = run(
         f"{zaigr} project vm exec -- printf SSH_AFTER_FINAL_START",
