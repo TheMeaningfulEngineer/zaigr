@@ -118,12 +118,34 @@ def test_stopped_permissions_validate_and_preserve_configuration(project):
     assert "all ports" in before.lower(), before
     assert "project" in before.lower(), before
     assert "next" in before.lower() or "pending" in before.lower(), before
+    exact_dns_lookalikes = [
+        "192.0.2.1-10", "192.0.2.999", "192.0.2", "192.000.2.42",
+    ]
+    for name in exact_dns_lookalikes:
+        stdout, stderr, rc = _run(
+            [zaigr, "project", "firewall", "allow", name],
+            cwd=project.cwd, env=project.env, timeout=10,
+        )
+        assert rc == 0, err_msg(stdout, stderr)
+        shown = run(f"{zaigr} project firewall show", timeout=180)
+        lines = shown.splitlines()
+        ip_section = lines.index("# Project exact IPv4 permissions (all ports)")
+        domain_section = lines.index("# Project manual domain permissions")
+        setup_section = lines.index("# Project setup permissions")
+        assert name not in lines[ip_section + 1:domain_section], shown
+        assert name in lines[domain_section + 1:setup_section], shown
+        stdout, stderr, rc = _run(
+            [zaigr, "project", "firewall", "remove", name],
+            cwd=project.cwd, env=project.env, timeout=10,
+        )
+        assert rc == 0, err_msg(stdout, stderr)
+        assert run(f"{zaigr} project firewall show", timeout=180) == before
     invalid_arguments = [
-        [], ["example.com"],
+        [],
         ["http://192.0.2.42"], ["192.0.2.42:22"], ["192.0.2.0/24"],
-        ["192.0.2.*"], ["192.0.2.1-10"], ["::1"], ["::ffff:192.0.2.42"],
-        ["192.0.2.999"], ["192.0.2"], ["3232235777"], ["0xc000022a"],
-        ["192.000.2.42"], ["192.0.2.42 "], [" 192.0.2.42"],
+        ["192.0.2.*"], ["::1"], ["::ffff:192.0.2.42"],
+        ["3232235777"], ["0xc000022a"],
+        ["192.0.2.42 "], [" 192.0.2.42"],
         ["192.0.2.42\n192.0.2.43"], ["0.0.0.0"], ["224.0.0.1"],
         ["239.255.255.255"], ["255.255.255.255"],
     ]
@@ -135,6 +157,18 @@ def test_stopped_permissions_validate_and_preserve_configuration(project):
             )
             assert rc != 0, err_msg(stdout, stderr)
             assert "unknown command" not in stdout + stderr, err_msg(stdout, stderr)
+    invalid_multi_arguments = [
+        ("allow", ["192.0.2.44", "bad..example.com"]),
+        ("remove", ["192.0.2.41", "bad..example.com"]),
+    ]
+    for operation, arguments in invalid_multi_arguments:
+        stdout, stderr, rc = _run(
+            [zaigr, "project", "firewall", operation, *arguments],
+            cwd=project.cwd, env=project.env, timeout=10,
+        )
+        assert rc != 0, err_msg(stdout, stderr)
+        assert "unknown command" not in stdout + stderr, err_msg(stdout, stderr)
+        assert run(f"{zaigr} project firewall show", timeout=180) == before
     assert run(f"{zaigr} project firewall show", timeout=180) == before
     stdout, stderr, rc = _run(
         f"{zaigr} project firewall remove 192.0.2.99",

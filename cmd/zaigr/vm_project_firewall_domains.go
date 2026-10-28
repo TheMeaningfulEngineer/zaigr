@@ -256,7 +256,7 @@ func checkFirewallTarget(raw string) error {
 		_, err := validateProjectFirewallIPv4(raw)
 		return err
 	}
-	if _, err := normalizeFirewallDomains([]string{raw}); err == nil {
+	if _, err := validateHostDNSPolicyName(raw); err == nil {
 		return nil
 	}
 	message := fmt.Sprintf("%q is not a domain name or an IPv4 address. Use plain names like github.com.", raw)
