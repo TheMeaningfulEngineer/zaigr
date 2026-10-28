@@ -1035,7 +1035,7 @@ func (h *hostNetworkHandle) watchFatal() {
 			default:
 			}
 			if h.ctx.Err() == nil {
-				h.reportFatal(fmt.Errorf("host network child %s exited: %v", child.Name, child.Err))
+				h.reportFatal(fmt.Errorf("host network child %s %s", child.Name, exitOutcome(child.Err)))
 				return
 			}
 		case <-h.ctx.Done():
@@ -1052,7 +1052,7 @@ func (h *hostNetworkHandle) waitFrontend(cmd *exec.Cmd) {
 	default:
 	}
 	if h.ctx.Err() == nil {
-		h.reportFatal(fmt.Errorf("host DNS frontend exited: %v", err))
+		h.reportFatal(fmt.Errorf("host DNS frontend %s", exitOutcome(err)))
 	}
 }
 

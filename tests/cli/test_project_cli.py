@@ -1,6 +1,9 @@
 """CLI tests for project initialization, VM lifecycle, setup state, and shell access."""
 
+import json
+import os
 import re
+import signal
 import socket
 import time
 from functools import partial
@@ -133,6 +136,25 @@ def test_project_vm_start_waits_for_minimal_systemd_runtime(project):
         "'! command -v dbus-daemon >/dev/null 2>&1 && ! pgrep -x dbus-daemon >/dev/null 2>&1'",
         timeout=20,
     )
+
+
+@pytest.mark.timeout(300)
+def test_qemu_exit_is_reported_as_the_stop_reason(project):
+    """A killed QEMU is named as the stop reason, not a process that stopped with it."""
+    run = partial(_checked_run, cwd=project.cwd, env=project.env)
+    zaigr = project.zaigr_bin
+
+    run(f"{zaigr} project vm start", input="y\n", timeout=180)
+    record = json.loads((project.store_dir / "vm-supervisor.json").read_text(encoding="utf-8"))
+    os.kill(record["qemu"]["pid"], signal.SIGKILL)
+    deadline = time.monotonic() + 60
+    while "not running" not in run(f"{zaigr} project status", timeout=10):
+        assert time.monotonic() < deadline, "VM did not stop after QEMU was killed"
+        time.sleep(1)
+
+    started = run(f"{zaigr} project vm start", timeout=180)
+    assert "because QEMU exited: signal: killed; logs are in " in started, started
+    assert "<nil>" not in started, started
 
 
 def test_project_vm_start_returns_after_systemd_boot_hooks_complete(project, setup_factory):

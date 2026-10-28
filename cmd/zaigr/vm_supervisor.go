@@ -1230,6 +1230,64 @@ type vmChildExit struct {
 	err  error
 }
 
+// vmChildLabel names a VM process in stop messages.
+func vmChildLabel(name string) string {
+	switch name {
+	case "workspace":
+		return "the workspace file-sharing process (virtiofsd)"
+	case "agent-state":
+		return "the agent-state file-sharing process (virtiofsd)"
+	case "qemu":
+		return "QEMU"
+	case "ssh-broker":
+		return "the SSH broker"
+	}
+	if child, ok := strings.CutPrefix(name, "host-network-"); ok {
+		return "the host network process " + child
+	}
+	return name
+}
+
+// exitOutcome describes a process exit without printing a nil error.
+func exitOutcome(err error) string {
+	if err == nil {
+		return "exited normally"
+	}
+	return "exited: " + err.Error()
+}
+
+// vmChildExitText says which VM process ended and how.
+func vmChildExitText(ended vmChildExit) string {
+	if ended.name == "host-network-fatal" && ended.err != nil {
+		return "the host network failed: " + ended.err.Error()
+	}
+	return vmChildLabel(ended.name) + " " + exitOutcome(ended.err)
+}
+
+// attributeVMChildExit prefers QEMU's exit when it follows within two seconds.
+// The other VM processes stop on their own once QEMU closes their connections,
+// so one of them is often noticed first.
+func attributeVMChildExit(ended vmChildExit, exit <-chan vmChildExit, alive map[string]bool, log io.Writer) vmChildExit {
+	if ended.name == "qemu" {
+		return ended
+	}
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for alive["qemu"] {
+		select {
+		case next := <-exit:
+			alive[next.name] = false
+			if next.name == "qemu" {
+				_, _ = fmt.Fprintf(log, "%s just before QEMU\n", vmChildExitText(ended))
+				return next
+			}
+		case <-deadline.C:
+			return ended
+		}
+	}
+	return ended
+}
+
 func qemuExitResult(err error) error {
 	if err == nil {
 		return nil
@@ -2080,7 +2138,7 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 					select {
 					case ended := <-exit:
 						alive[ended.name] = false
-						return fmt.Errorf("%s exited before commit: %v", ended.name, ended.err)
+						return fmt.Errorf("%s before commit", vmChildExitText(ended))
 					default:
 						goto drainedPrecommitExits
 					}
@@ -2134,7 +2192,9 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 			}
 		case ended := <-exit:
 			alive[ended.name] = false
-			if err := recordVMStop(store, supervisorLog, fmt.Sprintf("%s exited: %v", ended.name, ended.err)); err != nil {
+			ended = attributeVMChildExit(ended, exit, alive, supervisorLog)
+			reason := vmChildExitText(ended) + "; logs are in " + spec.LogRoot
+			if err := recordVMStop(store, supervisorLog, reason); err != nil {
 				_, _ = fmt.Fprintf(supervisorLog, "could not persist VM stop notice: %v\n", err)
 			} else {
 				stopRecorded = true
@@ -2142,7 +2202,7 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 			if ended.name == "qemu" {
 				return qemuExitResult(ended.err)
 			}
-			return fmt.Errorf("%s exited: %v", ended.name, ended.err)
+			return errors.New(reason)
 		case sig := <-signals:
 			if err := recordVMStop(store, supervisorLog, fmt.Sprintf("supervisor received %s", sig)); err != nil {
 				return err
