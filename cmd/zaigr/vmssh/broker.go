@@ -33,7 +33,7 @@ const (
 	setupTimeout    = 15 * time.Second
 	setupCancelWait = 500 * time.Millisecond
 	requestQueueLen = 32
-	maxRoleSetups   = 4
+	maxRoleSetups   = 32
 )
 
 // DialFunc opens a connection to guest SSH. It is injectable so the session
