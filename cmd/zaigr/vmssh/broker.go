@@ -32,6 +32,7 @@ const (
 	copyBufferSize  = 32 << 10
 	setupTimeout    = 15 * time.Second
 	setupCancelWait = 500 * time.Millisecond
+	roleDialTimeout = 8 * time.Second
 	requestQueueLen = 32
 	maxRoleSetups   = 32
 )
@@ -107,6 +108,12 @@ type roleClient struct {
 	user   string
 }
 
+type roleReconnect struct {
+	done   chan struct{}
+	client *ssh.Client
+	err    error
+}
+
 // Broker owns one long-lived SSH transport per guest identity and a local RPC
 // listener used by CLI processes that attach commands or terminals.
 type Broker struct {
@@ -119,15 +126,16 @@ type Broker struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu       sync.Mutex
-	clients  map[string]*ssh.Client
-	roleErrs map[string]error
-	dialErrs map[string]error
-	setups   map[string]chan struct{}
-	active   map[*net.UnixConn]struct{}
-	ready    map[string]chan error
-	closeErr error
-	wg       sync.WaitGroup
+	mu         sync.Mutex
+	clients    map[string]*ssh.Client
+	roleErrs   map[string]error
+	dialErrs   map[string]error
+	reconnects map[string]*roleReconnect
+	setups     map[string]chan struct{}
+	active     map[*net.UnixConn]struct{}
+	ready      map[string]chan error
+	closeErr   error
+	wg         sync.WaitGroup
 }
 
 // Start opens the private RPC socket and begins establishing persistent
@@ -183,7 +191,7 @@ func Start(ctx context.Context, cid uint32, socket, rootKeyPath, userKeyPath str
 	b := &Broker{
 		cid: cid, socket: socket, dial: dial, keys: keys, listener: listener,
 		ctx: brokerCtx, cancel: cancel,
-		clients: make(map[string]*ssh.Client), roleErrs: make(map[string]error), dialErrs: make(map[string]error), setups: map[string]chan struct{}{
+		clients: make(map[string]*ssh.Client), roleErrs: make(map[string]error), dialErrs: make(map[string]error), reconnects: make(map[string]*roleReconnect), setups: map[string]chan struct{}{
 			"root": make(chan struct{}, maxRoleSetups), "user": make(chan struct{}, maxRoleSetups),
 		}, active: make(map[*net.UnixConn]struct{}),
 		ready: map[string]chan error{"root": make(chan error, 1), "user": make(chan error, 1)},
@@ -205,40 +213,24 @@ func (b *Broker) connectRole(user string) {
 			b.ready[user] <- err
 			return
 		}
-		conn, err := b.dial(b.ctx, b.cid, 22)
+		client, err := b.dialRoleClient(b.ctx, user)
 		if err == nil {
-			_ = conn.SetDeadline(time.Now().Add(8 * time.Second))
-			config := &ssh.ClientConfig{
-				User:            user,
-				Auth:            []ssh.AuthMethod{ssh.PublicKeys(b.keys[user])},
-				HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-				Timeout:         8 * time.Second,
-			}
-			clientConn, chans, reqs, handshakeErr := ssh.NewClientConn(conn, fmt.Sprintf("vsock:%d:22", b.cid), config)
-			if handshakeErr == nil {
-				_ = conn.SetDeadline(time.Time{})
-				client := ssh.NewClient(clientConn, chans, reqs)
-				b.mu.Lock()
-				if b.ctx.Err() != nil {
-					b.mu.Unlock()
-					_ = client.Close()
-					b.ready[user] <- b.ctx.Err()
-					return
-				}
-				b.clients[user] = client
-				delete(b.dialErrs, user)
+			b.mu.Lock()
+			if b.ctx.Err() != nil {
 				b.mu.Unlock()
-				b.ready[user] <- nil
+				_ = client.Close()
+				b.ready[user] <- b.ctx.Err()
 				return
 			}
-			_ = conn.Close()
-			err = handshakeErr
-		}
-		if err != nil {
-			b.mu.Lock()
-			b.dialErrs[user] = err
+			b.clients[user] = client
+			delete(b.dialErrs, user)
 			b.mu.Unlock()
+			b.ready[user] <- nil
+			return
 		}
+		b.mu.Lock()
+		b.dialErrs[user] = err
+		b.mu.Unlock()
 		select {
 		case <-b.ctx.Done():
 			b.ready[user] <- b.ctx.Err()
@@ -251,8 +243,46 @@ func (b *Broker) connectRole(user string) {
 				delay = time.Second
 			}
 		}
-		_ = err // retain the failed attempt without turning readiness into a transient failure
 	}
+}
+
+func (b *Broker) dialRoleClient(ctx context.Context, user string) (*ssh.Client, error) {
+	connectCtx, cancel := context.WithTimeout(ctx, roleDialTimeout)
+	defer cancel()
+	conn, err := b.dial(connectCtx, b.cid, 22)
+	if err != nil {
+		return nil, err
+	}
+	stopCloseOnCancel := context.AfterFunc(connectCtx, func() { _ = conn.Close() })
+	defer stopCloseOnCancel()
+	if err := conn.SetDeadline(time.Now().Add(roleDialTimeout)); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("set guest SSH handshake deadline: %w", err)
+	}
+	config := &ssh.ClientConfig{
+		User:            user,
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(b.keys[user])},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         roleDialTimeout,
+	}
+	clientConn, chans, reqs, err := ssh.NewClientConn(conn, fmt.Sprintf("vsock:%d:22", b.cid), config)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if err := connectCtx.Err(); err != nil {
+		_ = clientConn.Close()
+		return nil, err
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		_ = clientConn.Close()
+		return nil, fmt.Errorf("clear guest SSH handshake deadline: %w", err)
+	}
+	if !stopCloseOnCancel() && connectCtx.Err() != nil {
+		_ = clientConn.Close()
+		return nil, connectCtx.Err()
+	}
+	return ssh.NewClient(clientConn, chans, reqs), nil
 }
 
 // WaitReady waits until root and user SSH authentication have both succeeded.
@@ -358,6 +388,8 @@ func (b *Broker) serveRequest(conn *net.UnixConn) error {
 	setupDone := make(chan struct{})
 	setupExpired := make(chan struct{})
 	watchDone := make(chan struct{})
+	setupClientMu := sync.Mutex{}
+	setupClient := client
 	go func() {
 		defer close(watchDone)
 		timer := time.NewTimer(setupTimeout)
@@ -377,7 +409,10 @@ func (b *Broker) serveRequest(conn *net.UnixConn) error {
 					return
 				default:
 				}
-				b.failRoleTransport(req.User, fmt.Errorf("SSH setup remained blocked after the caller disconnected"))
+				setupClientMu.Lock()
+				expectedClient := setupClient
+				setupClientMu.Unlock()
+				b.failRoleTransport(req.User, expectedClient, fmt.Errorf("SSH setup remained blocked after the caller disconnected"))
 			}
 		case <-timer.C:
 			select {
@@ -386,7 +421,10 @@ func (b *Broker) serveRequest(conn *net.UnixConn) error {
 			default:
 			}
 			close(setupExpired)
-			b.failRoleTransport(req.User, fmt.Errorf("SSH setup exceeded %s", setupTimeout))
+			setupClientMu.Lock()
+			expectedClient := setupClient
+			setupClientMu.Unlock()
+			b.failRoleTransport(req.User, expectedClient, fmt.Errorf("SSH setup exceeded %s", setupTimeout))
 		}
 	}()
 	finishSetup := func() {
@@ -394,14 +432,33 @@ func (b *Broker) serveRequest(conn *net.UnixConn) error {
 		<-watchDone
 		releaseSetupSlot()
 	}
+	// NewSession opens only an SSH channel; no guest command has been issued yet.
 	session, err := client.NewSession()
+	if isDeadSSHTransportError(err) && !requests.disconnectedNow() && !setupExpiredNow(setupExpired) {
+		replacement, reconnectErr := b.reconnectRoleClient(req.User, client)
+		if reconnectErr == nil {
+			client = replacement
+			setupClientMu.Lock()
+			setupClient = replacement
+			setupClientMu.Unlock()
+			if !requests.disconnectedNow() && !setupExpiredNow(setupExpired) {
+				session, err = client.NewSession()
+			}
+		} else {
+			err = errors.Join(err, fmt.Errorf("reconnect guest SSH transport: %w", reconnectErr))
+		}
+	}
 	if err != nil {
 		finishSetup()
 		if requests.disconnectedNow() {
 			return nil
 		}
 		if setupExpiredNow(setupExpired) {
+			b.failRoleTransport(req.User, client, fmt.Errorf("SSH setup exceeded %s: %w", setupTimeout, err))
 			return b.sendFrame(conn, frame{Type: "error", Error: fmt.Sprintf("guest SSH setup timed out while opening a channel: %v; restart the VM", err)})
+		}
+		if isDeadSSHTransportError(err) {
+			b.failRoleTransport(req.User, client, fmt.Errorf("guest SSH channel remained unavailable after reconnect: %w", err))
 		}
 		return b.sendFrame(conn, frame{Type: "error", Error: fmt.Sprintf("open guest SSH channel: %v", err)})
 	}
@@ -733,9 +790,95 @@ func setupExpiredNow(expired <-chan struct{}) bool {
 	}
 }
 
-func (b *Broker) failRoleTransport(user string, cause error) {
+func isDeadSSHTransportError(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed)
+}
+
+func (b *Broker) reconnectRoleClient(user string, failed *ssh.Client) (*ssh.Client, error) {
+	// Coalesce callers for this failed transport; later failures recover only
+	// when a fresh request observes them, with no background retry loop.
 	b.mu.Lock()
-	if b.roleErrs[user] != nil {
+	if roleErr := b.roleErrs[user]; roleErr != nil {
+		b.mu.Unlock()
+		return nil, roleErr
+	}
+	if current := b.clients[user]; current != failed {
+		if current != nil {
+			b.mu.Unlock()
+			return current, nil
+		}
+		b.mu.Unlock()
+		return nil, errors.New("persistent guest SSH connection disappeared during recovery")
+	}
+	if reconnect := b.reconnects[user]; reconnect != nil {
+		b.mu.Unlock()
+		select {
+		case <-reconnect.done:
+			return reconnect.client, reconnect.err
+		case <-b.ctx.Done():
+			return nil, b.ctx.Err()
+		}
+	}
+	reconnect := &roleReconnect{done: make(chan struct{})}
+	b.reconnects[user] = reconnect
+	b.mu.Unlock()
+
+	replacement, reconnectErr := b.dialRoleClient(b.ctx, user)
+	var closeOld, closeReplacement *ssh.Client
+	b.mu.Lock()
+	if reconnectErr == nil && b.ctx.Err() != nil {
+		reconnectErr = b.ctx.Err()
+	}
+	if reconnectErr == nil {
+		if roleErr := b.roleErrs[user]; roleErr != nil {
+			reconnectErr = roleErr
+		} else if b.clients[user] != failed {
+			if current := b.clients[user]; current != nil {
+				reconnect.client = current
+			} else {
+				reconnectErr = errors.New("persistent guest SSH connection changed during recovery")
+			}
+		} else {
+			b.clients[user] = replacement
+			delete(b.dialErrs, user)
+			reconnect.client = replacement
+			closeOld = failed
+			replacement = nil
+		}
+	}
+	if reconnectErr != nil && b.ctx.Err() == nil && b.roleErrs[user] == nil {
+		b.roleErrs[user] = fmt.Errorf("reconnect guest SSH transport: %w", reconnectErr)
+		reconnectErr = b.roleErrs[user]
+		if b.clients[user] == failed {
+			closeOld = failed
+			b.clients[user] = nil
+		}
+	}
+	if replacement != nil {
+		closeReplacement = replacement
+	}
+	reconnect.err = reconnectErr
+	if b.reconnects[user] == reconnect {
+		delete(b.reconnects, user)
+	}
+	close(reconnect.done)
+	b.mu.Unlock()
+
+	if closeOld != nil {
+		_ = closeOld.Close()
+	}
+	if closeReplacement != nil {
+		_ = closeReplacement.Close()
+	}
+	if reconnect.err != nil {
+		return nil, reconnect.err
+	}
+	return reconnect.client, nil
+}
+
+func (b *Broker) failRoleTransport(user string, expected *ssh.Client, cause error) {
+	b.mu.Lock()
+	if b.roleErrs[user] != nil || b.clients[user] != expected {
 		b.mu.Unlock()
 		return
 	}
