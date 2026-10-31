@@ -69,6 +69,11 @@ type activeName struct {
 	refreshing  bool
 }
 
+type nameGate struct {
+	token chan struct{}
+	refs  int
+}
+
 // Server owns exact-name authorization, upstream lookup, DNS lease references,
 // refresh scheduling, and the private frontend IPC socket for one VM launch.
 type Server struct {
@@ -87,6 +92,7 @@ type Server struct {
 	names             map[string]struct{}
 	active            map[string]*activeName
 	lookupEpoch       map[string]uint64
+	nameGates         map[string]*nameGate
 	lookupSequence    uint64
 	generation        uint64
 	failed            error
@@ -169,7 +175,7 @@ func StartBroker(parent context.Context, cfg Config, backend LeaseBackend) (*Ser
 		cfg: cfg, backend: backend, resolver: resolver, listener: listener,
 		ctx: ctx, cancel: cancel, closed: make(chan struct{}),
 		workers: make(chan struct{}, cfg.MaxConcurrent),
-		names:   policyNames, active: make(map[string]*activeName), lookupEpoch: make(map[string]uint64),
+		names:   policyNames, active: make(map[string]*activeName), lookupEpoch: make(map[string]uint64), nameGates: make(map[string]*nameGate),
 		generation: cfg.Generation, peers: make(map[int]uint64), fatal: make(chan error, 1),
 		maintenanceAccess: make(map[netip.Addr]*maintenanceLease),
 		eventChanged:      make(chan struct{}),

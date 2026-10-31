@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -192,6 +193,42 @@ func (s *Server) handleQuery(parent context.Context, source netip.Addr, packet [
 		record("unsupported-type", dns.RcodeNotImplemented, nil, generation)
 		return responseBytes(request, nil, dns.RcodeNotImplemented, 0)
 	}
+	ctx, cancel := context.WithTimeout(parent, s.cfg.ResolveTimeout)
+	defer cancel()
+	releaseNameGate, err := s.acquireNameGate(ctx, name)
+	if err != nil {
+		record("servfail", dns.RcodeServerFailure, nil, generation)
+		return responseBytes(request, nil, dns.RcodeServerFailure, 0)
+	}
+	defer releaseNameGate()
+
+	// Authorization may have changed while this request waited behind another
+	// lookup for the same name. Use a fresh snapshot before resolving or creating
+	// a lease so queued work cannot carry an old policy through the gate.
+	s.mu.Lock()
+	if s.failed != nil {
+		s.mu.Unlock()
+		record("servfail", dns.RcodeServerFailure, nil, generation)
+		return responseBytes(request, nil, dns.RcodeServerFailure, 0)
+	}
+	now = time.Now()
+	maintenanceLease = s.maintenanceAccess[source]
+	maintenanceEpoch = 0
+	maintenanceAccess = maintenanceLeaseActive(maintenanceLease, now)
+	if maintenanceLease != nil {
+		maintenanceEpoch = maintenanceLease.epoch
+	}
+	fullAccess = s.fullAccessUntil.After(now) || maintenanceAccess
+	fullAccessEpoch = s.fullAccessEpoch
+	allowed = maintenanceAccess || s.discoveryAllowsLocked(name, now)
+	_, permanent = s.names[name]
+	discoveryDeadline = s.discoveryDeadlineForLocked(name, now)
+	generation = s.generation
+	s.mu.Unlock()
+	if !allowed {
+		record("refused", dns.RcodeRefused, nil, generation)
+		return responseBytes(request, nil, dns.RcodeRefused, 0)
+	}
 	var epoch uint64
 	if !maintenanceAccess {
 		var ok bool
@@ -201,8 +238,6 @@ func (s *Server) handleQuery(parent context.Context, source netip.Addr, packet [
 			return responseBytes(request, nil, dns.RcodeServerFailure, 0)
 		}
 	}
-	ctx, cancel := context.WithTimeout(parent, s.cfg.ResolveTimeout)
-	defer cancel()
 	upstreamRequest := new(dns.Msg)
 	upstreamRequest.SetQuestion(name, dns.TypeA)
 	upstreamRequest.RecursionDesired = true
@@ -557,6 +592,53 @@ func (s *Server) beginLookup(name string, generation uint64) (uint64, bool) {
 	return s.lookupSequence, true
 }
 
+func (s *Server) acquireNameGate(ctx context.Context, name string) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	gate := s.nameGates[name]
+	if gate == nil {
+		if len(s.nameGates) >= s.cfg.MaxNames {
+			s.mu.Unlock()
+			return nil, errors.New("DNS lookup concurrency limit reached")
+		}
+		gate = &nameGate{token: make(chan struct{}, 1)}
+		s.nameGates[name] = gate
+	}
+	gate.refs++
+	s.mu.Unlock()
+
+	select {
+	case gate.token <- struct{}{}:
+		var once sync.Once
+		release := func() {
+			once.Do(func() {
+				<-gate.token
+				s.mu.Lock()
+				gate.refs--
+				if gate.refs == 0 && s.nameGates[name] == gate {
+					delete(s.nameGates, name)
+				}
+				s.mu.Unlock()
+			})
+		}
+		if err := ctx.Err(); err != nil {
+			release()
+			return nil, err
+		}
+		return release, nil
+	case <-ctx.Done():
+		s.mu.Lock()
+		gate.refs--
+		if gate.refs == 0 && s.nameGates[name] == gate {
+			delete(s.nameGates, name)
+		}
+		s.mu.Unlock()
+		return nil, ctx.Err()
+	}
+}
+
 func (s *Server) commitAnswer(ctx context.Context, name string, generation, epoch uint64, addresses map[netip.Addr]time.Duration, ttl time.Duration) error {
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
@@ -703,9 +785,7 @@ func refreshDelay(ttl, lead time.Duration) time.Duration {
 	return delay
 }
 
-func (s *Server) resolveForRefresh(name string) (map[netip.Addr]time.Duration, time.Duration, bool, error) {
-	ctx, cancel := context.WithTimeout(s.ctx, s.cfg.ResolveTimeout)
-	defer cancel()
+func (s *Server) resolveForRefresh(ctx context.Context, name string) (map[netip.Addr]time.Duration, time.Duration, bool, error) {
 	request := new(dns.Msg)
 	request.SetQuestion(name, dns.TypeA)
 	request.RecursionDesired = true
@@ -821,11 +901,27 @@ func (s *Server) refreshName(name string, generation uint64) {
 		}
 		s.mu.Unlock()
 	}()
+	gateCtx, cancelGate := context.WithTimeout(s.ctx, s.cfg.ResolveTimeout)
+	defer cancelGate()
+	releaseNameGate, err := s.acquireNameGate(gateCtx, name)
+	if err != nil {
+		return
+	}
+	defer releaseNameGate()
+
+	// The timer captured a generation before this refresh waited for the name
+	// gate. Refresh only under the current policy after acquiring the gate.
+	s.mu.Lock()
+	if s.failed != nil || s.ctx.Err() != nil || generation != s.generation || !s.discoveryAllowsLocked(name, time.Now()) {
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
 	epoch, ok := s.beginLookup(name, generation)
 	if !ok {
 		return
 	}
-	addresses, ttl, invalidate, err := s.resolveForRefresh(name)
+	addresses, ttl, invalidate, err := s.resolveForRefresh(gateCtx, name)
 	if err != nil {
 		if invalidate {
 			ctx, cancel := context.WithTimeout(s.ctx, s.cfg.ResolveTimeout)
