@@ -260,6 +260,12 @@ def test_all_builtin_setups_coexist(project):
         "https://sum.golang.org",
         timeout=20,
     )
+    run(
+        f"{zaigr} project vm exec -- "
+        "curl -4 -sS -o /dev/null --connect-timeout 3 --max-time 8 "
+        "https://vuln.go.dev",
+        timeout=20,
+    )
 
     # Yocto/kas
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
