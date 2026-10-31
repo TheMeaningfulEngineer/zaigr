@@ -11,7 +11,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
@@ -20,6 +20,7 @@ from typing import Any
 LOG = logging.getLogger("deps-check")
 ROOT = Path(__file__).resolve().parent.parent
 LOCK_PATH = ROOT / "deps.lock"
+DEV_SETUP_PATH = ROOT / "cmd" / "zaigr" / "builtin" / "setups" / "zaigr-dev" / "setup.script"
 TIMEOUT_SECONDS = 20
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_PAGES = 100
@@ -35,6 +36,15 @@ class Release:
     notes: str
     url: str
     tag_only: bool = False
+
+
+@dataclass(frozen=True)
+class Row:
+    """One summary line and the dependencies that exist only to serve it."""
+
+    label: str
+    cells: tuple[str, ...] = ("", "", "")
+    children: tuple[Row, ...] = ()
 
 
 def parse_lock(path: Path) -> dict[str, str]:
@@ -54,6 +64,14 @@ def parse_lock(path: Path) -> dict[str, str]:
     if missing:
         raise ValueError(f"{path}: missing required keys: {', '.join(missing)}")
     return values
+
+
+def rust_version(path: Path) -> str:
+    """Read the Rust version that compiles the bundled virtiofsd."""
+    pin = re.search(r'^rust_version="\$\{RUST_VERSION:-([^}]+)\}"$', path.read_text(encoding="utf-8"), re.MULTILINE)
+    if pin is None:
+        raise ValueError(f"{path}: missing the Rust version pin")
+    return pin.group(1)
 
 
 def fetch(url: str, missing_ok: bool = False) -> tuple[bytes, Any]:
@@ -240,7 +258,7 @@ def kernel_versions(shipped: str) -> tuple[str, str, str]:
 
 
 def debian_rootfs(suite: str) -> tuple[str, str, str]:
-    """Return Debian rootfs shipped label, latest point release, and next stable."""
+    """Return Debian rootfs shipped label, latest point release, and newest stable."""
     release_index, _ = fetch("https://www.debian.org/releases/")
     index_text = parse_visible_text(release_index)
     index_text = re.sub(r"\s+", " ", index_text)
@@ -264,11 +282,8 @@ def debian_rootfs(suite: str) -> tuple[str, str, str]:
     shipped_major = released_versions[0][0]
     shipped_label = f"Debian {shipped_major} ({suite})"
     bugfix = ".".join(str(part) for part in max(released_versions))
-    feature = (
-        f"Debian {stable_major} ({stable_codename})"
-        if stable_major > shipped_major else "up to date"
-    )
-    return shipped_label, bugfix, feature
+    overall = f"Debian {stable_major} ({stable_codename})" if stable_major > shipped_major else bugfix
+    return shipped_label, bugfix, overall
 
 
 class GoReleaseHistoryParser(HTMLParser):
@@ -520,7 +535,7 @@ def module_label(module: str) -> str:
 
 
 def module_update_rows(requirements: list[tuple[str, str]]) -> list[tuple[str, str, str, str]]:
-    """Return aligned summary rows for direct modules that have newer versions."""
+    """Return aligned summary rows for every direct module."""
     labels = [module_label(module) for module, _ in requirements]
     collisions = {label for label in labels if labels.count(label) > 1}
     rows = []
@@ -529,24 +544,15 @@ def module_update_rows(requirements: list[tuple[str, str]]) -> list[tuple[str, s
         next_major = next_major_module_path(module)
         versions.extend(module_releases(next_major, shipped, missing_ok=True))
         versions = sorted(set(versions), key=module_version_key)
-        if not versions:
-            continue
         shipped_key = module_classification_parts(shipped)
-        bugfix = []
-        features = []
-        for version in versions:
-            candidate = module_classification_parts(version)
-            if shipped_key[0] == 0 or candidate[:2] > shipped_key[:2]:
-                features.append(version)
-            elif candidate[:2] == shipped_key[:2]:
-                bugfix.append(version)
-        bugfix_version = max(bugfix, key=module_version_key) if bugfix else "up to date"
-        feature_version = max(features, key=module_version_key) if features else "up to date"
+        fixes = [version for version in versions if module_classification_parts(version)[:2] == shipped_key[:2]]
+        latest_fix = max(fixes, key=module_version_key) if fixes else shipped
+        latest_overall = versions[-1] if versions else shipped
         if label in collisions:
             label = "/".join(module.split("/")[-2:])
             if re.fullmatch(r"v\d+", module.split("/")[-1]):
                 label = "/".join(module.split("/")[-3:-1])
-        rows.append((label, shipped, bugfix_version, feature_version))
+        rows.append((label, shipped, latest_fix, latest_overall))
     return rows
 
 
@@ -576,21 +582,18 @@ def component_report(
         if series(release, width) == shipped_series and release.parts > shipped_parts
     ]
     features = [release for release in releases if series(release, width) > shipped_series]
-    bugfix = max(bugfixes, key=lambda item: item.parts).version if bugfixes else "up to date"
-    feature = max(features, key=lambda item: item.parts).version if features else "up to date"
+    latest_fix = max(bugfixes, key=lambda item: item.parts).version if bugfixes else shipped
+    latest_overall = max(features, key=lambda item: item.parts).version if features else latest_fix
     lines = [f"{name} release notes:"]
-    for channel, channel_releases, latest in (
-        ("bugfix updates channel", bugfixes, bugfix),
-        ("feature updates channel", features, feature),
+    for channel, channel_releases in (
+        ("bugfix updates channel", bugfixes),
+        ("feature updates channel", features),
     ):
         lines.append(f"  {channel}:")
-        if latest == "up to date":
-            lines.append("    up to date")
+        if not channel_releases:
+            lines.append("    none")
             continue
-        latest_parts = version_parts(latest)
         for release in channel_releases:
-            if release.parts > latest_parts:
-                continue
             if release.notes:
                 lines.append(f"    {release.version}: [{release.url}]")
                 lines.extend(f"      {line}" for line in clean_note(release.notes).splitlines())
@@ -598,7 +601,15 @@ def component_report(
                 lines.append(f"    {release.version}: tag-only; no release notes entry was published [{release.url}]")
             else:
                 lines.append(f"    {release.version}: release has no published notes [{release.url}]")
-    return (name, shipped, bugfix, feature), lines
+    return (name, shipped, latest_fix, latest_overall), lines
+
+
+def flatten(row: Row, lead: str = "", branch: str = "") -> Iterator[tuple[str, ...]]:
+    """Yield a row and its children, drawing tree branches from parent to child."""
+    yield (f"{lead}{branch}{row.label}", *row.cells)
+    below = lead + {"├─ ": "│  ", "└─ ": "   ", "": ""}[branch]
+    for index, child in enumerate(row.children, 1):
+        yield from flatten(child, below, "└─ " if index == len(row.children) else "├─ ")
 
 
 def display_version(value: str) -> str:
@@ -607,15 +618,15 @@ def display_version(value: str) -> str:
     return f"{match.group(1)}{match.group(2)}…" if match else value
 
 
-def print_summary(rows: list[tuple[str, str, str, str]]) -> None:
+def print_summary(rows: list[tuple[str, ...]]) -> None:
     """Print dependency summary rows in aligned four-column form."""
-    rows = [(row[0], *(display_version(value) for value in row[1:])) for row in rows]  # type: ignore[misc]
-    headers = ("component", "shipped", "bugfix updates channel", "feature updates channel")
+    rows = [(row[0], *(display_version(value) for value in row[1:])) for row in rows]
+    headers = ("component", "shipped", "latest fix", "latest overall")
     widths = tuple(max(len(header), *(len(row[index]) for row in rows)) for index, header in enumerate(headers))
-    print("  ".join(header.ljust(widths[index]) for index, header in enumerate(headers)))
+    print("  ".join(header.ljust(widths[index]) for index, header in enumerate(headers)).rstrip())
     print("  ".join("-" * width for width in widths))
     for row in rows:
-        print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
+        print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)).rstrip())
 
 
 def main() -> int:
@@ -628,35 +639,59 @@ def main() -> int:
     logging.basicConfig(level=logging.ERROR, format="%(levelname)s: %(message)s")
     try:
         lock = parse_lock(LOCK_PATH)
+        rust = rust_version(DEV_SETUP_PATH)
         kernel_same, kernel_lts, kernel_stable = kernel_versions(lock["KERNEL_VERSION"])
         kernel_shipped_parts = version_parts(lock["KERNEL_VERSION"])
-        kernel_bugfix = (
+        kernel_fix = (
             kernel_same if kernel_same != "none" and version_parts(kernel_same) > kernel_shipped_parts
-            else "up to date"
+            else lock["KERNEL_VERSION"]
         )
-        kernel_feature = "; ".join(
-            f"{label}: {version if version != 'none' and version_parts(version) > kernel_shipped_parts else 'up to date'}"
-            for label, version in (("next long-term", kernel_lts), ("latest stable", kernel_stable))
+        kernel_overall = (
+            kernel_stable if kernel_stable != "none" and version_parts(kernel_stable) > version_parts(kernel_fix)
+            else kernel_fix
         )
+        if kernel_lts != "none":
+            kernel_overall += f" (next long-term: {kernel_lts})"
         components = (
             ("virtiofsd", lock["VIRTIOFSD_VERSION"], gitlab_releases("virtio-fs/virtiofsd", lock["VIRTIOFSD_VERSION"]), 2),
             ("libseccomp", lock["LIBSECCOMP_VERSION"], github_releases("seccomp/libseccomp", lock["LIBSECCOMP_VERSION"]), 2),
             ("libcap-ng", lock["LIBCAP_NG_VERSION"], github_releases("stevegrubb/libcap-ng", lock["LIBCAP_NG_VERSION"]), 2),
+            ("Rust", rust, github_releases("rust-lang/rust", rust), 2),
             ("slirp4netns", lock["SLIRP4NETNS_VERSION"], github_releases("rootless-containers/slirp4netns", lock["SLIRP4NETNS_VERSION"]), 2),
             ("Go", lock["GO_VERSION"], go_releases(lock["GO_VERSION"]), 2),
         )
-        reports = [component_report(name, shipped, releases, width) for name, shipped, releases, width in components]
-        rootfs_shipped, rootfs_bugfix, rootfs_feature = debian_rootfs(lock["DEBIAN_SUITE"])
+        reports = {
+            name: component_report(name, shipped, releases, width)
+            for name, shipped, releases, width in components
+        }
+        rootfs_shipped, rootfs_fix, rootfs_overall = debian_rootfs(lock["DEBIAN_SUITE"])
         module_rows = module_update_rows(direct_go_requirements(ROOT / "go.mod"))
-        summary_rows = [
-            ("Kernel", lock["KERNEL_VERSION"], kernel_bugfix, kernel_feature),
-            ("Base rootfs", rootfs_shipped, rootfs_bugfix, rootfs_feature),
-            *(cells for cells, _ in reports),
-            *module_rows,
-        ]
-        print_summary(summary_rows)
+
+        def built(name: str) -> tuple[str, ...]:
+            """Return the shipped and update cells of a bundled component."""
+            return reports[name][0][1:]
+
+        summary = (
+            Row("Guest VM (shipped inside zaigr)", children=(
+                Row("Kernel", (lock["KERNEL_VERSION"], kernel_fix, kernel_overall)),
+                Row("Base rootfs", (rootfs_shipped, rootfs_fix, rootfs_overall)),
+            )),
+            Row("Host helpers (shipped inside zaigr)", children=(
+                Row("virtiofsd", built("virtiofsd"), (
+                    Row("libseccomp (linked in)", built("libseccomp")),
+                    Row("libcap-ng (linked in)", built("libcap-ng")),
+                    Row("Rust (compiles it)", built("Rust")),
+                )),
+                Row("slirp4netns (upstream binary)", built("slirp4netns")),
+            )),
+            Row("zaigr binary", children=(
+                Row("Go (compiles it)", built("Go")),
+                Row("Go modules (linked in)", children=tuple(Row(row[0], row[1:]) for row in module_rows)),
+            )),
+        )
+        print_summary([line for row in summary for line in flatten(row)])
         print("Release notes:")
-        for _, notes in reports:
+        for _, notes in reports.values():
             for line in notes:
                 print(line)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:

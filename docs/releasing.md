@@ -1,10 +1,13 @@
 # Releasing zaigr
 
-Before each release, run `make deps-check` and review the **bugfix updates
-channel** and **feature updates channel** for every bundled dependency. Decide
-manually whether to update the pinned dependencies. The report includes the
-Debian base rootfs release and direct Go module requirements as well as the
-bundled tools; the rootfs and Go module rows have no release notes.
+Before each release, run `make deps-check` and review the **latest fix** and
+**latest overall** columns for every bundled dependency. Latest fix is the
+newest release in the series we ship; latest overall is the newest release of
+all. A column that matches **shipped** has nothing newer to offer. Decide
+manually whether to update the pinned dependencies. The report is a tree that
+shows what each dependency serves. It covers the bundled tools, the compilers
+that build them, the Debian base rootfs release and direct Go module
+requirements; the rootfs and Go module rows have no release notes.
 
 Commit the release changes first. Run commands from the repository root and
 replace `0.1.0` with the version you want to release.

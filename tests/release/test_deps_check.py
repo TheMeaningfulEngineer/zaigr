@@ -1,6 +1,7 @@
 """Exercise the dependency checker CLI against local upstream-shaped responses."""
 
 import json
+import re
 import shutil
 import sys
 import threading
@@ -11,6 +12,12 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from tests.conftest import REPO_ROOT, err_msg, run
+
+
+def _summary_rows(out):
+    """Map each summary label, without its tree branches, to its table line."""
+    lines = out.split("Release notes:", 1)[0].splitlines()[2:]
+    return {re.split(r"\s{2,}", line.lstrip("│├└─ "))[0]: line for line in lines}
 
 
 def _install_checker(repo):
@@ -44,6 +51,9 @@ def _install_checker(repo):
         "require github.com/ignored/transitive v2.0.0 // indirect\n",
         encoding="utf-8",
     )
+    setup = repo / "cmd" / "zaigr" / "builtin" / "setups" / "zaigr-dev"
+    setup.mkdir(parents=True)
+    (setup / "setup.script").write_text('rust_version="${RUST_VERSION:-1.82.0}"\n', encoding="utf-8")
     return release_dir / "deps-check"
 
 
@@ -102,6 +112,12 @@ def _stable_sources():
             ],
         },
         "/repos/rootless-containers/slirp4netns/tags": {1: [{"name": "v1.4.1"}]},
+        "/repos/rust-lang/rust/releases": {
+            1: [
+                {"tag_name": "1.82.1", "body": "Rust patch one"},
+                {"tag_name": "1.83.0", "body": "Rust feature release"},
+            ],
+        },
     }
     gitlab = {
         "/api/v4/projects/virtio-fs%2Fvirtiofsd/releases": {
@@ -251,27 +267,30 @@ def test_deps_check_reports_versions_notes_and_local_source_mapping(tmp_path, up
 
     assert rc == 0, err_msg(out, err)
     table = out.split("Release notes:", 1)[0].splitlines()
-    assert table[0].split() == ["component", "shipped", "bugfix", "updates", "channel", "feature", "updates", "channel"]
-    rows = {line.split()[0]: line for line in table[2:]}
+    assert table[0].split() == ["component", "shipped", "latest", "fix", "latest", "overall"]
+    rows = _summary_rows(out)
     assert "6.12.0" in rows["Kernel"] and "6.12.9" in rows["Kernel"]
-    assert "next long-term: 6.18.2; latest stable: 7.0.1" in rows["Kernel"]
+    assert "7.0.1 (next long-term: 6.18.2)" in rows["Kernel"]
     assert "1.13.2" in rows["virtiofsd"] and "1.13.10" in rows["virtiofsd"] and "1.14.0" in rows["virtiofsd"]
-    assert "2.6.0" in rows["libseccomp"] and "2.6.10" in rows["libseccomp"] and "2.7.0" in rows["libseccomp"]
-    assert "0.8.5" in rows["libcap-ng"] and "0.8.6" in rows["libcap-ng"] and "0.9.1" in rows["libcap-ng"]
-    assert "1.3.4" in rows["slirp4netns"] and "1.3.5" in rows["slirp4netns"] and "1.4.1" in rows["slirp4netns"]
-    assert "1.24.4" in rows["Go"] and "1.24.6" in rows["Go"] and "1.25.2" in rows["Go"]
-    assert "Debian 13 (trixie)" in rows["Base"] and "13.7" in rows["Base"]
-    assert "up to date" in rows["Base"]
+    seccomp, cap_ng = rows["libseccomp (linked in)"], rows["libcap-ng (linked in)"]
+    assert "2.6.0" in seccomp and "2.6.10" in seccomp and "2.7.0" in seccomp
+    assert "0.8.5" in cap_ng and "0.8.6" in cap_ng and "0.9.1" in cap_ng
+    slirp, go = rows["slirp4netns (upstream binary)"], rows["Go (compiles it)"]
+    assert "1.3.4" in slirp and "1.3.5" in slirp and "1.4.1" in slirp
+    assert "1.24.4" in go and "1.24.6" in go and "1.25.2" in go
+    rust = rows["Rust (compiles it)"]
+    assert "1.82.0" in rust and "1.82.1" in rust and "1.83.0" in rust
+    assert "Debian 13 (trixie)" in rows["Base rootfs"] and rows["Base rootfs"].count("13.7") == 2
     assert "nftables" in rows and "v0.3.0" in rows["nftables"]
-    assert "up to date" in rows["nftables"] and "v2.1.0" in rows["nftables"]
+    assert "v0.3.1" in rows["nftables"] and "v2.1.0" in rows["nftables"]
     assert "mdlayher/netlink" in rows and "v1.7.4" in rows["mdlayher/netlink"] and "v1.8.0" in rows["mdlayher/netlink"]
     assert "v1.7.3-0.2025…" in rows["mdlayher/netlink"] and "fbb4dce95f42" not in rows["mdlayher/netlink"]
     assert "v1.18.6" in rows["compress"] and "v1.19.0" in rows["compress"]
-    assert "v1.1.71" in rows["dns"] and "up to date" in rows["dns"]
+    assert rows["dns"].count("v1.1.71") == 2
     assert "v1.10.2" in rows["cobra"] and "v1.11.0" in rows["cobra"]
     assert "v1.3.1" in rows["vishvananda/netlink"] and "v1.4.0" in rows["vishvananda/netlink"]
-    assert "v0.40.0" in rows["sys"] and "up to date" in rows["sys"]
-    assert "v3.0.0" in rows["acme/tool"] and "up to date" in rows["acme/tool"]
+    assert "v0.39.1" in rows["sys"] and "v0.40.0" in rows["sys"]
+    assert rows["acme/tool"].count("v2.1.0") == 2 and "v3.0.0" in rows["acme/tool"]
     assert "v1.0.1" in rows["other/tool"]
     assert "v2.0.0" in rows["legacy"]
     assert "v2.0.0+incompatible" in rows["incompatible"]
@@ -283,6 +302,7 @@ def test_deps_check_reports_versions_notes_and_local_source_mapping(tmp_path, up
         "slirp feature release", "Go patch five details", "Go patch six details",
         "Go feature patch one details", "Go feature patch two details",
         "Go 1.25 release features",
+        "Rust patch one", "Rust feature release",
         "1.14.0: tag-only; no release notes entry was published",
         "bugfix updates channel:", "feature updates channel:",
         "      virtiofsd patch three", "      [download](archive.zip)",
@@ -290,6 +310,7 @@ def test_deps_check_reports_versions_notes_and_local_source_mapping(tmp_path, up
     ):
         assert note in out
     assert "excluded prerelease" not in out
+    assert "up to date" not in out
     assert "badge.svg" not in out
     virtiofsd_feature = out.split("virtiofsd release notes:", 1)[1].split("libseccomp release notes:", 1)[0]
     assert "1.13.3" not in virtiofsd_feature.split("feature updates channel:", 1)[1]
@@ -298,7 +319,7 @@ def test_deps_check_reports_versions_notes_and_local_source_mapping(tmp_path, up
     assert "1.24.5" not in go_notes.split("feature updates channel:", 1)[1]
     assert "go1.24.6" in out
     assert "Go patch six details" in out
-    assert out.index("Release notes:") > out.index("Go                   1.24.4")
+    assert out.index("Release notes:") > out.index(rows["Go (compiles it)"])
     requests = "\n".join(upstream_server["requests"])
     assert "/releases.json" in requests
     assert "/dl/?mode=json&include=all" in requests
@@ -355,15 +376,16 @@ def test_deps_check_with_no_upstream_updates_exits_successfully(tmp_path, upstre
 
     assert rc == 0, err_msg(out, err)
     table = out.split("Release notes:", 1)[0]
-    summary_rows = {line.split()[0]: line for line in table.splitlines()[2:]}
-    assert "6.12.0" in summary_rows["Kernel"] and "up to date" in summary_rows["Kernel"]
-    assert "next long-term: up to date; latest stable: up to date" in table
-    assert "1.13.2" in summary_rows["virtiofsd"] and "up to date" in summary_rows["virtiofsd"]
-    assert "1.24.4" in summary_rows["Go"] and "up to date" in summary_rows["Go"]
-    assert "Debian 13 (trixie)" in summary_rows["Base"] and "13.7" in summary_rows["Base"]
-    assert "up to date" in summary_rows["Base"]
-    assert len(table.splitlines()) == 9, table
-    assert out.split("Release notes:", 1)[1].count("    up to date") == 10
+    summary_rows = _summary_rows(out)
+    assert summary_rows["Kernel"].count("6.12.0") == 3
+    assert "next long-term" not in table
+    assert summary_rows["virtiofsd"].count("1.13.2") == 3
+    assert summary_rows["Go (compiles it)"].count("1.24.4") == 3
+    assert summary_rows["Rust (compiles it)"].count("1.82.0") == 3
+    assert "Debian 13 (trixie)" in summary_rows["Base rootfs"] and summary_rows["Base rootfs"].count("13.7") == 2
+    assert summary_rows["nftables"].count("v0.3.0") == 3, table
+    assert out.split("Release notes:", 1)[1].count("    none") == 12
+    assert "up to date" not in out
 
 
 def test_deps_check_reports_next_debian_stable_when_released(tmp_path, upstream_server):
@@ -379,7 +401,7 @@ def test_deps_check_reports_next_debian_stable_when_released(tmp_path, upstream_
     )
 
     assert rc == 0, err_msg(out, err)
-    row = next(line for line in out.split("Release notes:", 1)[0].splitlines() if line.startswith("Base rootfs"))
+    row = _summary_rows(out)["Base rootfs"]
     assert "Debian 13 (trixie)" in row and "13.7" in row and "Debian 14 (forky)" in row
 
 
@@ -400,8 +422,55 @@ def test_deps_check_normalizes_wrapped_debian_metadata(tmp_path, upstream_server
     )
 
     assert rc == 0, err_msg(out, err)
-    row = next(line for line in out.split("Release notes:", 1)[0].splitlines() if line.startswith("Base rootfs"))
+    row = _summary_rows(out)["Base rootfs"]
     assert "Debian 13 (trixie)" in row and "13.7" in row
+
+
+def test_deps_check_shows_what_each_dependency_serves(tmp_path, upstream_server):
+    """Nest each dependency under the component it is built into or used for."""
+    checker = _install_checker(tmp_path)
+    out, err, rc = run(
+        [sys.executable, str(checker), "--source-base-url", upstream_server["base_url"]],
+        cwd=tmp_path,
+        timeout=30,
+    )
+
+    assert rc == 0, err_msg(out, err)
+    table = out.split("Release notes:", 1)[0].splitlines()
+    width = len(table[1].split("  ")[0])
+    lines = [line[:width].rstrip() for line in table[2:]]
+    assert lines[:12] == [
+        "Guest VM (shipped inside zaigr)",
+        "├─ Kernel",
+        "└─ Base rootfs",
+        "Host helpers (shipped inside zaigr)",
+        "├─ virtiofsd",
+        "│  ├─ libseccomp (linked in)",
+        "│  ├─ libcap-ng (linked in)",
+        "│  └─ Rust (compiles it)",
+        "└─ slirp4netns (upstream binary)",
+        "zaigr binary",
+        "├─ Go (compiles it)",
+        "└─ Go modules (linked in)",
+    ]
+    assert lines[12] == "   ├─ nftables"
+    assert lines[23] == "   └─ yaml"
+    assert len(lines) == 24
+
+
+def test_deps_check_requires_the_rust_pin(tmp_path, upstream_server):
+    """A moved Rust pin fails the report instead of dropping the compiler row."""
+    checker = _install_checker(tmp_path)
+    script = tmp_path / "cmd" / "zaigr" / "builtin" / "setups" / "zaigr-dev" / "setup.script"
+    script.write_text("# the pin moved\n", encoding="utf-8")
+    out, err, rc = run(
+        [sys.executable, str(checker), "--source-base-url", upstream_server["base_url"]],
+        cwd=tmp_path,
+        timeout=30,
+    )
+
+    assert rc == 1
+    assert "missing the Rust version pin" in out + err
 
 
 def test_deps_check_reports_next_major_upstream_failure(tmp_path, upstream_server):
