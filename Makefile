@@ -7,11 +7,13 @@ TAG = v$(VERSION)
 INSTALL_TEST_TIMEOUT ?= 1800
 PYTEST_XDIST_WORKERS ?= 8
 PYTEST_BUILTIN_WORKERS ?= 2
+STRESS_TEST_PATH ?= tests/cli
+STRESS_PYTEST_ARGS ?=
 CLOUDVM_DISTROS ?=
 TEST_BINARY = $(if $(strip $(ZAIGR_TEST_BINARY)),$(abspath $(ZAIGR_TEST_BINARY)),$(CURDIR)/zaigr)
 GO_VERSION = $(shell sed -n 's/^GO_VERSION=//p' deps.lock)
 
-.PHONY: build lint lint-golang lint-python test-all test-prepare test-cli test-cli-install test-builtin test-versioning test-install test-release test-logged clean base-rootfs base-kernel base-virtiofsd base-slirp4netns clean-kernel deps-check
+.PHONY: build lint lint-golang lint-python test-all test-prepare test-cli test-stress test-cli-install test-builtin test-versioning test-install test-release test-logged clean base-rootfs base-kernel base-virtiofsd base-slirp4netns clean-kernel deps-check
 
 # Build the base image, then compile the Go binary
 build: base-kernel base-rootfs base-virtiofsd base-slirp4netns
@@ -50,7 +52,10 @@ test-prepare:
 	fi
 
 test-cli: test-prepare
-	ZAIGR_TEST_BINARY="$(TEST_BINARY)" pytest -c tests/pytest.ini tests/cli -v -x -n $(PYTEST_XDIST_WORKERS) --maxschedchunk=1
+	ZAIGR_TEST_BINARY="$(TEST_BINARY)" pytest -c tests/pytest.ini tests/cli -v -x -n $(PYTEST_XDIST_WORKERS) --maxschedchunk=1 -m "not stress"
+
+test-stress: test-prepare
+	ZAIGR_TEST_BINARY="$(TEST_BINARY)" pytest -c tests/pytest.ini "$(STRESS_TEST_PATH)" -v -n 1 --maxfail=0 -m stress $(STRESS_PYTEST_ARGS)
 
 test-builtin: test-prepare
 	ZAIGR_TEST_BINARY="$(TEST_BINARY)" pytest -c tests/pytest.ini tests/builtin -v -x -n $(PYTEST_BUILTIN_WORKERS) --maxschedchunk=1 --timeout=1800 -o timeout_func_only=true
