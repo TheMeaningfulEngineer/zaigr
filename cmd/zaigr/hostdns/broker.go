@@ -438,6 +438,17 @@ func responseBytes(request *dns.Msg, answers []dns.RR, rcode int, ttl time.Durat
 	return packed
 }
 
+// recordLifetime returns how long a DNS record can be used. A TTL of 0 is valid
+// DNS, meaning use the answer now but do not cache it, and resolvers return it
+// as a cached record runs out. It gets the shortest lease an answer can have, so
+// the client can connect and the name keeps the leases it already holds.
+func recordLifetime(record dns.RR) time.Duration {
+	if ttl := record.Header().Ttl; ttl > 0 {
+		return time.Duration(ttl) * time.Second
+	}
+	return time.Second
+}
+
 func (s *Server) validateAnswerChain(queryName string, response *dns.Msg, allowPrivate bool) ([]dns.RR, map[netip.Addr]time.Duration, time.Duration, error) {
 	if len(response.Answer) > s.cfg.MaxAnswers {
 		return nil, nil, 0, errors.New("trusted DNS answer exceeds record-count bound")
@@ -485,10 +496,7 @@ func (s *Server) validateAnswerChain(queryName string, response *dns.Msg, allowP
 			}
 			rr := cnamesRR[current]
 			chain = append(chain, rr)
-			duration := time.Duration(rr.Header().Ttl) * time.Second
-			if duration <= 0 {
-				return nil, nil, 0, errors.New("trusted DNS CNAME has a zero TTL")
-			}
+			duration := recordLifetime(rr)
 			if !hasChainTTL || duration < chainTTL {
 				chainTTL = duration
 			}
@@ -537,15 +545,9 @@ func (s *Server) validateAnswerChain(queryName string, response *dns.Msg, allowP
 			} else if err := validateAddress(addr, s.cfg.ExcludedPrefixes); err != nil {
 				return nil, nil, 0, err
 			}
-			duration := time.Duration(record.Hdr.Ttl) * time.Second
-			if duration <= 0 {
-				return nil, nil, 0, errors.New("trusted DNS A record has a zero TTL")
-			}
+			duration := recordLifetime(record)
 			if hasChainTTL && chainTTL < duration {
 				duration = chainTTL
-			}
-			if duration <= 0 {
-				return nil, nil, 0, errors.New("trusted DNS answer has a zero TTL")
 			}
 			if duration > s.cfg.MaxLeaseTTL {
 				duration = s.cfg.MaxLeaseTTL
