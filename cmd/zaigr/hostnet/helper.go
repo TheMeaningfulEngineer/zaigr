@@ -371,17 +371,24 @@ func RunHelper(socketPath, launchID string, expectedHostUID, expectedParentPID i
 				}
 				if resp.Error == "" {
 					newManual := addressSet(parsed)
+					removed := make(map[netip.Addr]bool)
+					for address := range conntrackGrants {
+						if !newManual[address] {
+							removed[address] = true
+						}
+					}
+					// Hand live tuples to their DNS permission while the grant still
+					// covers them, so none of their packets are dropped in between.
+					if err := dnsFlows.inheritLiveFlows(removed); err != nil {
+						resp.Error = err.Error()
+						break
+					}
 					if err := replaceGrantSetUntil(parsed, helperRequestDeadline(req)); err != nil {
 						resp.Error = err.Error()
 					} else {
 						// Withdraw first, then remove only tuples without any remaining
 						// manual or admitted DNS authorization. DNS TTL expiry is not revocation.
-						removed := make(map[netip.Addr]bool)
-						for address := range conntrackGrants {
-							if !newManual[address] {
-								removed[address] = true
-							}
-						}
+						// Repeat the handoff for a tuple that opened during the withdrawal.
 						if err := dnsFlows.inheritLiveFlows(removed); err != nil {
 							resp.Error = err.Error()
 							break

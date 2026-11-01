@@ -67,8 +67,8 @@ func (s *dnsFlowState) allows(flow *netlink.ConntrackFlow) bool {
 
 // A manual or full-network grant may predate DNS resolution. At its removal,
 // transfer existing eligible tuples to the still-live DNS permission before
-// cleanup. The broader grant has already been withdrawn, so no new unmarked
-// connection can race this handoff. Never transfer using a historical answer.
+// cleanup. Once the broader grant has been withdrawn, no new unmarked connection
+// can race this handoff. Never transfer using a historical answer.
 func (s *dnsFlowState) inheritLiveFlows(targets map[netip.Addr]bool) error {
 	if targets != nil && len(targets) == 0 {
 		return nil
