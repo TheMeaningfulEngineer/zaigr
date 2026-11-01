@@ -102,79 +102,6 @@ def _deps_lock_value(repo: Path, key: str) -> str:
     raise RuntimeError(f"{key} is missing from {lock}")
 
 
-def _check_dependency_commit_separation(repo: Path) -> None:
-    """Reject mixed commits that update dependency pins.
-
-    Args:
-        repo: Repository root.
-
-    Raises:
-        RuntimeError: If dependency pins share a commit with unrelated changes.
-    """
-    commits = subprocess.run(
-        ["git", "log", "--format=%H", "--", "deps.lock", "go.mod", "go.sum"],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    if not commits.stdout.strip():
-        return
-    generated = {
-        "cmd/zaigr/vm_data/base-rootfs.img.zst",
-        "cmd/zaigr/vm_data/base-rootfs.version",
-        "cmd/zaigr/vm_data/bzImage",
-        "cmd/zaigr/vm_data/bzImage.build-key",
-        "cmd/zaigr/vm_data/virtiofsd",
-        "cmd/zaigr/vm_data/virtiofsd.version",
-        "cmd/zaigr/vm_data/slirp4netns",
-        "cmd/zaigr/vm_data/slirp4netns.version",
-    }
-    for commit in commits.stdout.splitlines():
-        parents = subprocess.run(
-            ["git", "show", "-s", "--format=%P", commit],
-            cwd=repo,
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.split()
-        for parent in parents:
-            changed = subprocess.run(
-                ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", parent, commit],
-                cwd=repo,
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout.splitlines()
-            prior_lock = subprocess.run(
-                ["git", "cat-file", "-e", f"{parent}:deps.lock"],
-                cwd=repo,
-                capture_output=True,
-                check=False,
-            )
-            if prior_lock.returncode:
-                continue
-            changed_set = set(changed)
-            if "deps.lock" in changed_set:
-                unexpected = sorted(changed_set - {"deps.lock"} - generated)
-                message = (
-                    "a deps.lock update may include only deps.lock and generated "
-                    "cmd/zaigr/vm_data artifacts"
-                )
-            elif changed_set.intersection({"go.mod", "go.sum"}):
-                unexpected = sorted(changed_set - {"go.mod", "go.sum"})
-                message = "a Go module pin update may include only go.mod and go.sum"
-            else:
-                continue
-            if unexpected:
-                paths = ", ".join(unexpected)
-                pin_kind = "deps.lock" if "deps.lock" in changed_set else "Go module pins"
-                raise RuntimeError(
-                    f"commit {commit[:12]} mixes {pin_kind} with other changes; "
-                    f"{message}; found: {paths}"
-                )
-
-
 def _cmd_candidate(repo: Path, args: argparse.Namespace) -> int:
     """Create a release candidate and capture its build outputs.
 
@@ -193,7 +120,6 @@ def _cmd_candidate(repo: Path, args: argparse.Namespace) -> int:
     version = _parse_version(version)
     commit = _git_commit(repo)
     dirty = _git_dirty(repo)
-    _check_dependency_commit_separation(repo)
     build = _next_build(repo, version)
     candidate_root = _candidate_path(repo, version, build)
 

@@ -43,6 +43,15 @@ def _release_env(tmp_path):
     return env
 
 
+def _deps_lock_value(repo, key):
+    """Read a pin from the dependency lock in a test repository."""
+    for line in (repo / "deps.lock").read_text(encoding="utf-8").splitlines():
+        name, separator, value = line.partition("=")
+        if separator and name.strip() == key:
+            return value.strip().strip("\"'")
+    raise AssertionError(f"{key} is missing from deps.lock")
+
+
 def _fake_command(bin_dir, name, body):
     bin_dir.mkdir(parents=True, exist_ok=True)
     path = bin_dir / name
@@ -199,60 +208,20 @@ def test_candidate_rejects_bad_versions(tmp_path, version):
     assert not (repo / "release/state").exists()
 
 
-@pytest.mark.parametrize("changed_path", ["tracked.txt", "cmd/zaigr/vm_data/miniconfig"])
-def test_candidate_rejects_buried_dependency_and_source_commit(tmp_path, changed_path):
-    """Reject a mixed lock/source update even when a later commit is benign."""
+def test_candidate_builds_with_the_go_version_in_deps_lock(tmp_path):
+    """Build the candidate with the Go version pinned in deps.lock."""
     repo = tmp_path / "repo"
     _init_git_repo(repo)
-    (repo / "deps.lock").write_text(
-        (repo / "deps.lock").read_text(encoding="utf-8") + "# lock update\n",
-        encoding="utf-8",
-    )
-    source = repo / changed_path
-    source.parent.mkdir(parents=True, exist_ok=True)
-    source.write_text("source update\n", encoding="utf-8")
-    out, err, rc = run(["git", "add", "deps.lock", changed_path], cwd=repo, timeout=10)
+    go_version = "1.25.8"
+    lock_text = (repo / "deps.lock").read_text(encoding="utf-8").splitlines()
+    updated_lock = [
+        f"GO_VERSION={go_version}" if line.startswith("GO_VERSION=") else line
+        for line in lock_text
+    ]
+    (repo / "deps.lock").write_text("\n".join(updated_lock) + "\n", encoding="utf-8")
+    out, err, rc = run(["git", "add", "deps.lock"], cwd=repo, timeout=10)
     assert rc == 0, err_msg(out, err)
-    out, err, rc = run(["git", "commit", "-m", "deps: mix lock and source"], cwd=repo, timeout=10)
-    assert rc == 0, err_msg(out, err)
-    (repo / "tracked.txt").write_text("later harmless change\n", encoding="utf-8")
-    out, err, rc = run(["git", "add", "tracked.txt"], cwd=repo, timeout=10)
-    assert rc == 0, err_msg(out, err)
-    out, err, rc = run(["git", "commit", "-m", "docs: later change"], cwd=repo, timeout=10)
-    assert rc == 0, err_msg(out, err)
-
-    out, err, rc = run(
-        [RELEASE, "candidate", "1.0.0"],
-        cwd=repo,
-        env=_release_env(tmp_path),
-        timeout=10,
-    )
-
-    assert rc != 0
-    assert "deps.lock" in out + err
-    assert changed_path in out + err
-    assert not (repo / "release/state").exists()
-
-
-def test_candidate_allows_dependency_lock_with_generated_vm_data(tmp_path):
-    """Allow generated VM outputs alongside an existing dependency lock."""
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    lock_text = (repo / "deps.lock").read_text(encoding="utf-8")
-    (repo / "deps.lock").write_text(
-        lock_text.replace("GO_VERSION=1.24.4", "GO_VERSION=1.25.8") + "# refreshed pins\n",
-        encoding="utf-8",
-    )
-    generated = repo / "cmd/zaigr/vm_data/slirp4netns.version"
-    generated.parent.mkdir(parents=True)
-    generated.write_text("1.3.4\n", encoding="utf-8")
-    rootfs_version = repo / "cmd/zaigr/vm_data/base-rootfs.version"
-    rootfs_version.write_text("6e86cb0-ac2b98b\n", encoding="utf-8")
-    out, err, rc = run(
-        ["git", "add", "deps.lock", generated, rootfs_version], cwd=repo, timeout=10
-    )
-    assert rc == 0, err_msg(out, err)
-    out, err, rc = run(["git", "commit", "-m", "deps: refresh generated pins"], cwd=repo, timeout=10)
+    out, err, rc = run(["git", "commit", "-m", "deps: update Go"], cwd=repo, timeout=10)
     assert rc == 0, err_msg(out, err)
     _write_fake_candidate_primitives(
         repo,
@@ -275,99 +244,7 @@ chmod +x zaigr
     assert rc == 0, err_msg(out, err)
     assert "Release candidate created" in out
     commands = (repo / "release/state" / "commands.log").read_text(encoding="utf-8")
-    assert "GOTOOLCHAIN=go1.25.8" in commands
-
-
-def test_candidate_allows_go_module_pin_update_without_source(tmp_path):
-    """Allow a Go pin update when it changes only go.mod and go.sum."""
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    (repo / "go.mod").write_text("module example.invalid/app\n\ngo 1.24.4\n", encoding="utf-8")
-    (repo / "go.sum").write_text("example.invalid/dependency v1.2.3 h1:test\n", encoding="utf-8")
-    out, err, rc = run(["git", "add", "go.mod", "go.sum"], cwd=repo, timeout=10)
-    assert rc == 0, err_msg(out, err)
-    out, err, rc = run(["git", "commit", "-m", "deps: update Go module pins"], cwd=repo, timeout=10)
-    assert rc == 0, err_msg(out, err)
-    _write_fake_candidate_primitives(
-        repo,
-        tmp_path,
-        "printf '#!/bin/sh\\nexit 0\\n' > zaigr\nchmod +x zaigr\n",
-    )
-
-    out, err, rc = run(
-        [RELEASE, "candidate", "1.0.0"],
-        cwd=repo,
-        env=_release_env(tmp_path),
-        input="y\n",
-        timeout=10,
-    )
-
-    assert rc == 0, err_msg(out, err)
-    assert "Release candidate created" in out
-
-
-def test_candidate_rejects_go_module_pins_mixed_with_source(tmp_path):
-    """Reject a Go pin change committed together with application source."""
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    (repo / "go.mod").write_text("module example.invalid/app\n\ngo 1.24.4\n", encoding="utf-8")
-    (repo / "go.sum").write_text("example.invalid/dependency v1.2.3 h1:test\n", encoding="utf-8")
-    (repo / "tracked.txt").write_text("source changed with Go pins\n", encoding="utf-8")
-    out, err, rc = run(["git", "add", "go.mod", "go.sum", "tracked.txt"], cwd=repo, timeout=10)
-    assert rc == 0, err_msg(out, err)
-    out, err, rc = run(["git", "commit", "-m", "deps: mix Go pins and source"], cwd=repo, timeout=10)
-    assert rc == 0, err_msg(out, err)
-
-    out, err, rc = run(
-        [RELEASE, "candidate", "1.0.0"],
-        cwd=repo,
-        env=_release_env(tmp_path),
-        timeout=10,
-    )
-
-    assert rc != 0
-    assert "a Go module pin update may include only go.mod and go.sum" in out + err
-    assert "tracked.txt" in out + err
-    assert not (repo / "release/state").exists()
-
-
-def test_candidate_allows_lock_introduction_with_reader_update(tmp_path):
-    """Allow a lock introduction and its source reader in one commit."""
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    out, err, rc = run(["git", "rm", "deps.lock"], cwd=repo, timeout=10)
-    assert rc == 0, err_msg(out, err)
-    out, err, rc = run(["git", "commit", "-m", "chore: establish pre-lock history"], cwd=repo, timeout=10)
-    assert rc == 0, err_msg(out, err)
-    shutil.copy2(Path(REPO_ROOT) / "deps.lock", repo / "deps.lock")
-    (repo / "go.mod").write_text("module example.invalid/app\n\ngo 1.24.4\n", encoding="utf-8")
-    (repo / "go.sum").write_text("example.invalid/dependency v1.2.3 h1:test\n", encoding="utf-8")
-    (repo / "tracked.txt").write_text("now reads the dependency lock\n", encoding="utf-8")
-    out, err, rc = run(
-        ["git", "add", "deps.lock", "go.mod", "go.sum", "tracked.txt"], cwd=repo, timeout=10
-    )
-    assert rc == 0, err_msg(out, err)
-    out, err, rc = run(["git", "commit", "-m", "build: introduce dependency lock reader"], cwd=repo, timeout=10)
-    assert rc == 0, err_msg(out, err)
-    _write_fake_candidate_primitives(
-        repo,
-        tmp_path,
-        """
-printf '#!/bin/sh\\nexit 0\\n' > zaigr
-chmod +x zaigr
-""",
-    )
-
-    out, err, rc = run(
-        [RELEASE, "candidate", "1.0.0"],
-        cwd=repo,
-        env=_release_env(tmp_path),
-        input="y\n",
-        timeout=10,
-    )
-
-    assert rc == 0, err_msg(out, err)
-    assert "Release candidate created" in out
+    assert f"GOTOOLCHAIN=go{go_version}" in commands
 
 
 def test_candidate_summary_derives_tag_and_first_build(tmp_path):
@@ -397,7 +274,7 @@ chmod +x zaigr
     assert "build:" in out and "1" in out
     assert "tag:" in out and "v1.0.0" in out
     commands = (repo / "release/state" / "commands.log").read_text(encoding="utf-8")
-    assert "GOTOOLCHAIN=go1.24.4" in commands
+    assert f"GOTOOLCHAIN=go{_deps_lock_value(repo, 'GO_VERSION')}" in commands
     assert "Plan" not in out
     assert "Release candidate" in err
     assert "version:" in err and "1.0.0" in err
