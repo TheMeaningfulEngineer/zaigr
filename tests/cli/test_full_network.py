@@ -14,6 +14,7 @@ from ..conftest import err_msg, spawn_interactive
 from ..conftest import run as _run
 from .host_access_endpoints import wait_text
 from .host_network_fixture.processes import signal_recorded_process
+from .host_network_fixture.public_site import public_address
 
 USER_PROMPT = r"user@[^:]+:.*[$] "
 FULL_NETWORK_WARNING = (
@@ -552,7 +553,7 @@ def test_exact_dns_grants_share_and_release_live_ip_references(
     """Keep a public HTTP flow through shared DNS grants until its final reference is removed."""
     zaigr = project.zaigr_bin
     dns = host_network_dns
-    public_ip = socket.gethostbyname("deb.debian.org")
+    public_ip = public_address("deb.debian.org")
     debian_url = "http://deb.debian.org/debian/dists/trixie/main/binary-amd64/Packages.xz"
     host_control = checked_run(
         ["curl", "--noproxy", "*", "-4fsSI", "--connect-timeout", "4", "--max-time", "12",
@@ -746,7 +747,7 @@ def test_dns_answer_change_keeps_established_flow_until_domain_removed(
     """A CDN moving an allowed name to new IPs must not cut connections already open."""
     zaigr = project.zaigr_bin
     dns = host_network_dns
-    public_ip = socket.gethostbyname("deb.debian.org")
+    public_ip = public_address("deb.debian.org")
     # Any other public address: the name's answer moves away from public_ip.
     rotated_ip = "151.101.2.132"
     assert rotated_ip != public_ip
@@ -822,7 +823,7 @@ def test_delayed_dns_answer_cannot_restore_removed_grant(
     zaigr = project.zaigr_bin
     resolver = host_network_dns["resolver"]
     assert dns_probe_binary.is_file()
-    public_ip = socket.gethostbyname("deb.debian.org")
+    public_ip = public_address("deb.debian.org")
     debian_url = "http://deb.debian.org/debian/dists/trixie/main/binary-amd64/Packages.xz"
     host_control = checked_run(
         ["curl", "--noproxy", "*", "-4fsSI", "--connect-timeout", "4", "--max-time", "12",

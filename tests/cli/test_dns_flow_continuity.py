@@ -3,12 +3,12 @@
 import os
 import shlex
 import signal
-import socket
 import time
 
 import pytest
 
 from .host_network_fixture.processes import open_supervisor_pidfd
+from .host_network_fixture.public_site import public_address
 from .test_full_network import checked_run, stream_goes_quiet, stream_grows
 
 
@@ -27,7 +27,7 @@ def test_dns_refresh_outage_preserves_existing_flow_and_blocks_new_flows(
     resolver = host_network_dns["resolver"]
     checked_run([zaigr, "project", "vm", "start"], cwd=project.cwd, env=project.env,
                 input="y\n", timeout=180)
-    address = socket.gethostbyname("deb.debian.org")
+    address = public_address("deb.debian.org")
     resolver.set_answer("outage.test", address, 5)
     checked_run([zaigr, "project", "firewall", "allow", "outage.test"],
                 cwd=project.cwd, env=project.env)
@@ -91,7 +91,7 @@ def test_manual_flow_can_transfer_to_a_later_dns_permission(
     zaigr = project.zaigr_bin
     checked_run([zaigr, "project", "vm", "start"], cwd=project.cwd, env=project.env,
                 input="y\n", timeout=180)
-    address = socket.gethostbyname("deb.debian.org")
+    address = public_address("deb.debian.org")
     host_network_dns["resolver"].set_answer("handoff.test", address, 30)
     checked_run([zaigr, "project", "firewall", "allow", address],
                 cwd=project.cwd, env=project.env)
@@ -129,7 +129,7 @@ def test_dns_flow_does_not_resume_after_network_liveness_expires(
     zaigr = project.zaigr_bin
     checked_run([zaigr, "project", "vm", "start"], cwd=project.cwd, env=project.env,
                 input="y\n", timeout=180)
-    address = socket.gethostbyname("deb.debian.org")
+    address = public_address("deb.debian.org")
     host_network_dns["resolver"].set_answer("liveness.test", address, 60)
     checked_run([zaigr, "project", "firewall", "allow", "liveness.test"],
                 cwd=project.cwd, env=project.env)
