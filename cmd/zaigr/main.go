@@ -52,7 +52,13 @@ func newRootCommand() *cobra.Command {
 				projectSandboxContext = true
 			}
 		}
-		return configureLogging(logLevel, verboseCount, cmd.Flags().Changed("log-level"))
+		if err := configureLogging(logLevel, verboseCount, cmd.Flags().Changed("log-level")); err != nil {
+			return err
+		}
+		if !internalCommand(cmd) {
+			showVMNetworkNotice(currentProjectStore())
+		}
+		return nil
 	}
 	rootCmd.Version = version
 	rootCmd.SetVersionTemplate("{{.Version}}\n")
@@ -69,6 +75,17 @@ func newRootCommand() *cobra.Command {
 	rootCmd.AddCommand(newVMSSHBrokerChildCommand())
 
 	return rootCmd
+}
+
+// internalCommand reports whether cmd is zaigr's own plumbing, not something a
+// person ran.
+func internalCommand(cmd *cobra.Command) bool {
+	for scope := cmd; scope != nil; scope = scope.Parent() {
+		if scope.Hidden {
+			return true
+		}
+	}
+	return false
 }
 
 type cliError struct {

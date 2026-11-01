@@ -635,6 +635,28 @@ func showVMStopNotice(store projectStore) {
 	}
 }
 
+func vmNetworkNoticePath(store projectStore) string {
+	return filepath.Join(store.runtimeDir(), "network-blocked-notice")
+}
+
+// showVMNetworkNotice warns while the project's running VM has no network. It
+// goes to stderr so command output stays usable, and the supervisor check keeps
+// a notice left behind by a killed supervisor from being shown.
+func showVMNetworkNotice(store projectStore) {
+	data, err := os.ReadFile(vmNetworkNoticePath(store))
+	if err != nil || len(data) == 0 {
+		return
+	}
+	record, err := readVMSupervisorRecord(store)
+	if err != nil {
+		return
+	}
+	if live, err := vmProcessLive(record.Supervisor); err != nil || !live {
+		return
+	}
+	_, _ = fmt.Fprintf(os.Stderr, ":: Warning: %s\n", strings.TrimSpace(string(data)))
+}
+
 func vmProcessIdentity(pid int) (vmOwnedProcess, error) {
 	start, err := processStartTime(pid)
 	if err != nil {

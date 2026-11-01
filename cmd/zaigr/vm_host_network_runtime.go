@@ -65,6 +65,10 @@ type hostNetworkHandle struct {
 	networkLiveUntil    time.Time
 	discoveryScope      string
 	recordUpdater       func(uint64) error
+
+	networkNotice string
+	// policyPending forces reconciliation after an update that may yet land.
+	policyPending bool
 }
 
 type hostNetworkPolicyScope struct {
@@ -94,8 +98,10 @@ type hostNetworkCheckFailure struct {
 
 const terminalDNSPolicyFailurePrefix = "terminal host DNS policy failure: "
 
+const firewallChangePending = "the firewall change is saved, but the host network has not confirmed it yet; zaigr keeps retrying and applies it as soon as the host network responds"
+
 func terminalDNSPolicyFailure(err error) error {
-	return fmt.Errorf("Couldn't confirm the saved firewall policy ("+terminalDNSPolicyFailurePrefix+"%w). Network access is being blocked (within 10 seconds); the VM will stop within 60 seconds. Your saved firewall rules will be applied when you start the VM again.", err)
+	return fmt.Errorf("Couldn't confirm the saved firewall policy ("+terminalDNSPolicyFailurePrefix+"%w). Network access stays blocked until the VM restarts. Your saved firewall rules will be applied when you start the VM again.", err)
 }
 
 // startHostNetworkRuntime performs the complete host-owned network bootstrap.
@@ -344,47 +350,25 @@ func (h *hostNetworkHandle) updateFullNetworkLease(ctx context.Context, leaseID,
 func (h *hostNetworkHandle) fullNetworkLeaseLoop() {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
-	var failureSince time.Time
-	var failureDeadline time.Time
+	var failureSince, lastLogged time.Time
 	lastFailure := ""
-	var failureTimer *time.Timer
 	var asyncFailure string
-	var lastFailureErr error
-	defer func() {
-		if failureTimer != nil {
-			failureTimer.Stop()
-		}
-	}()
-	failed := func(step string, err error) bool {
+	// A failed check never stops the VM. Every failure skips the renewal below,
+	// so the kernel blocks guest traffic within fullNetworkOwnerTTL by itself and
+	// the next successful renewal reopens it.
+	failed := func(step string, err error) {
+		now := time.Now()
 		if failureSince.IsZero() {
-			failureSince = time.Now()
-			failureDeadline = failureSince.Add(60 * time.Second)
-			timedOutCheck := step
-			timedOutErr := err
-			failureTimer = time.AfterFunc(time.Until(failureDeadline), func() {
-				if dnsFailure := h.asyncCheckFailure(); dnsFailure != nil {
-					if strings.Contains(dnsFailure.err.Error(), terminalDNSPolicyFailurePrefix) {
-						h.reportFatal(fmt.Errorf("%w; stopped after 60-second grace", dnsFailure.err))
-					} else {
-						h.reportFatal(fmt.Errorf("host network checks failed for 60 s: %s: %w", dnsFailure.step, dnsFailure.err))
-					}
-					return
-				}
-				h.reportFatal(fmt.Errorf("host network checks failed for 60 s: %s: %w", timedOutCheck, timedOutErr))
-			})
+			failureSince = now
+		}
+		if step != lastFailure || now.Sub(lastLogged) >= time.Minute {
+			logWarn("host network check failed; retrying", "check", step, "error", err, "failed_for", now.Sub(failureSince).Round(time.Second))
+			lastLogged = now
 		}
 		lastFailure = step
-		lastFailureErr = err
-		logWarn("host network check failed; retrying", "check", step, "error", err, "failed_for", time.Since(failureSince).Round(time.Second))
-		if !time.Now().Before(failureDeadline) {
-			if issue := h.asyncCheckFailure(); issue != nil && strings.Contains(issue.err.Error(), terminalDNSPolicyFailurePrefix) {
-				h.reportFatal(fmt.Errorf("%w; stopped after 60-second grace", issue.err))
-			} else {
-				h.reportFatal(fmt.Errorf("host network checks failed for 60 s: %s: %w", lastFailure, lastFailureErr))
-			}
-			return true
+		if now.Sub(failureSince) >= fullNetworkOwnerTTL {
+			h.noteNetworkBlocked(failureSince, step, err)
 		}
-		return false
 	}
 	for {
 		select {
@@ -392,9 +376,7 @@ func (h *hostNetworkHandle) fullNetworkLeaseLoop() {
 			return
 		case issue := <-h.checkFailures:
 			asyncFailure = issue.step
-			if failed(issue.step, issue.err) {
-				return
-			}
+			failed(issue.step, issue.err)
 		case <-ticker.C:
 			if h.asyncCheckFailed.Load() {
 				issue := h.asyncCheckFailure()
@@ -402,25 +384,19 @@ func (h *hostNetworkHandle) fullNetworkLeaseLoop() {
 					issue = &hostNetworkCheckFailure{step: "reconcile host DNS policy", err: errors.New("host DNS policy worker reported a terminal reconciliation failure")}
 				}
 				asyncFailure = issue.step
-				if failed(issue.step, issue.err) {
-					return
-				}
+				failed(issue.step, issue.err)
 				continue
 			}
 			policyCtx, policyCancel := context.WithTimeout(h.ctx, 4*time.Second)
 			policyErr := h.applySavedPolicy(policyCtx, false)
 			policyCancel()
 			if policyErr != nil {
-				if failed("reconcile saved host policy", policyErr) {
-					return
-				}
+				failed("reconcile saved host policy", policyErr)
 				continue
 			}
 			currentExclusions, inventoryErr := hostDNSExcludedPrefixes()
 			if inventoryErr != nil {
-				if failed("inspect host network topology", inventoryErr) {
-					return
-				}
+				failed("inspect host network topology", inventoryErr)
 				continue
 			}
 			if !equalHostDNSPrefixes(currentExclusions, h.hostExclusions) {
@@ -435,9 +411,7 @@ func (h *hostNetworkHandle) fullNetworkLeaseLoop() {
 					h.reportFatal(err)
 					return
 				}
-				if failed("check host network child liveness", err) {
-					return
-				}
+				failed("check host network child liveness", err)
 				continue
 			}
 			for id, deadline := range h.fullAccessLeases {
@@ -464,9 +438,7 @@ func (h *hostNetworkHandle) fullNetworkLeaseLoop() {
 			}
 			if cycleErr != nil {
 				h.updateMu.Unlock()
-				if failed(cycleStep, cycleErr) {
-					return
-				}
+				failed(cycleStep, cycleErr)
 				continue
 			}
 			active := len(h.fullAccessLeases) > 0
@@ -480,9 +452,7 @@ func (h *hostNetworkHandle) fullNetworkLeaseLoop() {
 				cancel()
 				if err != nil {
 					h.updateMu.Unlock()
-					if failed("renew full-network host lease", err) {
-						return
-					}
+					failed("renew full-network host lease", err)
 					continue
 				} else {
 					h.fullAccessLive = active
@@ -492,9 +462,7 @@ func (h *hostNetworkHandle) fullNetworkLeaseLoop() {
 			case issue := <-h.checkFailures:
 				asyncFailure = issue.step
 				h.updateMu.Unlock()
-				if failed(issue.step, issue.err) {
-					return
-				}
+				failed(issue.step, issue.err)
 				continue
 			default:
 			}
@@ -504,9 +472,7 @@ func (h *hostNetworkHandle) fullNetworkLeaseLoop() {
 				if issue == nil {
 					issue = &hostNetworkCheckFailure{step: "reconcile host DNS policy", err: errors.New("host DNS policy worker reported a terminal reconciliation failure")}
 				}
-				if failed(issue.step, issue.err) {
-					return
-				}
+				failed(issue.step, issue.err)
 				continue
 			}
 			networkCtx, networkCancel := context.WithTimeout(h.ctx, 4*time.Second)
@@ -515,9 +481,7 @@ func (h *hostNetworkHandle) fullNetworkLeaseLoop() {
 			networkCancel()
 			if networkErr != nil {
 				h.updateMu.Unlock()
-				if failed("renew host network liveness gate", networkErr) {
-					return
-				}
+				failed("renew host network liveness gate", networkErr)
 				continue
 			}
 			h.networkLiveUntil = networkDeadline
@@ -525,29 +489,14 @@ func (h *hostNetworkHandle) fullNetworkLeaseLoop() {
 			select {
 			case issue := <-h.checkFailures:
 				asyncFailure = issue.step
-				if failed(issue.step, issue.err) {
-					return
-				}
+				failed(issue.step, issue.err)
 			default:
 				if asyncFailure == "" && !h.asyncCheckFailed.Load() {
-					if !failureDeadline.IsZero() && !time.Now().Before(failureDeadline) {
-						if issue := h.asyncCheckFailure(); issue != nil {
-							if strings.Contains(issue.err.Error(), terminalDNSPolicyFailurePrefix) {
-								h.reportFatal(fmt.Errorf("%w; stopped after 60-second grace", issue.err))
-							} else {
-								h.reportFatal(fmt.Errorf("host network checks failed for 60 s: %s: %w", issue.step, issue.err))
-							}
-						} else {
-							h.reportFatal(fmt.Errorf("host network checks failed for 60 s: %s: %w", lastFailure, lastFailureErr))
-						}
-						return
-					}
-					if failureTimer != nil {
-						failureTimer.Stop()
-						failureTimer = nil
+					if !failureSince.IsZero() {
+						logWarn("host network checks recovered", "failed_for", time.Since(failureSince).Round(time.Second))
+						h.clearNetworkBlocked()
 					}
 					failureSince = time.Time{}
-					failureDeadline = time.Time{}
 					lastFailure = ""
 				}
 			}
@@ -630,7 +579,11 @@ func (h *hostNetworkHandle) SetPolicyRecordUpdater(update func(uint64) error) {
 // ApplySavedPolicy reloads the complete authoritative project/global snapshot
 // in the supervisor. Callers cannot submit stale policy contents over IPC.
 func (h *hostNetworkHandle) ApplySavedPolicy(ctx context.Context) error {
-	return h.applySavedPolicy(ctx, true)
+	err := h.applySavedPolicy(ctx, true)
+	if err != nil && hostdns.RetryableUpdateFailure(err) {
+		return fmt.Errorf("%s (%w)", firewallChangePending, err)
+	}
+	return err
 }
 
 func (h *hostNetworkHandle) recordAsyncCheckFailure(step string, err error) {
@@ -691,7 +644,7 @@ func (h *hostNetworkHandle) applySavedPolicy(ctx context.Context, fatalOnFailure
 		}
 		return wrapped
 	}
-	if equalStrings(names, h.policyNames) && equalHostNetworkAddresses(grants, h.policyGrants) {
+	if !h.policyPending && equalStrings(names, h.policyNames) && equalHostNetworkAddresses(grants, h.policyGrants) {
 		return nil
 	}
 	allNames, allGrants := unionScopedHostPolicy(names, grants, h.policyScopes)
@@ -706,11 +659,16 @@ func (h *hostNetworkHandle) applySavedPolicy(ctx context.Context, fatalOnFailure
 		if terminalErr := h.currentTerminalDNSPolicyFailure(); terminalErr != nil {
 			return terminalErr
 		}
+		if hostdns.RetryableUpdateFailure(err) {
+			h.policyPending = true
+			return err
+		}
 		if fatalOnFailure {
 			h.reportFatal(fmt.Errorf("apply saved host network policy: %w", err))
 		}
 		return err
 	}
+	h.policyPending = false
 	if h.recordUpdater != nil {
 		if err := h.recordUpdater(generation); err != nil {
 			if fatalOnFailure {
@@ -761,6 +719,10 @@ func (h *hostNetworkHandle) BeginScopedPolicy(ctx context.Context, scopeID strin
 		return h.network.ApplyPolicy(applyCtx, hostnet.PolicySnapshot{LaunchID: h.network.LaunchID(), Generation: generation, IPGrants: allIPs})
 	})
 	if err != nil {
+		if hostdns.RetryableUpdateFailure(err) {
+			// The attempt may still land, so reconcile back to the recorded scopes.
+			h.policyPending = true
+		}
 		h.reportFatal(fmt.Errorf("apply scoped host network policy: %w", err))
 		return err
 	}
@@ -800,6 +762,12 @@ func (h *hostNetworkHandle) EndScopedPolicy(ctx context.Context, scopeID string)
 		return h.network.ApplyPolicy(applyCtx, hostnet.PolicySnapshot{LaunchID: h.network.LaunchID(), Generation: generation, IPGrants: allIPs})
 	})
 	if err != nil {
+		if hostdns.RetryableUpdateFailure(err) {
+			// The scope is over either way. Reconciliation removes it once the
+			// helper responds.
+			h.policyScopes = nextScopes
+			h.policyPending = true
+		}
 		h.reportFatal(fmt.Errorf("remove scoped host network policy: %w", err))
 		return err
 	}
@@ -850,8 +818,12 @@ func (h *hostNetworkHandle) EndDiscovery(ctx context.Context, launchID string, g
 		return errors.New("host network discovery: scope identity mismatch")
 	}
 	if err := h.dns.EndDiscovery(ctx, launchID, generation, scopeID); err != nil {
-		h.reportFatal(fmt.Errorf("end host DNS discovery: %w", err))
-		return err
+		if !hostdns.RetryableUpdateFailure(err) {
+			h.reportFatal(fmt.Errorf("end host DNS discovery: %w", err))
+			return err
+		}
+		// The broker has dropped the scope and resends its leases by itself.
+		logWarn("ending host DNS discovery will be retried", "error", err)
 	}
 	h.discoveryScope = ""
 	return nil
@@ -1056,7 +1028,40 @@ func (h *hostNetworkHandle) waitFrontend(cmd *exec.Cmd) {
 	}
 }
 
+// noteNetworkBlocked tells every later zaigr command what state the project is
+// in. The warning is removed as soon as the network works again.
+func (h *hostNetworkHandle) noteNetworkBlocked(since time.Time, step string, err error) {
+	var next string
+	if strings.Contains(err.Error(), terminalDNSPolicyFailurePrefix) {
+		next = "This will not clear by itself. Restart the VM with 'zaigr project vm stop' and 'zaigr project vm start'; your saved firewall rules are applied on start."
+	} else {
+		next = "zaigr keeps retrying and the network comes back by itself if this clears. If it doesn't, restart the VM with 'zaigr project vm stop' and 'zaigr project vm start'."
+	}
+	notice := fmt.Sprintf("the VM is running, but its network has been blocked since %s.\nCause: %s: %v\nFiles and open sessions are not affected; programs in the VM can't reach the network.\n%s\nDetails: %s",
+		since.UTC().Format(time.RFC3339), step, err, next, filepath.Join(h.store.Path, "vm-supervisor.log"))
+	if notice == h.networkNotice {
+		return
+	}
+	if writeErr := writeFileAtomically(vmNetworkNoticePath(h.store), []byte(notice+"\n"), 0600); writeErr != nil {
+		logWarn("record blocked host network", "error", writeErr)
+		return
+	}
+	h.networkNotice = notice
+}
+
+func (h *hostNetworkHandle) clearNetworkBlocked() {
+	h.networkNotice = ""
+	if err := os.Remove(vmNetworkNoticePath(h.store)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		logWarn("clear blocked host network notice", "error", err)
+	}
+}
+
 func (h *hostNetworkHandle) reportFatal(err error) {
+	// A late helper never stops the VM, whichever operation noticed it.
+	if hostdns.RetryableUpdateFailure(err) {
+		logWarn("host network update will be retried", "error", err)
+		return
+	}
 	select {
 	case h.fatal <- err:
 	default:
@@ -1320,6 +1325,10 @@ func hostNetworkControlRequestWithReply(ctx context.Context, runtimeDir, launchI
 	}
 	var response hostNetworkControlResponse
 	if err := json.NewDecoder(io.LimitReader(conn, 64<<10)).Decode(&response); err != nil {
+		var netErr net.Error
+		if operation == "policy-reconcile" && errors.As(err, &netErr) && netErr.Timeout() {
+			return hostNetworkControlResponse{}, fmt.Errorf("%s (%w)", firewallChangePending, err)
+		}
 		return hostNetworkControlResponse{}, err
 	}
 	if response.Error != "" {

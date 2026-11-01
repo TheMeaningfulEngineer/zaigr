@@ -64,7 +64,7 @@ def continue_recorded_process_if_alive(record, name, network_process=False):
     try:
         signal_recorded_process(record, name, signal.SIGCONT, network_process)
     except (ProcessLookupError, FileNotFoundError):
-        # The 60-second failure path owns and may already have reaped the helper.
+        # A dying VM owns and may already have reaped the helper.
         try:
             fields = proc_stat.read_text().rsplit(")", 1)[1].split()
         except FileNotFoundError:
@@ -212,43 +212,94 @@ def test_paused_host_network_helper_preserves_vm_then_fails_closed_and_recovers(
             shell.expect(pexpect.EOF, timeout=10)
         shell.close()
 
-@pytest.mark.timeout(420)
-def test_host_network_checks_stopping_vm_after_continuous_failure_is_reported(project):
-    """A 60-second helper stall stops the VM and reports the failed check."""
+@pytest.mark.timeout(300)
+def test_frozen_host_network_warns_every_command_and_recovers_without_stopping_vm(
+    project, host_network_endpoints, host_network_dns
+):
+    """A helper frozen past every deadline blocks traffic, warns, and never stops the VM."""
     run = partial(checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
+    endpoint = host_network_endpoints
+    in_vm = [zaigr, "project", "vm", "exec", "--"]
+    fetch = in_vm + ["curl", "--noproxy", "*", "-4fsS", "--max-time", "4",
+                     f"http://10.0.2.2:{endpoint['tcp_port']}/"]
+    host_network_dns["resolver"].set_answer("stall.test", "93.184.216.34", 30)
+
     run([zaigr, "project", "vm", "start"], input="y\n", timeout=180)
+    run([zaigr, "project", "firewall", "allow", "10.0.2.2"], timeout=30)
+    run([zaigr, "project", "firewall", "allow", "stall.test"], timeout=30)
+    assert run(fetch, timeout=20).strip() == endpoint["token"]
+    boot_id = run(in_vm + ["cat", "/proc/sys/kernel/random/boot_id"], timeout=20)
     record = json.loads((project.store_dir / "vm-supervisor.json").read_text())
     assert "hostnet-helper" in record["network_processes"], record
 
-    signal_recorded_process(
-        record, "hostnet-helper", signal.SIGSTOP, network_process=True
-    )
+    def warning(command=("project", "status")):
+        _stdout, stderr, _code = _run([zaigr, *command], cwd=project.cwd, env=project.env, timeout=20)
+        return stderr if "network has been blocked" in stderr else None
+
+    signal_recorded_process(record, "hostnet-helper", signal.SIGSTOP, network_process=True)
+    frozen_at = time.monotonic()
     try:
         wait_process_stopped(record, "hostnet-helper", network_process=True)
-        time.sleep(66)
+        # A lookup whose firewall update never finishes used to doom the VM.
+        _run(in_vm + ["getent", "ahostsv4", "stall.test"],
+             cwd=project.cwd, env=project.env, timeout=30)
+
+        warned = wait_until(warning, "a warning from zaigr project status", timeout=30)
+        assert "the vm is running" in warned.lower(), warned
+        assert "keeps retrying" in warned, warned
+        assert "zaigr project vm stop" in warned, warned
+        assert "vm-supervisor.log" in warned, warned
+        assert warning(("project", "firewall", "show")), "another command gave no warning"
+
+        # Stay frozen well past the 60 seconds that used to stop the VM.
+        time.sleep(max(0, 70 - (time.monotonic() - frozen_at)))
+        assert warning(), "the VM should still be running and blocked"
+        assert "status: running" in run([zaigr, "project", "status"], timeout=20).lower()
     finally:
         continue_recorded_process_if_alive(record, "hostnet-helper", network_process=True)
 
-    stopped = wait_until(
-        lambda: (output if "status: not running" in (output := run(
-            [zaigr, "project", "status"], timeout=20
-        ).lower()) else None),
-        "project status to report stopped after 60 seconds of failed checks",
-        timeout=15,
-    )
-    assert "status: not running" in stopped
+    def recovered():
+        stdout, stderr, code = _run(fetch, cwd=project.cwd, env=project.env, timeout=10)
+        return code == 0 and stdout.strip() == endpoint["token"] and "blocked" not in stderr
 
-    supervisor_log = (project.store_dir / "vm-supervisor.log").read_text()
-    assert "host network checks failed for 60 s" in supervisor_log.lower()
-    assert "renew host network liveness gate" in supervisor_log.lower()
+    wait_until(recovered, "the network to return without a warning", timeout=30)
+    assert "93.184.216.34" in run(in_vm + ["getent", "ahostsv4", "stall.test"], timeout=20)
+    assert run(in_vm + ["cat", "/proc/sys/kernel/random/boot_id"], timeout=20) == boot_id
+    assert "the vm stopped at" not in (project.store_dir / "vm-supervisor.log").read_text().lower()
 
-    stdout, stderr, code = _run(
-        [zaigr, "project", "vm", "start"],
-        cwd=project.cwd, env=project.env, timeout=180,
-    )
-    startup_output = stdout + stderr
-    assert code == 0, err_msg(stdout, stderr)
-    assert "the vm stopped at" in startup_output.lower(), startup_output
-    assert "host network checks failed for 60 s" in startup_output.lower(), startup_output
-    assert "renew host network liveness gate" in startup_output.lower(), startup_output
+
+@pytest.mark.timeout(180)
+def test_restart_advice_in_the_warning_works_while_the_helper_is_frozen(
+    project, host_network_endpoints
+):
+    """The commands the warning recommends stop and restart a VM with a frozen helper."""
+    run = partial(checked_run, cwd=project.cwd, env=project.env)
+    zaigr = project.zaigr_bin
+    endpoint = host_network_endpoints
+    run([zaigr, "project", "vm", "start"], input="y\n", timeout=120)
+    run([zaigr, "project", "firewall", "allow", "10.0.2.2"], timeout=30)
+    record = json.loads((project.store_dir / "vm-supervisor.json").read_text())
+
+    def warned():
+        _stdout, stderr, _code = _run([zaigr, "project", "status"],
+                                      cwd=project.cwd, env=project.env, timeout=20)
+        return "network has been blocked" in stderr
+
+    signal_recorded_process(record, "hostnet-helper", signal.SIGSTOP, network_process=True)
+    try:
+        wait_process_stopped(record, "hostnet-helper", network_process=True)
+        wait_until(warned, "the warning that recommends a restart", timeout=30)
+        started = time.monotonic()
+        run([zaigr, "project", "vm", "stop"], timeout=60)
+        print(f"\nRESULT vm stop took {time.monotonic() - started:.1f}s", flush=True)
+    finally:
+        continue_recorded_process_if_alive(record, "hostnet-helper", network_process=True)
+
+    assert "status: not running" in run([zaigr, "project", "status"], timeout=20).lower()
+    assert not warned(), "a stopped VM must not warn about its network"
+    run([zaigr, "project", "vm", "start"], timeout=120)
+    assert not warned(), "a restarted VM must not repeat the old warning"
+    assert run([zaigr, "project", "vm", "exec", "--", "curl", "--noproxy", "*", "-4fsS",
+                "--max-time", "4", f"http://10.0.2.2:{endpoint['tcp_port']}/"],
+               timeout=20).strip() == endpoint["token"]

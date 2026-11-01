@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -77,6 +78,7 @@ type nameGate struct {
 // Server owns exact-name authorization, upstream lookup, DNS lease references,
 // refresh scheduling, and the private frontend IPC socket for one VM launch.
 type Server struct {
+	leasesUnsynced    atomic.Bool
 	cfg               Config
 	backend           LeaseBackend
 	resolver          *upstreamResolver
@@ -468,7 +470,6 @@ func (s *Server) UpdatePolicyWith(ctx context.Context, launchID string, exactNam
 		s.mu.Unlock()
 		return nil
 	}
-	oldGeneration := s.generation
 	if applyManual == nil {
 		s.mu.Unlock()
 		return errors.New("host DNS: advancing a policy generation requires the coupled hostnet apply callback")
@@ -485,7 +486,9 @@ func (s *Server) UpdatePolicyWith(ctx context.Context, launchID string, exactNam
 		// Remove only references belonging exclusively to removed names before
 		// advancing the shared generation. Retained names (including shared-IP
 		// references) keep their nft leases and conntrack state continuously.
-		if err := s.backend.ReplaceDNSLeases(ctx, s.cfg.LaunchID, oldGeneration, retainedLeases.addresses, retainedLeases.names); err != nil {
+		// The helper may be ahead of s.generation if an earlier attempt's policy
+		// landed after that attempt gave up. The caller counts from the helper.
+		if err := s.backend.ReplaceDNSLeases(ctx, s.cfg.LaunchID, generation-1, retainedLeases.addresses, retainedLeases.names); err != nil {
 			s.failClosed(err)
 			return fmt.Errorf("host DNS: withdraw leases before policy generation advance: %w", err)
 		}
@@ -590,7 +593,22 @@ func (s *Server) Failure() error {
 	return s.failed
 }
 
+// RetryableUpdateFailure reports whether err only means the network helper has
+// not finished yet. Nothing is wrong with the policy: the firewall stays closed
+// to whatever did not land, and the next attempt sends the complete state.
+func RetryableUpdateFailure(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var temporary interface{ Temporary() bool }
+	return errors.As(err, &temporary) && temporary.Temporary()
+}
+
 func (s *Server) failClosed(err error) {
+	if RetryableUpdateFailure(err) {
+		s.leasesUnsynced.Store(true)
+		return
+	}
 	s.mu.Lock()
 	first := false
 	if s.failed == nil {

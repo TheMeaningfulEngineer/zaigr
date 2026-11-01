@@ -61,6 +61,9 @@ type linuxRuntime struct {
 	slirpExited    chan struct{}
 	helperExitErr  error
 	slirpExitErr   error
+
+	// pendingOnSuccess belongs to the one request in flight on the stream.
+	pendingOnSuccess func()
 }
 
 type helperResponseResult struct {
@@ -422,7 +425,7 @@ func (r *linuxRuntime) applyPolicyLocked(ctx context.Context, p PolicySnapshot) 
 		return errors.New("host policy launch identity mismatch")
 	}
 	if p.Generation <= r.generation {
-		return errors.New("host policy generation must increase")
+		return helperLateError{errors.New("host policy generation must increase")}
 	}
 	grants, err := cleanIPv4Addresses(p.IPGrants)
 	if err != nil {
@@ -432,12 +435,10 @@ func (r *linuxRuntime) applyPolicyLocked(ctx context.Context, p PolicySnapshot) 
 	for _, a := range grants {
 		raw = append(raw, a.String())
 	}
-	if err := r.requestContext(ctx, helperRequest{Operation: "apply-policy", LaunchID: r.launchID, Generation: p.Generation, Grants: raw}); err != nil {
-		return err
-	}
-	r.generation = p.Generation
-	r.grants = grants
-	return nil
+	return r.requestContext(ctx, helperRequest{Operation: "apply-policy", LaunchID: r.launchID, Generation: p.Generation, Grants: raw, onSuccess: func() {
+		r.generation = p.Generation
+		r.grants = grants
+	}})
 }
 
 func (r *linuxRuntime) ReplaceDNSLeases(ctx context.Context, launchID string, generation uint64, leases map[string]map[netip.Addr]time.Time, names map[string]time.Time) error {
@@ -447,7 +448,7 @@ func (r *linuxRuntime) ReplaceDNSLeases(ctx context.Context, launchID string, ge
 		return errors.New("DNS lease launch identity mismatch")
 	}
 	if generation != r.generation {
-		return errors.New("DNS lease policy generation is stale")
+		return helperLateError{errors.New("DNS lease policy generation is stale")}
 	}
 	items := make([]leaseRecord, 0)
 	for name, addresses := range leases {
@@ -600,7 +601,9 @@ func (r *linuxRuntime) requestContextReply(ctx context.Context, req helperReques
 				return helperResponse{}, result.err
 			}
 			// This is the response for a request whose caller already timed out.
-			// Its late result cannot satisfy the new request being prepared here.
+			// Its late result cannot satisfy the new request being prepared here,
+			// but what it confirms still happened.
+			r.settleRequest(result.response)
 		case <-rpcCtx.Done():
 			return helperResponse{}, rpcCtx.Err()
 		}
@@ -614,6 +617,7 @@ func (r *linuxRuntime) requestContextReply(ctx context.Context, req helperReques
 	}
 	b = append(b, '\n')
 	r.pending++
+	r.pendingOnSuccess = req.onSuccess
 	writeDone := make(chan error, 1)
 	r.pendingWrite = writeDone
 	go func() { writeDone <- writeHelperRequest(conn, b) }()
@@ -635,16 +639,47 @@ func (r *linuxRuntime) requestContextReply(ctx context.Context, req helperReques
 			r.poisonControl(conn)
 			return helperResponse{}, result.err
 		}
+		r.settleRequest(result.response)
 		if err := rpcCtx.Err(); err != nil {
 			return helperResponse{}, err
 		}
 		if !result.response.OK {
+			if helperAnsweredLate(result.response.Error) {
+				return helperResponse{}, helperLateError{errors.New(result.response.Error)}
+			}
 			return helperResponse{}, errors.New(result.response.Error)
 		}
 		return result.response, nil
 	case <-rpcCtx.Done():
 		return helperResponse{}, rpcCtx.Err()
 	}
+}
+
+// settleRequest records what a reply proves, whether or not anyone still waits.
+// A timeout leaves no unknown outcome: the helper answers every request in order.
+func (r *linuxRuntime) settleRequest(response helperResponse) {
+	onSuccess := r.pendingOnSuccess
+	r.pendingOnSuccess = nil
+	if response.OK && onSuccess != nil {
+		onSuccess()
+	}
+}
+
+// helperLateError means a request lost a race with time or with a newer policy.
+// The helper is fine, and the next attempt sends the complete current state.
+type helperLateError struct{ cause error }
+
+func (e helperLateError) Error() string   { return e.cause.Error() }
+func (e helperLateError) Unwrap() error   { return e.cause }
+func (e helperLateError) Temporary() bool { return true }
+
+func helperAnsweredLate(message string) bool {
+	switch message {
+	case "host network helper request has expired", "stale policy generation",
+		"DNS lease generation does not match active policy", "policy generation must advance exactly once":
+		return true
+	}
+	return false
 }
 
 func writeHelperRequest(conn *net.UnixConn, request []byte) error {

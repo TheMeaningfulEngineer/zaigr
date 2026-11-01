@@ -33,6 +33,9 @@ const maximumMaintenanceSessions = 16
 const startupNFTablesRuleBatchSize = 24
 
 type helperRequest struct {
+	// onSuccess runs in the client when the helper confirms this request, even
+	// if the caller stopped waiting. It is never sent to the helper.
+	onSuccess       func()
 	Operation       string           `json:"operation"`
 	LaunchID        string           `json:"launch_id"`
 	Generation      uint64           `json:"generation"`

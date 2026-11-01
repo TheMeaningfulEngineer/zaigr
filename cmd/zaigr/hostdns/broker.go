@@ -715,7 +715,11 @@ func (s *Server) commitAnswer(ctx context.Context, name string, generation, epoc
 	leases := s.currentLeaseSnapshotLocked(now)
 	currentGeneration := s.generation
 	s.mu.Unlock()
-	if err := s.backend.ReplaceDNSLeases(ctx, s.cfg.LaunchID, currentGeneration, leases.addresses, leases.names); err != nil {
+	// ctx has already paid for the lookup and the queue. A slow lookup must not
+	// leave the firewall update without time to finish.
+	updateCtx, cancel := context.WithTimeout(s.ctx, s.cfg.ResolveTimeout)
+	defer cancel()
+	if err := s.backend.ReplaceDNSLeases(updateCtx, s.cfg.LaunchID, currentGeneration, leases.addresses, leases.names); err != nil {
 		s.failClosed(err)
 		return fmt.Errorf("commit DNS-derived address leases: %w", err)
 	}
@@ -763,7 +767,9 @@ func (s *Server) commitNegative(ctx context.Context, name string, generation, ep
 	if !changed {
 		return nil
 	}
-	if err := s.backend.ReplaceDNSLeases(ctx, s.cfg.LaunchID, generation, leases.addresses, leases.names); err != nil {
+	updateCtx, cancel := context.WithTimeout(s.ctx, s.cfg.ResolveTimeout)
+	defer cancel()
+	if err := s.backend.ReplaceDNSLeases(updateCtx, s.cfg.LaunchID, generation, leases.addresses, leases.names); err != nil {
 		s.failClosed(err)
 		return fmt.Errorf("remove invalidated DNS-derived address leases: %w", err)
 	}
@@ -821,8 +827,35 @@ func (s *Server) refreshLoop() {
 		case now := <-ticker.C:
 			s.expireDiscovery(now)
 			s.expireLeases(now)
+			s.resendLeases()
 			s.scheduleRefreshes(now)
 		}
+	}
+}
+
+// resendLeases repairs an update the network helper did not finish. Every
+// update carries the complete snapshot, so sending the current one is enough.
+func (s *Server) resendLeases() {
+	if !s.leasesUnsynced.Swap(false) {
+		return
+	}
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
+	if s.ctx.Err() != nil {
+		return
+	}
+	s.mu.Lock()
+	if s.failed != nil {
+		s.mu.Unlock()
+		return
+	}
+	leases := s.currentLeaseSnapshotLocked(time.Now())
+	generation := s.generation
+	s.mu.Unlock()
+	ctx, cancel := context.WithTimeout(s.ctx, s.cfg.ResolveTimeout)
+	defer cancel()
+	if err := s.backend.ReplaceDNSLeases(ctx, s.cfg.LaunchID, generation, leases.addresses, leases.names); err != nil {
+		s.failClosed(err)
 	}
 }
 
