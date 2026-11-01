@@ -534,24 +534,51 @@ def module_label(module: str) -> str:
     return parts[-1]
 
 
-def module_update_rows(requirements: list[tuple[str, str]]) -> list[tuple[str, str, str, str]]:
-    """Return aligned summary rows for every direct module."""
+def unavailable_upstream(operation: Any, fallback: Any, failures: list[str]) -> Any:
+    """Run one upstream lookup and retain its failure for the final report."""
+    try:
+        return operation()
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        failures.append(str(exc))
+        return fallback
+
+
+def module_update_rows_with_failures(
+    requirements: list[tuple[str, str]], failures: list[str]
+) -> list[tuple[str, str, str, str]]:
+    """Return module rows while marking only failed module lookups unavailable."""
     labels = [module_label(module) for module, _ in requirements]
     collisions = {label for label in labels if labels.count(label) > 1}
     rows = []
-    for (module, shipped), label in zip(requirements, labels, strict=True):
-        versions = module_releases(module, shipped)
+    for (module, shipped), original_label in zip(requirements, labels, strict=True):
+        label = original_label
+        if label in collisions:
+            label = "/".join(module.split("/")[-2:])
+            if re.fullmatch(r"v\d+", module.split("/")[-1]):
+                label = "/".join(module.split("/")[-3:-1])
+        versions = unavailable_upstream(
+            lambda module=module, shipped=shipped: module_releases(module, shipped),
+            None,
+            failures,
+        )
         next_major = next_major_module_path(module)
-        versions.extend(module_releases(next_major, shipped, missing_ok=True))
+        if versions is None:
+            rows.append((label, shipped, "unavailable", "unavailable"))
+            continue
+        adjacent = unavailable_upstream(
+            lambda next_major=next_major, shipped=shipped: module_releases(next_major, shipped, missing_ok=True),
+            None,
+            failures,
+        )
+        if adjacent is None:
+            rows.append((label, shipped, "unavailable", "unavailable"))
+            continue
+        versions.extend(adjacent)
         versions = sorted(set(versions), key=module_version_key)
         shipped_key = module_classification_parts(shipped)
         fixes = [version for version in versions if module_classification_parts(version)[:2] == shipped_key[:2]]
         latest_fix = max(fixes, key=module_version_key) if fixes else shipped
         latest_overall = versions[-1] if versions else shipped
-        if label in collisions:
-            label = "/".join(module.split("/")[-2:])
-            if re.fullmatch(r"v\d+", module.split("/")[-1]):
-                label = "/".join(module.split("/")[-3:-1])
         rows.append((label, shipped, latest_fix, latest_overall))
     return rows
 
@@ -640,32 +667,54 @@ def main() -> int:
     try:
         lock = parse_lock(LOCK_PATH)
         rust = rust_version(DEV_SETUP_PATH)
-        kernel_same, kernel_lts, kernel_stable = kernel_versions(lock["KERNEL_VERSION"])
-        kernel_shipped_parts = version_parts(lock["KERNEL_VERSION"])
-        kernel_fix = (
-            kernel_same if kernel_same != "none" and version_parts(kernel_same) > kernel_shipped_parts
-            else lock["KERNEL_VERSION"]
+        failures: list[str] = []
+        kernel = unavailable_upstream(
+            lambda: kernel_versions(lock["KERNEL_VERSION"]), None, failures
         )
-        kernel_overall = (
-            kernel_stable if kernel_stable != "none" and version_parts(kernel_stable) > version_parts(kernel_fix)
-            else kernel_fix
+        if kernel is None:
+            kernel_fix = kernel_overall = "unavailable"
+        else:
+            kernel_same, kernel_lts, kernel_stable = kernel
+            kernel_shipped_parts = version_parts(lock["KERNEL_VERSION"])
+            kernel_fix = (
+                kernel_same if kernel_same != "none" and version_parts(kernel_same) > kernel_shipped_parts
+                else lock["KERNEL_VERSION"]
+            )
+            kernel_overall = (
+                kernel_stable if kernel_stable != "none" and version_parts(kernel_stable) > version_parts(kernel_fix)
+                else kernel_fix
+            )
+            if kernel_lts != "none":
+                kernel_overall += f" (next long-term: {kernel_lts})"
+
+        component_sources = (
+            ("virtiofsd", lock["VIRTIOFSD_VERSION"], lambda: gitlab_releases("virtio-fs/virtiofsd", lock["VIRTIOFSD_VERSION"])),
+            ("libseccomp", lock["LIBSECCOMP_VERSION"], lambda: github_releases("seccomp/libseccomp", lock["LIBSECCOMP_VERSION"])),
+            ("libcap-ng", lock["LIBCAP_NG_VERSION"], lambda: github_releases("stevegrubb/libcap-ng", lock["LIBCAP_NG_VERSION"])),
+            ("Rust", rust, lambda: github_releases("rust-lang/rust", rust)),
+            ("slirp4netns", lock["SLIRP4NETNS_VERSION"], lambda: github_releases("rootless-containers/slirp4netns", lock["SLIRP4NETNS_VERSION"])),
+            ("Go", lock["GO_VERSION"], lambda: go_releases(lock["GO_VERSION"])),
         )
-        if kernel_lts != "none":
-            kernel_overall += f" (next long-term: {kernel_lts})"
-        components = (
-            ("virtiofsd", lock["VIRTIOFSD_VERSION"], gitlab_releases("virtio-fs/virtiofsd", lock["VIRTIOFSD_VERSION"]), 2),
-            ("libseccomp", lock["LIBSECCOMP_VERSION"], github_releases("seccomp/libseccomp", lock["LIBSECCOMP_VERSION"]), 2),
-            ("libcap-ng", lock["LIBCAP_NG_VERSION"], github_releases("stevegrubb/libcap-ng", lock["LIBCAP_NG_VERSION"]), 2),
-            ("Rust", rust, github_releases("rust-lang/rust", rust), 2),
-            ("slirp4netns", lock["SLIRP4NETNS_VERSION"], github_releases("rootless-containers/slirp4netns", lock["SLIRP4NETNS_VERSION"]), 2),
-            ("Go", lock["GO_VERSION"], go_releases(lock["GO_VERSION"]), 2),
+        reports = {}
+        for name, shipped, source in component_sources:
+            fallback = ((name, shipped, "unavailable", "unavailable"), [f"{name} release notes:", "  unavailable"])
+            reports[name] = unavailable_upstream(
+                lambda source=source, name=name, shipped=shipped: component_report(name, shipped, source(), 2),
+                fallback,
+                failures,
+            )
+
+        rootfs = unavailable_upstream(
+            lambda: debian_rootfs(lock["DEBIAN_SUITE"]), None, failures
         )
-        reports = {
-            name: component_report(name, shipped, releases, width)
-            for name, shipped, releases, width in components
-        }
-        rootfs_shipped, rootfs_fix, rootfs_overall = debian_rootfs(lock["DEBIAN_SUITE"])
-        module_rows = module_update_rows(direct_go_requirements(ROOT / "go.mod"))
+        if rootfs is None:
+            rootfs_shipped = lock["DEBIAN_SUITE"]
+            rootfs_fix = rootfs_overall = "unavailable"
+        else:
+            rootfs_shipped, rootfs_fix, rootfs_overall = rootfs
+        module_rows = module_update_rows_with_failures(
+            direct_go_requirements(ROOT / "go.mod"), failures
+        )
 
         def built(name: str) -> tuple[str, ...]:
             """Return the shipped and update cells of a bundled component."""
@@ -694,6 +743,10 @@ def main() -> int:
         for _, notes in reports.values():
             for line in notes:
                 print(line)
+        for failure in failures:
+            LOG.error("%s", failure)
+        if failures:
+            return 1
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
         LOG.error("%s", exc)
         return 1

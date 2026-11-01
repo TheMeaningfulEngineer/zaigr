@@ -474,7 +474,7 @@ def test_deps_check_requires_the_rust_pin(tmp_path, upstream_server):
 
 
 def test_deps_check_reports_next_major_upstream_failure(tmp_path, upstream_server):
-    """A failed adjacent-major lookup names proxy.golang.org and exits nonzero."""
+    """A failed adjacent-major probe marks its module unavailable and continues."""
     checker = _install_checker(tmp_path)
     upstream_server["fail_next_major"] = True
     out, err, rc = run(
@@ -486,6 +486,11 @@ def test_deps_check_reports_next_major_upstream_failure(tmp_path, upstream_serve
     assert rc == 1
     assert "fetch failed from host proxy.golang.org" in out + err
     assert "fixture next-major source unavailable" in out + err
+    rows = _summary_rows(out)
+    assert "unavailable" in rows["nftables"]
+    assert "v1.7.4" in rows["mdlayher/netlink"]
+    assert "1.82.1" in rows["Rust (compiles it)"]
+    assert "Rust release notes:" in out
     assert any(
         request.startswith("/github.com/google/nftables/v2/@v/list")
         for request in upstream_server["requests"]
@@ -493,7 +498,7 @@ def test_deps_check_reports_next_major_upstream_failure(tmp_path, upstream_serve
 
 
 def test_deps_check_reports_original_host_for_upstream_failure(tmp_path, upstream_server):
-    """A local fixture failure names the upstream source that could not be fetched."""
+    """An unavailable kernel row does not stop the remaining dependency report."""
     checker = _install_checker(tmp_path)
     upstream_server["fail_kernel"] = True
     out, err, rc = run(
@@ -504,4 +509,10 @@ def test_deps_check_reports_original_host_for_upstream_failure(tmp_path, upstrea
 
     assert rc == 1
     assert "ERROR: fetch failed from host www.kernel.org" in out + err
+    rows = _summary_rows(out)
+    assert "unavailable" in rows["Kernel"]
+    assert "13.7" in rows["Base rootfs"]
+    assert "1.13.10" in rows["virtiofsd"]
+    assert "v1.7.4" in rows["mdlayher/netlink"]
+    assert "Release notes:" in out
     assert "fixture source unavailable" in out + err
