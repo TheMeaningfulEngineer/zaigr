@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/mdlayher/socket"
-	"github.com/mdlayher/vsock"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
@@ -38,12 +37,11 @@ const (
 )
 
 // DialFunc opens a connection to guest SSH. It is injectable so the session
-// path can be exercised without requiring a VM; production uses vsock.Dial.
+// path can be exercised without requiring a VM; production uses DialVSock.
 type DialFunc func(context.Context, uint32, uint32) (net.Conn, error)
 
 // DialVSock opens a context-cancellable host-to-guest AF_VSOCK connection.
-// It uses the same socket implementation as mdlayher/vsock while supplying
-// the context that vsock.Dial currently fixes to context.Background.
+// It opens and connects the socket directly so the operation can honor ctx.
 func DialVSock(ctx context.Context, cid, port uint32) (net.Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -68,8 +66,16 @@ func DialVSock(ctx context.Context, cid, port uint32) (net.Conn, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("vsock connect returned an unexpected address type")
 	}
-	return &vsockConn{Conn: conn, local: &vsock.Addr{ContextID: localVM.CID, Port: localVM.Port}, remote: &vsock.Addr{ContextID: remoteVM.CID, Port: remoteVM.Port}}, nil
+	return &vsockConn{Conn: conn, local: vmAddr{cid: localVM.CID, port: localVM.Port}, remote: vmAddr{cid: remoteVM.CID, port: remoteVM.Port}}, nil
 }
+
+type vmAddr struct {
+	cid  uint32
+	port uint32
+}
+
+func (addr vmAddr) Network() string { return "vsock" }
+func (addr vmAddr) String() string  { return fmt.Sprintf("%d:%d", addr.cid, addr.port) }
 
 type vsockConn struct {
 	*socket.Conn
