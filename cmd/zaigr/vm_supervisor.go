@@ -2192,6 +2192,13 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 			}
 		case ended := <-exit:
 			alive[ended.name] = false
+			// Any child exit stops the VM. Drop the uplink before working out
+			// which child to blame: that can take two seconds, and a failed
+			// network helper must not leave the guest online while it does.
+			if networkExitWriter != nil {
+				_ = networkExitWriter.Close()
+				networkExitWriter = nil
+			}
 			ended = attributeVMChildExit(ended, exit, alive, supervisorLog)
 			reason := vmChildExitText(ended) + "; logs are in " + spec.LogRoot
 			if err := recordVMStop(store, supervisorLog, reason); err != nil {
