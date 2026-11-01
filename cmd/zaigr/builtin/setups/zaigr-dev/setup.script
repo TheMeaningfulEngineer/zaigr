@@ -8,8 +8,8 @@ export DEBIAN_FRONTEND=noninteractive
 #
 # This covers:
 #   - Kernel/rootfs build toolchain (previously `kernel-mmdebstrap`).
-#   - Release orchestration tools, podman/rootless stack, Python test deps
-#     (previously `release-tools`).
+#   - Release orchestration tools and Python test deps (previously
+#     `release-tools`).
 #   - virtiofsd build toolchain: Rust/musl, native libcap-ng/libseccomp
 #     headers, libsqlite3-dev for the virtiofs integrity test probe.
 #
@@ -24,12 +24,10 @@ apt-get install -y --no-install-recommends \
     ca-certificates \
     cloud-image-utils \
     cpio \
-    crun \
     curl \
     fakeroot \
     file \
     flex \
-    fuse-overlayfs \
     git \
     gperf \
     libcap-ng-dev \
@@ -39,9 +37,7 @@ apt-get install -y --no-install-recommends \
     libssl-dev \
     mmdebstrap \
     musl-tools \
-    passt \
     pkg-config \
-    podman \
     python3 \
     python3-pexpect \
     python3-pytest \
@@ -56,24 +52,11 @@ apt-get install -y --no-install-recommends \
     uidmap \
     zstd
 
-echo ":: Configuring rootless container storage ..."
+# The IP access test network maps a range of user IDs with `unshare --map-auto`.
+echo ":: Configuring subordinate user IDs ..."
 sed -i '/^user:/d' /etc/subuid /etc/subgid
 echo 'user:100000:131072' >> /etc/subuid
 echo 'user:100000:131072' >> /etc/subgid
-
-mkdir -p /etc/containers/containers.conf.d /etc/containers/registries.conf.d
-cat > /etc/containers/containers.conf.d/zaigr.conf <<'EOF'
-[engine]
-cgroup_manager = "cgroupfs"
-events_logger = "file"
-EOF
-
-cat > /etc/containers/registries.conf <<'EOF'
-unqualified-search-registries = ["docker.io"]
-short-name-mode = "disabled"
-EOF
-rm -f /etc/containers/registries.conf.d/shortnames.conf
-rm -f /etc/containers/short-name-aliases.conf
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT

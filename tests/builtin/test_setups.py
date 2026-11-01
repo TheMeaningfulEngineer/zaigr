@@ -369,7 +369,6 @@ kas shell /tmp/kas-smoke.yml -c 'bitbake zlib-native -n'
     run(f"{zaigr} project vm stop", timeout=60)
     run(f"{zaigr} project setup run k3s", timeout=1800)
     run(f"{zaigr} project setup run docker", timeout=1800)
-    run(f"{zaigr} project setup run podman", timeout=1800)
     run(f"{zaigr} project setup run zaigr-dev", timeout=1800)
     run(f"{zaigr} project vm start", input="y\n", timeout=180)
 
@@ -432,38 +431,6 @@ kas shell /tmp/kas-smoke.yml -c 'bitbake zlib-native -n'
         f"{vm} k3s kubectl delete pod docker-k3s-network --wait=true",
         timeout=60,
     )
-
-    # Podman
-    run = partial(_checked_run, cwd=project.cwd, env=project.env)
-    zaigr = project.zaigr_bin
-    vm = f"{zaigr} project vm exec --"
-
-    run(f"{vm} podman pull docker.io/library/hello-world", timeout=600)
-    output = run(
-        f"{vm} podman run --rm docker.io/library/hello-world",
-        timeout=600,
-    )
-    assert "Hello from Docker!" in output
-
-    build_dir = "/tmp/zaigr-podman-build-test"
-    message = "hello from zaigr podman build\n"
-    run(f"{vm} rm -rf {build_dir}")
-    run(f"{vm} mkdir -p {build_dir}")
-    run(f"{vm} tee {build_dir}/message.txt", input=message)
-    run(
-        f"{vm} tee {build_dir}/Dockerfile",
-        input=dedent("""\
-            FROM docker.io/library/busybox:stable
-            COPY message.txt /message.txt
-            CMD ["cat", "/message.txt"]
-        """),
-    )
-    run(
-        f"{vm} podman build --no-cache -t zaigr-podman-build-test {build_dir}",
-        timeout=600,
-    )
-    output = run(f"{vm} podman run --rm zaigr-podman-build-test", timeout=600)
-    assert output == message
 
     # zaigr-dev (kernel/mmdebstrap tools + release orchestration + virtiofsd build toolchain)
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
@@ -675,7 +642,7 @@ kubectl delete pod net-test --wait=true
 
     package_tools_script = """
 set -eu
-for tool in podman crun fuse-overlayfs pasta slirp4netns file rpm newuidmap newgidmap; do
+for tool in slirp4netns file rpm newuidmap newgidmap; do
     command -v "$tool" >/dev/null
 done
 """
@@ -707,11 +674,6 @@ done
         timeout=10,
     )
     assert "pytest " in output
-
-    run(
-        f"{zaigr} project vm exec -- podman run --rm hello-world",
-        timeout=600,
-    )
 
     run(
         f"{zaigr} project vm exec -- "
@@ -868,7 +830,6 @@ done
         "k3s",
         "mistral",
         "nodejs",
-        "podman",
         "python",
         "yocto-kas",
         "zaigr-dev",
@@ -876,11 +837,6 @@ done
         assert setup in output
 
     output = run(f"{vm} docker run --rm hello-world", timeout=600)
-    assert "Hello from Docker!" in output
-    output = run(
-        f"{vm} podman run --rm docker.io/library/hello-world",
-        timeout=600,
-    )
     assert "Hello from Docker!" in output
     run(
         f"{vm} k3s kubectl wait --for=condition=Ready node --all --timeout=30s",
