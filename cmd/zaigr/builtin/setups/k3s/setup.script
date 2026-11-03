@@ -73,6 +73,7 @@ chmod 0755 /usr/local/lib/zaigr/k3s-internal-network
 
 /usr/local/lib/zaigr/k3s-internal-network
 
+echo ":: Building Helm from source (go install) ..."
 go_version="${GO_VERSION:-1.27.2}"
 mkdir -p /mnt
 helm_tmp="$(mktemp -d /mnt/zaigr-helm.XXXXXX)"
