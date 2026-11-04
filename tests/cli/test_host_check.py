@@ -13,6 +13,10 @@ import pytest
 from ..conftest import err_msg
 from ..conftest import run as _run
 
+SLIRP4NETNS_VERSION = (
+    Path(__file__).parents[2] / "cmd/zaigr/vm_data/slirp4netns.version"
+).read_text(encoding="utf-8").strip()
+
 
 def _checked_run(cmd, **kwargs):
     stdout, stderr, rc = _run(cmd, **kwargs)
@@ -171,7 +175,7 @@ def test_host_check_reports_missing_tools_and_still_probes_sandbox(
     # No newuidmap/newgidmap helpers are needed for the production mapping.
     assert "vhost-vsock available" in stdout
     assert "host-enforced networking" in stdout
-    assert "slirp4netns 1.3.4" in stdout
+    assert f"slirp4netns {SLIRP4NETNS_VERSION}" in stdout
     assert "start/stop probe passed" in stdout
     assert "answered a vhost-user request" in stdout
     assert "6/7 checks passed" in stdout
@@ -203,7 +207,10 @@ def test_host_check_reports_bundled_slirp_version_with_system_shadow(
     output = stdout + stderr
 
     assert "intentional slirp runtime failure" not in output
-    assert any("slirp4netns" in line.lower() and "1.3.4" in line for line in output.splitlines())
+    assert any(
+        "slirp4netns" in line.lower() and SLIRP4NETNS_VERSION in line
+        for line in output.splitlines()
+    )
     assert not (project.home / ".zaigr" / "store").exists()
 
 
