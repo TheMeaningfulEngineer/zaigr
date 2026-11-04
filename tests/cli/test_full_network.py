@@ -545,6 +545,10 @@ def test_full_network_temporarily_allows_arbitrary_and_private_dns(
     exit_shell(normal)
 
 
+@pytest.mark.skip(reason=(
+    "holds one deb.debian.org address for minutes; when the site moves to another "
+    "address, a zaigr firewall around the test machine blocks it"
+))
 @pytest.mark.parametrize("manual_ip_reference", [False, True])
 @pytest.mark.timeout(360)
 def test_exact_dns_grants_share_and_release_live_ip_references(
@@ -740,6 +744,10 @@ def stream_goes_quiet(path, seconds):
     return False
 
 
+@pytest.mark.skip(reason=(
+    "holds one deb.debian.org address for minutes; when the site moves to another "
+    "address, a zaigr firewall around the test machine blocks it"
+))
 @pytest.mark.timeout(360)
 def test_dns_answer_change_keeps_established_flow_until_domain_removed(
     project, host_network_dns, public_http_stream_client, request
