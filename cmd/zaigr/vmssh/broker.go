@@ -967,6 +967,12 @@ func Run(ctx context.Context, socket string, req Request, input io.Reader, outpu
 // RunInteractive creates a PTY-backed SSH session through the broker. It
 // restores the caller's terminal on every return and forwards resize and
 // process-signal events while preserving the remote command's exit status.
+//
+// The local terminal stays fully raw, like OpenSSH's `ssh -t`: Ctrl+C, Ctrl+Z
+// and Ctrl+\ travel to the guest as keystrokes. The guest terminal then signals
+// the foreground program, or hands the key to a program that reads keys itself,
+// such as an agent's terminal UI. Turning them into local signals would instead
+// reach the session's first process (for a preset, its launcher) and end it.
 func RunInteractive(ctx context.Context, socket, user, command string, terminal *os.File, output, errorOutput io.Writer) error {
 	req := Request{User: user, Command: command, PTY: true, ForcePTY: true, Input: true, Terminal: os.Getenv("TERM")}
 	if req.Terminal == "" {
@@ -978,14 +984,6 @@ func RunInteractive(ctx context.Context, socket, user, command string, terminal 
 			return fmt.Errorf("put local terminal in raw mode: %w", err)
 		}
 		defer func() { _ = term.Restore(int(terminal.Fd()), state) }()
-		localModes, err := unix.IoctlGetTermios(int(terminal.Fd()), unix.TCGETS)
-		if err != nil {
-			return fmt.Errorf("read local terminal signal mode: %w", err)
-		}
-		localModes.Lflag |= unix.ISIG
-		if err := unix.IoctlSetTermios(int(terminal.Fd()), unix.TCSETS, localModes); err != nil {
-			return fmt.Errorf("enable local terminal signal keys: %w", err)
-		}
 		if width, height, err := term.GetSize(int(terminal.Fd())); err == nil {
 			req.Width, req.Height = width, height
 		}
