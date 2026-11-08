@@ -68,7 +68,9 @@ DISTROS = {
 # here so acceptance tests can cover both system-package states by removing it.
 # This is the prepared outer test VM's baseline package set, not Zaigr's
 # install prerequisites. gcc and libsqlite3-dev support the virtiofs integrity
-# probe; uidmap and the subordinate ID ranges support the IP namespace fixture.
+# probe. uidmap and the subordinate ID ranges served the IP namespace fixture,
+# removed for 0.4.0; they stay because the package list is part of the
+# prepared image cache key, and changing it re-downloads every distro image.
 # The controller's SSH/scp/keygen live outside that VM; product commands inside
 # it use a restricted PATH without host OpenSSH tools.
 GUEST_PACKAGES = (
