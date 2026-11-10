@@ -973,17 +973,23 @@ func Run(ctx context.Context, socket string, req Request, input io.Reader, outpu
 // the foreground program, or hands the key to a program that reads keys itself,
 // such as an agent's terminal UI. Turning them into local signals would instead
 // reach the session's first process (for a preset, its launcher) and end it.
+//
+// When the session ends without an exit status, for example because the VM
+// stopped, the guest program never got to switch off the terminal modes it
+// turned on, so RunInteractive switches them off itself.
 func RunInteractive(ctx context.Context, socket, user, command string, terminal *os.File, output, errorOutput io.Writer) error {
 	req := Request{User: user, Command: command, PTY: true, ForcePTY: true, Input: true, Terminal: os.Getenv("TERM")}
 	if req.Terminal == "" {
 		req.Terminal = "xterm-256color"
 	}
+	interactive := false
 	if terminal != nil && term.IsTerminal(int(terminal.Fd())) {
 		state, err := term.MakeRaw(int(terminal.Fd()))
 		if err != nil {
 			return fmt.Errorf("put local terminal in raw mode: %w", err)
 		}
 		defer func() { _ = term.Restore(int(terminal.Fd()), state) }()
+		interactive = true
 		if width, height, err := term.GetSize(int(terminal.Fd())); err == nil {
 			req.Width, req.Height = width, height
 		}
@@ -994,8 +1000,21 @@ func RunInteractive(ctx context.Context, socket, user, command string, terminal 
 	if req.Height < 1 {
 		req.Height = 24
 	}
-	return run(ctx, socket, req, terminal, output, errorOutput, terminal)
+	err := run(ctx, socket, req, terminal, output, errorOutput, terminal)
+	var exitErr *ExitError
+	if interactive && err != nil && !errors.As(err, &exitErr) {
+		_, _ = io.WriteString(terminal, terminalModeReset+"\r\n")
+	}
+	return err
 }
+
+// terminalModeReset switches off modes a full-screen program in the guest may
+// have turned on: mouse reporting, focus events, bracketed paste, the alternate
+// screen, application cursor keys and keypad, a hidden cursor, and text
+// attributes. Left on, the local shell prints every mouse movement as escape
+// codes. Each sequence is a no-op when its mode is already off.
+const terminalModeReset = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l" +
+	"\x1b[?1004l\x1b[?2004l\x1b[?1047l\x1b[?1l\x1b>\x1b[?25h\x1b[0m"
 
 func run(ctx context.Context, socket string, req Request, input io.Reader, output, errorOutput io.Writer, terminal *os.File) (runErr error) {
 	if req.User != "root" && req.User != "user" {

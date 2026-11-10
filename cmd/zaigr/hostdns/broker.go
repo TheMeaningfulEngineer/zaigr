@@ -542,7 +542,7 @@ func (s *Server) validateAnswerChain(queryName string, response *dns.Msg, allowP
 				if err := validateFullNetworkAddress(addr); err != nil {
 					return nil, nil, 0, err
 				}
-			} else if err := validateAddress(addr, s.cfg.ExcludedPrefixes); err != nil {
+			} else if err := validateAddress(addr, s.excludedPrefixes()); err != nil {
 				return nil, nil, 0, err
 			}
 			duration := recordLifetime(record)

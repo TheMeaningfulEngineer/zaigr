@@ -399,9 +399,16 @@ func (h *hostNetworkHandle) fullNetworkLeaseLoop() {
 				failed("inspect host network topology", inventoryErr)
 				continue
 			}
+			// A VPN reconnect, a new Wi-Fi network or a Docker bridge changes
+			// this inventory. Refresh the exclusions for later DNS answers and
+			// keep the VM running; earlier leases end with their DNS lifetime.
 			if !equalHostDNSPrefixes(currentExclusions, h.hostExclusions) {
-				h.reportFatal(errors.New("host network topology changed: host interface/address/route inventory changed; stop and restart the VM to recompute host exclusions"))
-				return
+				if err := h.dns.SetExcludedPrefixes(currentExclusions); err != nil {
+					failed("refresh host network exclusions", err)
+					continue
+				}
+				logInfo("host network changed; refreshed host exclusions", "prefixes", len(currentExclusions))
+				h.hostExclusions = currentExclusions
 			}
 			now := time.Now()
 			h.updateMu.Lock()

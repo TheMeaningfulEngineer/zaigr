@@ -926,7 +926,9 @@ func runProjectSSH(endpoint vmControlEndpoint, root bool) error {
 		return fmt.Errorf("track shell session: %w", err)
 	}
 	defer cleanup()
-	return vmssh.RunInteractive(context.Background(), endpoint.SocketPath, user, "", os.Stdin, os.Stdout, os.Stderr)
+	err = vmssh.RunInteractive(context.Background(), endpoint.SocketPath, user, "", os.Stdin, os.Stdout, os.Stderr)
+	showVMStopAfterSession(currentProjectStore(), err)
+	return err
 }
 
 func runMaintenanceProjectSSH(endpoint vmControlEndpoint, namespace string) error {
@@ -939,7 +941,9 @@ func runMaintenanceProjectSSH(endpoint vmControlEndpoint, namespace string) erro
 	}
 	defer cleanup()
 	command := "ip netns exec " + singleQuotedArg(namespace) + " bash --login"
-	return vmssh.RunInteractive(context.Background(), endpoint.SocketPath, "root", command, os.Stdin, os.Stdout, os.Stderr)
+	err = vmssh.RunInteractive(context.Background(), endpoint.SocketPath, "root", command, os.Stdin, os.Stdout, os.Stderr)
+	showVMStopAfterSession(currentProjectStore(), err)
+	return err
 }
 
 func buildQEMUArgsWithContext(imagePath, kernelPath, format string, snapshot bool, ram string, cpus string, vsockCID uint32, rootPubKey string, userPubKey string, vmHostname string, monitorSock string, agentStateDir string, workspace string, serialLog string, workspaceSock string, agentStateSock string) []string {

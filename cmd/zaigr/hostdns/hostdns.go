@@ -42,7 +42,8 @@ type LeaseBackend interface {
 // Config contains trusted host-side policy and resolver settings for one VM.
 // ResolverServers overrides ResolverConfigPath when provided. ExcludedPrefixes
 // must include host-owned addresses and internal routes in addition to the
-// built-in special-use ranges.
+// built-in special-use ranges; SetExcludedPrefixes replaces them while the
+// server runs.
 type Config struct {
 	LaunchID           string
 	IPCPath            string
@@ -79,6 +80,7 @@ type nameGate struct {
 // refresh scheduling, and the private frontend IPC socket for one VM launch.
 type Server struct {
 	leasesUnsynced    atomic.Bool
+	excluded          atomic.Pointer[[]netip.Prefix]
 	cfg               Config
 	backend           LeaseBackend
 	resolver          *upstreamResolver
@@ -185,6 +187,12 @@ func StartBroker(parent context.Context, cfg Config, backend LeaseBackend) (*Ser
 	if cfg.FrontendPID > 0 {
 		s.peers[cfg.FrontendPID] = cfg.FrontendStartTime
 	}
+	if err := s.SetExcludedPrefixes(cfg.ExcludedPrefixes); err != nil {
+		cancel()
+		listener.Close()
+		os.Remove(cfg.IPCPath)
+		return nil, err
+	}
 	s.wg.Add(2)
 	go func() { defer s.wg.Done(); s.acceptLoop() }()
 	go func() { defer s.wg.Done(); s.refreshLoop() }()
@@ -193,6 +201,29 @@ func StartBroker(parent context.Context, cfg Config, backend LeaseBackend) (*Ser
 		_ = s.Close()
 	}()
 	return s, nil
+}
+
+// SetExcludedPrefixes replaces the host-owned and internal-route prefixes that
+// DNS answers must not point into. Answers validated after the call use the new
+// list. Leases granted earlier are not withdrawn: they end with their DNS
+// lifetime, capped at MaxLeaseTTL.
+func (s *Server) SetExcludedPrefixes(prefixes []netip.Prefix) error {
+	normalized := make([]netip.Prefix, len(prefixes))
+	for i, prefix := range prefixes {
+		if !prefix.IsValid() {
+			return fmt.Errorf("host DNS: invalid excluded address prefix %q", prefix)
+		}
+		normalized[i] = prefix.Masked()
+	}
+	s.excluded.Store(&normalized)
+	return nil
+}
+
+func (s *Server) excludedPrefixes() []netip.Prefix {
+	if prefixes := s.excluded.Load(); prefixes != nil {
+		return *prefixes
+	}
+	return nil
 }
 
 func normalizeConfig(cfg *Config) error {

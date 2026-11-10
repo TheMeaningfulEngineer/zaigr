@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"zaigr/cmd/zaigr/vmssh"
 )
@@ -46,4 +47,25 @@ func vmSSHExitError(err error) error {
 		return exitError(status.Status)
 	}
 	return err
+}
+
+// showVMStopAfterSession prints why the VM stopped when an interactive session
+// was cut off, instead of leaving the reason for the next zaigr command. The
+// supervisor writes the reason while it shuts down, so wait for it briefly.
+func showVMStopAfterSession(store projectStore, sessionErr error) {
+	var exitErr *vmssh.ExitError
+	if sessionErr == nil || errors.As(sessionErr, &exitErr) {
+		return
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(vmStopNoticePath(store)); err == nil {
+			showVMStopNotice(store)
+			return
+		}
+		if !time.Now().Before(deadline) {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }

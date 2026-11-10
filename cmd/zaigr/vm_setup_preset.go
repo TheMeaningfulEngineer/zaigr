@@ -279,7 +279,9 @@ func runPresetInVM(endpoint vmControlEndpoint, presetName string, script []byte)
 	if err := rejectHardLinkedPresetState(presetName); err != nil {
 		return err
 	}
-	return sshRunPresetCommand(endpoint, presetName, string(script))
+	err := sshRunPresetCommand(endpoint, presetName, string(script))
+	showVMStopAfterSession(currentProjectStore(), err)
+	return err
 }
 
 func ensurePresetAgentStateDir(presetName string) error {

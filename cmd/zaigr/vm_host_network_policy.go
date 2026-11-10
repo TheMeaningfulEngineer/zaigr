@@ -283,9 +283,10 @@ func startHostDNSBroker(ctx context.Context, runtime hostnet.Runtime, runtimeDir
 }
 
 func hostDNSExcludedPrefixes() ([]netip.Prefix, error) {
-	// This inventory is a startup snapshot. The current development backend
-	// requires stopping/restarting VMs after host interface or route changes;
-	// production must monitor/revalidate and withdraw leases on inventory change.
+	// The VM supervisor takes this inventory at launch and again on every
+	// network check, and hands changes to the DNS broker. Private and
+	// special-use ranges are rejected separately, so this list only adds
+	// host-owned public addresses and routes.
 	set := make(map[netip.Prefix]struct{})
 	interfaces, err := net.Interfaces()
 	if err != nil {
