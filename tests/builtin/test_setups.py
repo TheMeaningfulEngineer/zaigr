@@ -730,14 +730,18 @@ done
         timeout=45,
     )
 
+    # The image now holds docker and k3s, so later setups must run against
+    # the stopped image, as the README says.
     # Codex
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
 
+    run(f"{zaigr} project vm stop", timeout=60)
     run(
         f"{zaigr} project setup run codex",
         timeout=1200,
     )
+    run(f"{zaigr} project vm start", input="y\n", timeout=180)
     status = run(
         f"{zaigr} project status",
         timeout=10,
@@ -767,10 +771,12 @@ done
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
 
+    run(f"{zaigr} project vm stop", timeout=60)
     run(
         f"{zaigr} project setup run mistral",
         timeout=1200,
     )
+    run(f"{zaigr} project vm start", input="y\n", timeout=180)
     status = run(
         f"{zaigr} project status",
         timeout=10,
@@ -787,10 +793,12 @@ done
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
     zaigr = project.zaigr_bin
 
+    run(f"{zaigr} project vm stop", timeout=60)
     run(
         f"{zaigr} project setup run claude",
         timeout=1200,
     )
+    run(f"{zaigr} project vm start", input="y\n", timeout=180)
     status = run(
         f"{zaigr} project status",
         timeout=10,
