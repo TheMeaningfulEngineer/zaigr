@@ -205,7 +205,17 @@ func applyStepsViaSSHInContextWithIntent(imagePath string, steps []string, ram s
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			returnErr = errors.Join(returnErr, sshSyncContext(ctx, endpoint))
 			cancel()
-			qmpQuit(monitorSock)
+			exited := shutDownGuest(endpoint, func(timeout time.Duration) bool {
+				select {
+				case <-launch.exited:
+					return true
+				case <-time.After(timeout):
+					return false
+				}
+			})
+			if !exited {
+				qmpQuit(monitorSock)
+			}
 			returnErr = errors.Join(returnErr, launch.stop())
 		} else {
 			returnErr = errors.Join(returnErr, launch.cancel())
@@ -444,6 +454,37 @@ func sshSync(endpoint vmControlEndpoint) error {
 
 func sshSyncContext(ctx context.Context, endpoint vmControlEndpoint) error {
 	return runVMGuestCommand(ctx, endpoint, "root", "sync", nil, io.Discard, io.Discard)
+}
+
+// cleanGuestShutdownTimeout bounds how long a stop waits for the guest to stop
+// its services and unmount its disk before quitting QEMU instead.
+const cleanGuestShutdownTimeout = 20 * time.Second
+
+// shutDownGuest asks the guest to shut down cleanly and waits for QEMU to exit.
+// The guest reboots, and the reboot=t kernel option with QEMU's -no-reboot
+// turns that into a QEMU exit. It returns false when the guest didn't shut
+// down; the caller then quits QEMU, and its earlier sync has kept the data.
+func shutDownGuest(endpoint vmControlEndpoint, waitForExit func(time.Duration) bool) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// A VM started by an older zaigr lacks reboot=t, and its reboot would hang
+	// instead of ending QEMU, so it gets the quit right away.
+	err := runVMGuestCommand(ctx, endpoint, "root", "grep -qw reboot=t /proc/cmdline && systemctl --no-block reboot", nil, io.Discard, io.Discard)
+	var status *vmssh.ExitError
+	if errors.As(err, &status) {
+		logDebug("guest declined a clean shutdown", "exit_status", status.Status)
+		return false
+	}
+	if err != nil {
+		// The guest may close the connection while shutting down; whether
+		// QEMU exits tells.
+		logDebug("guest shutdown request ended without a status", "error", err)
+	}
+	if waitForExit(cleanGuestShutdownTimeout) {
+		return true
+	}
+	fmt.Fprintf(os.Stderr, "warning: the VM did not shut down within %s; stopping it now\n", cleanGuestShutdownTimeout)
+	return false
 }
 
 func sshRunCommandWithExitStatus(endpoint vmControlEndpoint, user string, command string) error {

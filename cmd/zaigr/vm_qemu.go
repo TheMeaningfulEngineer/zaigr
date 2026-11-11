@@ -959,6 +959,11 @@ func buildQEMUArgsWithContext(imagePath, kernelPath, format string, snapshot boo
 		// skip the console login prompts: getty@tty1, getty-static's tty2-6
 		// and the generated serial-getty@ttyS0, which never starts here.
 		"systemd.mask=getty.target",
+		// microvm has no ACPI or keyboard controller, so the kernel's default
+		// restart methods hang. A triple fault resets the CPU at once, and
+		// -no-reboot turns that reset into a QEMU exit, for both a guest
+		// reboot and a panic.
+		"reboot=t",
 		"panic=-1",
 		"quiet",
 		fmt.Sprintf("zaigr.host-epoch=%d", hostLaunchEpoch),
