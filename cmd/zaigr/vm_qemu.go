@@ -955,6 +955,10 @@ func buildQEMUArgsWithContext(imagePath, kernelPath, format string, snapshot boo
 		"init=/usr/lib/systemd/systemd",
 		"systemd.unit=multi-user.target",
 		"systemd.ssh_auto=no",
+		// The VM has no screen or keyboard and zaigr logs in over vsock, so
+		// skip the console login prompts: getty@tty1, getty-static's tty2-6
+		// and the generated serial-getty@ttyS0, which never starts here.
+		"systemd.mask=getty.target",
 		"panic=-1",
 		"quiet",
 		fmt.Sprintf("zaigr.host-epoch=%d", hostLaunchEpoch),
