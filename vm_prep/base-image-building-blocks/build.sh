@@ -86,6 +86,15 @@ fakeroot sh -c "
     ln -sfn /dev/null \"$ROOTFS_DIR/etc/systemd/system/ssh.socket\"
     ln -sfn /etc/systemd/system/ssh-vsock.socket \"$ROOTFS_DIR/etc/systemd/system/sockets.target.wants/ssh-vsock.socket\"
 
+    # Skip generators that never apply in a zaigr VM, which shortens
+    # systemd's start: root= is given, and there is no partition table,
+    # hibernation, TPM, offline update, systemd.run=, console login or stock
+    # sshd. fstab, sysv and rc-local stay for setups that use them.
+    mkdir -p \"$ROOTFS_DIR/etc/systemd/system-generators\"
+    for generator in gpt-auto hibernate-resume tpm2 ssh system-update run getty; do
+        ln -sfn /dev/null \"$ROOTFS_DIR/etc/systemd/system-generators/systemd-\$generator-generator\"
+    done
+
     echo \"base-image:$BASE_VERSION\" > \"$ROOTFS_DIR/etc/base-image-version\"
     chmod 644 \"$ROOTFS_DIR/etc/base-image-version\"
 
