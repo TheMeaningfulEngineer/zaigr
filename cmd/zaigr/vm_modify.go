@@ -451,7 +451,7 @@ func sshRunCommandWithExitStatus(endpoint vmControlEndpoint, user string, comman
 }
 
 func sshRunCommandWithExitStatusContext(ctx context.Context, endpoint vmControlEndpoint, user string, command string) error {
-	err := runVMGuestCommand(ctx, endpoint, user, "bash -eu -c "+singleQuotedArg(command), os.Stdin, os.Stdout, os.Stderr)
+	err := runVMGuestUserCommand(ctx, endpoint, user, "bash -eu -c "+singleQuotedArg(command), os.Stdin, os.Stdout, os.Stderr)
 	return vmSSHExitError(err)
 }
 

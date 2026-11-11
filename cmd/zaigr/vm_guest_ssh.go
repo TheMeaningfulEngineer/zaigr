@@ -24,6 +24,19 @@ func runVMGuestCommand(ctx context.Context, endpoint vmControlEndpoint, user str
 	return vmssh.Run(ctx, endpoint.SocketPath, vmssh.Request{User: user, Command: command, Input: true}, input, stdout, stderr)
 }
 
+// runVMGuestUserCommand runs a command the user asked for, with the host's
+// locale and color settings. zaigr's own control commands use
+// runVMGuestCommand, so their output doesn't depend on the host locale.
+func runVMGuestUserCommand(ctx context.Context, endpoint vmControlEndpoint, user string, command string, input io.Reader, stdout io.Writer, stderr io.Writer) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := validateVMControlEndpoint(endpoint); err != nil {
+		return err
+	}
+	return vmssh.Run(ctx, endpoint.SocketPath, vmssh.Request{User: user, Command: command, Env: vmssh.ForwardedEnv(os.Environ())}, input, stdout, stderr)
+}
+
 func runVMGuestInteractive(ctx context.Context, endpoint vmControlEndpoint, user string, command string, terminal *os.File) error {
 	if ctx == nil {
 		ctx = context.Background()

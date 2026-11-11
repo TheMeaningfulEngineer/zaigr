@@ -96,7 +96,49 @@ type Request struct {
 	Height   int    `json:"height,omitempty"`
 	ForcePTY bool   `json:"force_pty,omitempty"`
 	Input    bool   `json:"input,omitempty"`
-	Version  int    `json:"version"`
+	// Env holds the caller's locale and color settings (see ForwardedEnv).
+	// The guest's sshd ignores names outside its AcceptEnv list.
+	Env     map[string]string `json:"env,omitempty"`
+	Version int               `json:"version"`
+}
+
+// ForwardedEnv picks the variables OpenSSH sends by default (Debian's
+// "SendEnv LANG LC_* COLORTERM NO_COLOR") out of environ, so commands in the
+// guest use the host terminal's language, character set and colors, as they
+// did when zaigr ran the ssh client.
+func ForwardedEnv(environ []string) map[string]string {
+	var env map[string]string
+	for _, entry := range environ {
+		name, value, ok := strings.Cut(entry, "=")
+		if !ok || !forwardableEnv(name, value) {
+			continue
+		}
+		if env == nil {
+			env = make(map[string]string)
+		}
+		env[name] = value
+	}
+	return env
+}
+
+func forwardableEnv(name, value string) bool {
+	if len(value) > 256 || strings.ContainsRune(value, 0) {
+		return false
+	}
+	switch name {
+	case "LANG", "COLORTERM", "NO_COLOR":
+		return true
+	}
+	suffix, ok := strings.CutPrefix(name, "LC_")
+	if !ok || suffix == "" {
+		return false
+	}
+	for _, r := range suffix {
+		if (r < 'A' || r > 'Z') && r != '_' {
+			return false
+		}
+	}
+	return true
 }
 
 type frame struct {
@@ -367,6 +409,11 @@ func (b *Broker) serveRequest(conn *net.UnixConn) error {
 	if req.User != "root" && req.User != "user" {
 		return b.sendFrame(conn, frame{Type: "error", Error: "invalid guest SSH identity"})
 	}
+	for name, value := range req.Env {
+		if !forwardableEnv(name, value) {
+			return b.sendFrame(conn, frame{Type: "error", Error: "invalid forwarded environment variable"})
+		}
+	}
 	b.mu.Lock()
 	client := b.clients[req.User]
 	roleErr := b.roleErrs[req.User]
@@ -494,6 +541,10 @@ func (b *Broker) serveRequest(conn *net.UnixConn) error {
 		_ = stdinReader.Close()
 		_ = stdinWriter.Close()
 		return b.sendFrame(conn, frame{Type: "error", Error: err.Error()})
+	}
+	for name, value := range req.Env {
+		// Like the OpenSSH client, carry on when sshd refuses a name.
+		_ = session.Setenv(name, value)
 	}
 	pty := req.PTY || req.ForcePTY
 	if requests.disconnectedNow() {
@@ -978,7 +1029,7 @@ func Run(ctx context.Context, socket string, req Request, input io.Reader, outpu
 // stopped, the guest program never got to switch off the terminal modes it
 // turned on, so RunInteractive switches them off itself.
 func RunInteractive(ctx context.Context, socket, user, command string, terminal *os.File, output, errorOutput io.Writer) error {
-	req := Request{User: user, Command: command, PTY: true, ForcePTY: true, Input: true, Terminal: os.Getenv("TERM")}
+	req := Request{User: user, Command: command, PTY: true, ForcePTY: true, Input: true, Terminal: os.Getenv("TERM"), Env: ForwardedEnv(os.Environ())}
 	if req.Terminal == "" {
 		req.Terminal = "xterm-256color"
 	}
