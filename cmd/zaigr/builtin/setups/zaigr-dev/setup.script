@@ -12,6 +12,8 @@ export DEBIAN_FRONTEND=noninteractive
 #     `release-tools`).
 #   - virtiofsd build toolchain: Rust/musl, native libcap-ng/libseccomp
 #     headers, libsqlite3-dev for the virtiofs integrity test probe.
+#   - Troubleshooting tools: strace for process and syscall timing, lsof
+#     for open files and sockets.
 #
 # Replaces the separate `kernel-mmdebstrap` and `release-tools` setups.
 
@@ -35,6 +37,7 @@ apt-get install -y --no-install-recommends \
     libseccomp-dev \
     libsqlite3-dev \
     libssl-dev \
+    lsof \
     mmdebstrap \
     musl-tools \
     pkg-config \
@@ -49,6 +52,7 @@ apt-get install -y --no-install-recommends \
     rpm \
     rsync \
     slirp4netns \
+    strace \
     uidmap \
     zstd
 
