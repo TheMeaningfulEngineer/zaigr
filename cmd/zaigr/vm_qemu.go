@@ -959,6 +959,16 @@ func buildQEMUArgsWithContext(imagePath, kernelPath, format string, snapshot boo
 		// skip the console login prompts: getty@tty1, getty-static's tty2-6
 		// and the generated serial-getty@ttyS0, which never starts here.
 		"systemd.mask=getty.target",
+		// The kernel has no module support and the image no modprobe, so
+		// these always fail. e2scrub needs LVM, and root has no network for
+		// apt outside maintenance sessions.
+		"systemd.mask=modprobe@.service",
+		"systemd.mask=systemd-modules-load.service",
+		"systemd.mask=e2scrub_reap.service",
+		"systemd.mask=e2scrub_all.timer",
+		"systemd.mask=apt-daily.timer",
+		"systemd.mask=apt-daily-upgrade.timer",
+		"systemd.mask=dpkg-db-backup.timer",
 		// Prepare the guest runtime during boot. Otherwise it waits for the
 		// first vsock connection, which can't arrive until sysinit is done.
 		"systemd.wants=zaigr-runtime-ready.service",
