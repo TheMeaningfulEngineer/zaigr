@@ -962,6 +962,10 @@ func buildQEMUArgsWithContext(imagePath, kernelPath, format string, snapshot boo
 		// Prepare the guest runtime during boot. Otherwise it waits for the
 		// first vsock connection, which can't arrive until sysinit is done.
 		"systemd.wants=zaigr-runtime-ready.service",
+		// Keep the guest journal in memory. Flushing it to the project disk
+		// held up every boot, and each boot's clock jump left a new 8 MB file
+		// behind. zaigr's own VM logs stay on the host.
+		"systemd.set_credential=journal.storage:volatile",
 		// microvm has no ACPI or keyboard controller, so the kernel's default
 		// restart methods hang. A triple fault resets the CPU at once, and
 		// -no-reboot turns that reset into a QEMU exit, for both a guest
