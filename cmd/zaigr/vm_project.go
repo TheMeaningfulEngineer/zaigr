@@ -572,7 +572,7 @@ func stopProjectVMInStore(store projectStore, abrupt bool) (projectVMStopResult,
 		if err := sshSync(running.Endpoint); err != nil {
 			return projectVMStopResult{}, fmt.Errorf("flush project VM before shutdown: %w; use 'zaigr project vm stop --abrupt' only if recovery is required", err)
 		}
-		exited := shutDownGuest(running.Endpoint, func(timeout time.Duration) bool {
+		exited := shutDownGuest(running.Endpoint, bootedImagePath(sockPath), func(timeout time.Duration) bool {
 			return waitForQemuProcessesExit(processes, timeout) == nil
 		})
 		if !exited {

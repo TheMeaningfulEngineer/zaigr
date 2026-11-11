@@ -106,6 +106,16 @@ func sshHostname(endpoint vmControlEndpoint) string {
 	return hostname
 }
 
+// bootedImagePath asks the running QEMU which image it booted, or returns "".
+func bootedImagePath(monitorSock string) string {
+	conn, err := net.DialTimeout("unix", monitorSock, time.Second)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = conn.Close() }()
+	return queryQMPImagePath(conn)
+}
+
 // queryQMPImagePath connects to a running QEMU QMP socket and returns the
 // image path of the root block device, or "" if it cannot be determined.
 func queryQMPImagePath(conn net.Conn) string {

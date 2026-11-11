@@ -1,6 +1,7 @@
 """Public recovery boundaries for virtiofs VM ownership."""
 
 import json
+import os
 import signal
 import time
 from functools import partial
@@ -43,6 +44,9 @@ def test_image_identity_probe_uses_store_disk_when_tmpdir_is_unusable(project):
     run([zaigr, "project", "vm", "stop"], timeout=60)
     store = project.store_dir
     assert (store / "project.qcow2").exists()
+    # Without a change zaigr didn't observe, the next start would reuse the
+    # identity recorded at the clean stop and skip the image copy.
+    os.utime(store / "project.qcow2")
     blocked_tmp = project.home / "not-a-directory"
     blocked_tmp.write_text("blocked\n", encoding="utf-8")
     env = project.env
@@ -60,6 +64,33 @@ def test_image_identity_probe_uses_store_disk_when_tmpdir_is_unusable(project):
     ).strip() == "virtiofs"
     run([zaigr, "project", "vm", "stop"], timeout=60)
     assert not list(store.glob(".zaigr-identity-*.raw"))
+
+
+@pytest.mark.timeout(360)
+def test_clean_stop_lets_the_next_start_skip_the_identity_copy(project):
+    zaigr = project.zaigr_bin
+    run = partial(_checked_run, cwd=project.cwd, env=project.env)
+    store = project.store_dir
+    reused = "using guest identity recorded at the last clean shutdown"
+
+    run([zaigr, "project", "vm", "start"], input="y\n", timeout=180)
+    run([zaigr, "project", "vm", "stop"], timeout=60)
+    record = json.loads((store / ".guest-identity.json").read_text(encoding="utf-8"))
+    assert record["uid"] > 0 and record["gid"] > 0, record
+
+    stdout, stderr, code = _run([zaigr, "-vv", "project", "vm", "start"], cwd=project.cwd, env=project.env, timeout=180)
+    assert code == 0, err_msg(stdout, stderr)
+    assert reused in stderr, err_msg(stdout, stderr)
+    assert run([zaigr, "project", "vm", "exec", "--", "id", "-u"]).strip() == str(record["uid"])
+    run([zaigr, "project", "vm", "stop"], timeout=60)
+
+    # A change zaigr didn't observe makes the next start read the image again.
+    os.utime(store / "project.qcow2")
+    stdout, stderr, code = _run([zaigr, "-vv", "project", "vm", "start"], cwd=project.cwd, env=project.env, timeout=180)
+    assert code == 0, err_msg(stdout, stderr)
+    assert reused not in stderr, err_msg(stdout, stderr)
+    assert run([zaigr, "project", "vm", "exec", "--", "findmnt", "-n", "-o", "FSTYPE", "/home/user/workspace"]).strip() == "virtiofs"
+    run([zaigr, "project", "vm", "stop"], timeout=60)
 
 
 @pytest.mark.timeout(180)

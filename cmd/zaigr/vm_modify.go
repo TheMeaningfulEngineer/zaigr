@@ -205,7 +205,7 @@ func applyStepsViaSSHInContextWithIntent(imagePath string, steps []string, ram s
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			returnErr = errors.Join(returnErr, sshSyncContext(ctx, endpoint))
 			cancel()
-			exited := shutDownGuest(endpoint, func(timeout time.Duration) bool {
+			exited := shutDownGuest(endpoint, imagePath, func(timeout time.Duration) bool {
 				select {
 				case <-launch.exited:
 					return true
@@ -464,7 +464,13 @@ const cleanGuestShutdownTimeout = 20 * time.Second
 // The guest reboots, and the reboot=t kernel option with QEMU's -no-reboot
 // turns that into a QEMU exit. It returns false when the guest didn't shut
 // down; the caller then quits QEMU, and its earlier sync has kept the data.
-func shutDownGuest(endpoint vmControlEndpoint, waitForExit func(time.Duration) bool) bool {
+// After a clean shutdown it records the guest user's IDs for imagePath, so
+// the next start can skip copying the whole image to read them.
+func shutDownGuest(endpoint vmControlEndpoint, imagePath string, waitForExit func(time.Duration) bool) bool {
+	uid, gid, idErr := 0, 0, errors.New("no booted image path")
+	if imagePath != "" {
+		uid, gid, idErr = readGuestUserIDs(endpoint)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	// A VM started by an older zaigr lacks reboot=t, and its reboot would hang
@@ -481,6 +487,11 @@ func shutDownGuest(endpoint vmControlEndpoint, waitForExit func(time.Duration) b
 		logDebug("guest shutdown request ended without a status", "error", err)
 	}
 	if waitForExit(cleanGuestShutdownTimeout) {
+		if idErr != nil {
+			logDebug("guest identity not recorded", "error", idErr)
+		} else if err := rememberGuestIdentity(imagePath, uid, gid); err != nil {
+			logDebug("guest identity not recorded", "image", imagePath, "error", err)
+		}
 		return true
 	}
 	fmt.Fprintf(os.Stderr, "warning: the VM did not shut down within %s; stopping it now\n", cleanGuestShutdownTimeout)

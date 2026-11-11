@@ -299,6 +299,10 @@ def test_daemon_startup_failure_cleans_started_children(project, test_root):
     zaigr = project.zaigr_bin
     run([zaigr, "project", "vm", "start"], input="y\n", timeout=180)
     run([zaigr, "project", "vm", "stop"], timeout=60)
+    # A clean stop records the guest identity, and the next start would skip
+    # the image copy this test pauses in. A change zaigr didn't observe forces
+    # the copy again.
+    os.utime(project.store_dir / "project.qcow2")
     caches = [p for p in (project.home / ".zaigr").glob("virtiofsd-*") if p.is_file() and not p.name.endswith(".lock")]
     assert len(caches) == 1, caches
     cache = caches[0]
