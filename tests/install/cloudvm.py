@@ -52,7 +52,7 @@ DISTROS = {
         "algorithm": "sha512",
         "name": "debian-12-generic-amd64.qcow2",
         "login": "user",
-        "redirect_hosts": {"cloud.debian.org", "chuangtzu.ftp.acc.umu.se", "gemmei.ftp.acc.umu.se", "laotzu.ftp.acc.umu.se"},
+        "redirect_hosts": {"cloud.debian.org", "chuangtzu.ftp.acc.umu.se", "gemmei.ftp.acc.umu.se", "laotzu.ftp.acc.umu.se", "saimei.ftp.acc.umu.se"},
     },
     "debian-13": {
         "url": "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.qcow2",
@@ -60,7 +60,7 @@ DISTROS = {
         "algorithm": "sha512",
         "name": "debian-13-generic-amd64.qcow2",
         "login": "user",
-        "redirect_hosts": {"cloud.debian.org", "chuangtzu.ftp.acc.umu.se", "gemmei.ftp.acc.umu.se", "laotzu.ftp.acc.umu.se"},
+        "redirect_hosts": {"cloud.debian.org", "chuangtzu.ftp.acc.umu.se", "gemmei.ftp.acc.umu.se", "laotzu.ftp.acc.umu.se", "saimei.ftp.acc.umu.se"},
     },
 }
 

@@ -29,6 +29,7 @@ proxy.golang.org
 registry-1.docker.io
 registry.fedoraproject.org
 release-assets.githubusercontent.com
+saimei.ftp.acc.umu.se
 security.debian.org
 security.ubuntu.com
 sh.rustup.rs
