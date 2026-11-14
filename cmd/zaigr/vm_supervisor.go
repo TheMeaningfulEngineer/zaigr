@@ -1659,6 +1659,13 @@ func runVMSupervisor(spec vmLaunchSpec) (retErr error) {
 		return err
 	}
 	defer func() { _ = supervisorLog.Close() }()
+	if spec.Mode == "detached" {
+		if unit, err := leaveTerminalCgroup(spec.LaunchID, spec.Workspace); err != nil {
+			_, _ = fmt.Fprintf(supervisorLog, "no systemd user scope (%v); the VM stops if the terminal that started it is killed\n", err)
+		} else {
+			_, _ = fmt.Fprintf(supervisorLog, "running in systemd user scope %s, apart from the terminal that started it\n", unit)
+		}
+	}
 	exit := make(chan vmChildExit, 8)
 	commands := make(chan string, 2)
 	go func() {

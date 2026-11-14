@@ -74,11 +74,29 @@ def test_install_deb_and_run_documented_workflow(cloudvm_factory, distro):
     assert "7/7 checks passed" in check, initial_check + "\n" + check
 
     checked(vm, "mkdir -p /home/user/zaigr-install-project", user="user")
+    # Start the VM from a stand-in for a desktop terminal: a systemd user unit
+    # of its own, like the one a terminal window runs in. When a terminal is
+    # killed, systemd terminates every process in its unit; the VM must not go
+    # with it.
+    checked(
+        vm,
+        "systemd-run --user --quiet --unit=zaigr-install-terminal "
+        "--working-directory=/home/user/zaigr-install-project "
+        f"--setenv=PATH={product_path} "
+        "sh -c 'printf \"y\\n\" | zaigr project vm start > /tmp/zaigr-terminal.log 2>&1; "
+        "echo $? > /tmp/zaigr-terminal.rc; exec sleep infinity'",
+        user="user",
+    )
     started = vm.run(
-        "zaigr project vm start", cwd="/home/user/zaigr-install-project",
-        input="y\n", timeout=240, user="user", env=product_env,
+        "for i in $(seq 240); do [ -s /tmp/zaigr-terminal.rc ] && break; sleep 1; done; "
+        "cat /tmp/zaigr-terminal.log; exit \"$(cat /tmp/zaigr-terminal.rc 2>/dev/null || echo 124)\"",
+        timeout=260, user="user",
     )
     assert started[2] == 0, f"project VM failed to start:\n{started[0]}{started[1]}"
+    checked(vm, "systemctl --user stop zaigr-install-terminal.service", timeout=60, user="user")
+    qemu_cgroup = vm.run("cat /proc/$(pgrep -u user -x qemu-system-x86)/cgroup", user="user")
+    assert qemu_cgroup[2] == 0, f"the VM did not survive its terminal being killed:\n{qemu_cgroup[0]}{qemu_cgroup[1]}"
+    assert "/zaigr-vm-" in qemu_cgroup[0], f"QEMU is not in its own systemd scope: {qemu_cgroup[0]}"
 
     root_status = checked(
         vm,
@@ -176,3 +194,11 @@ def test_install_deb_and_run_documented_workflow(cloudvm_factory, distro):
         user="user",
         env=product_env,
     )
+    leftover_scopes = checked(
+        vm,
+        "for i in $(seq 10); do units=$(systemctl --user list-units --all --plain --no-legend 'zaigr-vm-*'); "
+        "[ -z \"$units\" ] && break; sleep 1; done; printf '%s' \"$units\"",
+        user="user",
+        timeout=30,
+    )
+    assert leftover_scopes == "", f"the VM's systemd scope outlived the VM: {leftover_scopes}"
