@@ -512,9 +512,13 @@ func startPreparedProjectVM(ram string, cpu string) (endpoint vmControlEndpoint,
 			return vmControlEndpoint{}, err
 		}
 		fmt.Println(":: The VM's user has other IDs than expected; restarting the VM to share files with the right owner")
+		// The supervisor's exit status says nothing here: it differs with
+		// whether it noticed the closed control pipe or the signal first.
+		// Only a supervisor that didn't exit stops the restart.
 		cancelErr := launch.cancel()
 		launch = nil
-		if cancelErr != nil {
+		var exitStatus *exec.ExitError
+		if cancelErr != nil && !errors.As(cancelErr, &exitStatus) {
 			return vmControlEndpoint{}, cancelErr
 		}
 	}
