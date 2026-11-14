@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/google/nftables v0.3.0
-	github.com/klauspost/compress v1.20.3
+	github.com/klauspost/compress v1.20.4
 	github.com/mdlayher/netlink v1.11.2
 	github.com/mdlayher/socket v0.8.0
 	github.com/miekg/dns v1.1.73

@@ -564,7 +564,7 @@ virtiofsd version as a static musl executable, downloads upstream's static
 slirp4netns release binary and verifies it against `deps.lock`, then embeds the
 guest assets and both host tools in the Go binary. Zaigr extracts slirp4netns under
 `~/.zaigr/` and does not depend on a system slirp4netns package. It needs Go
-1.27.3, Rust 1.82.0 with the `x86_64-unknown-linux-musl` target installed,
+1.27.4, Rust 1.82.0 with the `x86_64-unknown-linux-musl` target installed,
 `x86_64-linux-musl-gcc`, `gperf`, `pkg-config`, `make`, `binutils`, `git`,
 `curl`, `tar`, and Linux headers. The daemon build script downloads the
 checksum-pinned libcap-ng and libseccomp sources from `deps.lock` and builds
