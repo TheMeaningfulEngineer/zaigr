@@ -62,7 +62,18 @@ func applyStepsViaSSHInContext(imagePath string, steps []string, ram string, cpu
 	return applyStepsViaSSHInContextWithIntent(imagePath, steps, ram, cpus, rootFullNetwork, nil, agentStateDir, workspace, store, logRoot)
 }
 
-func applyStepsViaSSHInContextWithIntent(imagePath string, steps []string, ram string, cpus string, rootFullNetwork bool, intent *directSetupExecutionIntent, agentStateDir string, workspace string, store projectStore, logRoot string) (returnErr error) {
+func applyStepsViaSSHInContextWithIntent(imagePath string, steps []string, ram string, cpus string, rootFullNetwork bool, intent *directSetupExecutionIntent, agentStateDir string, workspace string, store projectStore, logRoot string) error {
+	err := applyStepsInTemporaryVM(imagePath, steps, ram, cpus, rootFullNetwork, intent, agentStateDir, workspace, store, logRoot)
+	if errors.Is(err, errGuestIdentityChanged) {
+		// The guest user has other IDs than expected. They are recorded now
+		// and no step has run yet, so boot once more with the right ones.
+		fmt.Println(":: The VM's user has other IDs than expected; restarting the VM to share files with the right owner")
+		err = applyStepsInTemporaryVM(imagePath, steps, ram, cpus, rootFullNetwork, intent, agentStateDir, workspace, store, logRoot)
+	}
+	return err
+}
+
+func applyStepsInTemporaryVM(imagePath string, steps []string, ram string, cpus string, rootFullNetwork bool, intent *directSetupExecutionIntent, agentStateDir string, workspace string, store projectStore, logRoot string) (returnErr error) {
 	logInfo("booting temporary VM to apply image steps", "image", imagePath, "step_count", len(steps))
 	kernelPath, err := ensureKernel(false)
 	if err != nil {
@@ -164,10 +175,7 @@ func applyStepsViaSSHInContextWithIntent(imagePath string, steps []string, ram s
 	workspaceSock = filepath.Join(socketDir, "workspace.sock")
 	agentStateSock = filepath.Join(socketDir, "agent-state.sock")
 	args := buildQEMUArgsWithContext(imagePath, kernelPath, "qcow2", false, ram, cpus, vsockCID, rootPubKey, userPubKey, store.hostname(), monitorSock, agentStateDir, workspace, serialLog, workspaceSock, agentStateSock)
-	guestUID, guestGID, err := readGuestIdentityFromImage(imagePath)
-	if err != nil {
-		return err
-	}
+	guestUID, guestGID := expectedGuestIdentity(imagePath)
 	spec := vmLaunchSpec{
 		Store: runtimeStore.Path, LogRoot: logRoot, RuntimeDir: runtimeDir, SocketDir: socketDir,
 		MonitorSock: monitorSock, WorkspaceSock: workspaceSock, AgentStateSock: agentStateSock,
@@ -228,6 +236,9 @@ func applyStepsViaSSHInContextWithIntent(imagePath string, steps []string, ram s
 	fmt.Println(":: Waiting for guest vsock ...")
 	logDebug("waiting for image-modification VM SSH readiness", "vsock_cid", endpoint.VsockCID, "timeout_sec", 60)
 	if err := waitForVMGuestReady(launch, 60*time.Second); err != nil {
+		return err
+	}
+	if err := confirmGuestIdentity(endpoint, imagePath, guestUID, guestGID); err != nil {
 		return err
 	}
 	if err := launch.commit(); err != nil {
@@ -464,8 +475,8 @@ const cleanGuestShutdownTimeout = 20 * time.Second
 // The guest reboots, and the reboot=t kernel option with QEMU's -no-reboot
 // turns that into a QEMU exit. It returns false when the guest didn't shut
 // down; the caller then quits QEMU, and its earlier sync has kept the data.
-// After a clean shutdown it records the guest user's IDs for imagePath, so
-// the next start can skip copying the whole image to read them.
+// After a clean shutdown it records the guest user's IDs for imagePath if a
+// setup or root session changed them, so the next start expects the new ones.
 func shutDownGuest(endpoint vmControlEndpoint, imagePath string, waitForExit func(time.Duration) bool) bool {
 	uid, gid, idErr := 0, 0, errors.New("no booted image path")
 	if imagePath != "" {
@@ -489,8 +500,10 @@ func shutDownGuest(endpoint vmControlEndpoint, imagePath string, waitForExit fun
 	if waitForExit(cleanGuestShutdownTimeout) {
 		if idErr != nil {
 			logDebug("guest identity not recorded", "error", idErr)
-		} else if err := rememberGuestIdentity(imagePath, uid, gid); err != nil {
-			logDebug("guest identity not recorded", "image", imagePath, "error", err)
+		} else if wantUID, wantGID := expectedGuestIdentity(imagePath); uid != wantUID || gid != wantGID {
+			if err := rememberGuestIdentity(imagePath, uid, gid); err != nil {
+				logDebug("guest identity not recorded", "image", imagePath, "error", err)
+			}
 		}
 		return true
 	}

@@ -486,19 +486,37 @@ func startPreparedProjectVM(ram string, cpu string) (endpoint vmControlEndpoint,
 	logInfo("starting prepared project VM", "ram", ramValue, "cpu", cpuValue)
 	backend := vmNetworkBackendHost
 	var launch *vmLaunchHandle
-	endpoint, launch, err = bootProjectVM(ramValue, cpuValue, grants)
-	if err != nil {
-		return vmControlEndpoint{}, err
-	}
 	committed := false
 	defer func() {
-		if !committed {
+		if !committed && launch != nil {
 			returnErr = errors.Join(returnErr, launch.cancel())
 		}
 	}()
-	logDebug("waiting for project VM guest readiness", "vsock_cid", endpoint.VsockCID, "timeout_sec", 90)
-	if err := waitForVMGuestReady(launch, 90*time.Second); err != nil {
-		return vmControlEndpoint{}, err
+	for attempt := 1; ; attempt++ {
+		endpoint, launch, err = bootProjectVM(ramValue, cpuValue, grants)
+		if err != nil {
+			return vmControlEndpoint{}, err
+		}
+		logDebug("waiting for project VM guest readiness", "vsock_cid", endpoint.VsockCID, "timeout_sec", 90)
+		if err := waitForVMGuestReady(launch, 90*time.Second); err != nil {
+			return vmControlEndpoint{}, err
+		}
+		// File sharing started with the IDs zaigr expects the guest user to
+		// have. A guest with other IDs has them recorded now and boots once
+		// more, so that shared files get the right owner.
+		err = confirmGuestIdentity(endpoint, bootedImagePath(launch.spec.MonitorSock), launch.spec.GuestUID, launch.spec.GuestGID)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, errGuestIdentityChanged) || attempt == 2 {
+			return vmControlEndpoint{}, err
+		}
+		fmt.Println(":: The VM's user has other IDs than expected; restarting the VM to share files with the right owner")
+		cancelErr := launch.cancel()
+		launch = nil
+		if cancelErr != nil {
+			return vmControlEndpoint{}, cancelErr
+		}
 	}
 	startupCtx, cancelStartup := launch.precommitContext()
 	defer cancelStartup()
@@ -886,10 +904,7 @@ func bootProjectVM(ram string, cpu string, grants hostAccessGrants) (vmControlEn
 	}
 	diskSize := store.disk()
 
-	guestUID, guestGID, err := readGuestIdentityFromImage(imgPath)
-	if err != nil {
-		return vmControlEndpoint{}, nil, err
-	}
+	guestUID, guestGID := expectedGuestIdentity(imgPath)
 	spec := vmLaunchSpec{
 		Store: store.Path, LogRoot: store.Path, RuntimeDir: store.runtimeDir(),
 		MonitorSock: store.monitorSockPath(),

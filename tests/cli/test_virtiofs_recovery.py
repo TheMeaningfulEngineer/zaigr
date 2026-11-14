@@ -35,61 +35,55 @@ def test_comma_and_spaces_in_home_support_both_mounts_and_stop(project, test_roo
     assert not (project.store_dir / "vm-supervisor.json").exists()
 
 
-@pytest.mark.timeout(240)
-def test_image_identity_probe_uses_store_disk_when_tmpdir_is_unusable(project):
-    zaigr = project.zaigr_bin
-    run = partial(_checked_run, cwd=project.cwd, env=project.env)
-
-    run([zaigr, "project", "vm", "start"], input="y\n", timeout=180)
-    run([zaigr, "project", "vm", "stop"], timeout=60)
-    store = project.store_dir
-    assert (store / "project.qcow2").exists()
-    # Without a change zaigr didn't observe, the next start would reuse the
-    # identity recorded at the clean stop and skip the image copy.
-    os.utime(store / "project.qcow2")
-    blocked_tmp = project.home / "not-a-directory"
-    blocked_tmp.write_text("blocked\n", encoding="utf-8")
-    env = project.env
-    env["TMPDIR"] = str(blocked_tmp)
-
-    stdout, stderr, code = _run(
-        [zaigr, "project", "vm", "start"],
-        cwd=project.cwd, env=env, timeout=180,
-    )
-    assert code == 0, err_msg(stdout, stderr)
-    assert not list(store.glob(".zaigr-identity-*.raw"))
-    assert _checked_run(
-        [zaigr, "project", "vm", "exec", "--", "findmnt", "-n", "-o", "FSTYPE", "/home/user/workspace"],
-        cwd=project.cwd, env=project.env,
-    ).strip() == "virtiofs"
-    run([zaigr, "project", "vm", "stop"], timeout=60)
-    assert not list(store.glob(".zaigr-identity-*.raw"))
-
-
-@pytest.mark.timeout(360)
-def test_clean_stop_lets_the_next_start_skip_the_identity_copy(project):
+@pytest.mark.timeout(480)
+def test_changed_guest_user_ids_are_picked_up_without_reading_the_disk(project):
+    """File sharing follows the guest user's IDs, which zaigr learns from the running guest."""
     zaigr = project.zaigr_bin
     run = partial(_checked_run, cwd=project.cwd, env=project.env)
     store = project.store_dir
-    reused = "using guest identity recorded at the last clean shutdown"
+    restarted = "restarting the VM to share files with the right owner"
+    workspace = "/home/user/workspace"
 
-    run([zaigr, "project", "vm", "start"], input="y\n", timeout=180)
-    run([zaigr, "project", "vm", "stop"], timeout=60)
-    record = json.loads((store / ".guest-identity.json").read_text(encoding="utf-8"))
-    assert record["uid"] > 0 and record["gid"] > 0, record
+    def change_user_id(old, new):
+        run([
+            zaigr, "project", "vm", "exec", "--root", "--", "sh", "-c",
+            f"sed -i 's/^user:x:{old}:/user:x:{new}:/' /etc/passwd && "
+            + f"find / -xdev -uid {old} ! -path {workspace} ! -path /home/user/.zaigr-agent-state "
+            + f"-exec chown -h {new} {{}} + && sync",
+        ], input="y\n", timeout=60)
 
-    stdout, stderr, code = _run([zaigr, "-vv", "project", "vm", "start"], cwd=project.cwd, env=project.env, timeout=180)
+    def assert_shared_as(uid):
+        assert run([zaigr, "project", "vm", "exec", "--", "id", "-u"]).strip() == str(uid)
+        (Path(project.cwd) / f"from-host-{uid}").write_text("host\n", encoding="utf-8")
+        assert run([zaigr, "project", "vm", "exec", "--", "stat", "-c", "%u", f"{workspace}/from-host-{uid}"]).strip() == str(uid)
+        run([zaigr, "project", "vm", "exec", "--", "touch", f"{workspace}/from-guest-{uid}"])
+        assert (Path(project.cwd) / f"from-guest-{uid}").stat().st_uid == os.getuid()
+
+    stdout, stderr, code = _run([zaigr, "project", "vm", "start"], cwd=project.cwd, env=project.env, input="y\n", timeout=180)
     assert code == 0, err_msg(stdout, stderr)
-    assert reused in stderr, err_msg(stdout, stderr)
-    assert run([zaigr, "project", "vm", "exec", "--", "id", "-u"]).strip() == str(record["uid"])
-    run([zaigr, "project", "vm", "stop"], timeout=60)
+    assert restarted not in stdout + stderr, err_msg(stdout, stderr)
+    assert not (store / ".guest-identity.json").exists()
+    assert not list(store.glob(".zaigr-identity-*.raw"))
+    assert_shared_as(1000)
 
-    # A change zaigr didn't observe makes the next start read the image again.
-    os.utime(store / "project.qcow2")
-    stdout, stderr, code = _run([zaigr, "-vv", "project", "vm", "start"], cwd=project.cwd, env=project.env, timeout=180)
+    # The VM ends without a clean stop, so nothing tells zaigr about the new
+    # IDs before the next boot. That start notices and boots once more.
+    change_user_id(1000, 1500)
+    run([zaigr, "project", "vm", "stop", "--abrupt"], timeout=60)
+    stdout, stderr, code = _run([zaigr, "project", "vm", "start"], cwd=project.cwd, env=project.env, timeout=240)
     assert code == 0, err_msg(stdout, stderr)
-    assert reused not in stderr, err_msg(stdout, stderr)
-    assert run([zaigr, "project", "vm", "exec", "--", "findmnt", "-n", "-o", "FSTYPE", "/home/user/workspace"]).strip() == "virtiofs"
+    assert restarted in stdout + stderr, err_msg(stdout, stderr)
+    assert json.loads((store / ".guest-identity.json").read_text(encoding="utf-8"))["uid"] == 1500
+    assert_shared_as(1500)
+
+    # A clean stop records changed IDs, so the next start needs one boot.
+    change_user_id(1500, 1600)
+    run([zaigr, "project", "vm", "stop"], timeout=60)
+    assert json.loads((store / ".guest-identity.json").read_text(encoding="utf-8"))["uid"] == 1600
+    stdout, stderr, code = _run([zaigr, "project", "vm", "start"], cwd=project.cwd, env=project.env, timeout=180)
+    assert code == 0, err_msg(stdout, stderr)
+    assert restarted not in stdout + stderr, err_msg(stdout, stderr)
+    assert_shared_as(1600)
     run([zaigr, "project", "vm", "stop"], timeout=60)
 
 

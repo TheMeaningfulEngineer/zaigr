@@ -299,35 +299,28 @@ def test_daemon_startup_failure_cleans_started_children(project, test_root):
     zaigr = project.zaigr_bin
     run([zaigr, "project", "vm", "start"], input="y\n", timeout=180)
     run([zaigr, "project", "vm", "stop"], timeout=60)
-    # A clean stop records the guest identity, and the next start would skip
-    # the image copy this test pauses in. A change zaigr didn't observe forces
-    # the copy again.
-    os.utime(project.store_dir / "project.qcow2")
     caches = [p for p in (project.home / ".zaigr").glob("virtiofsd-*") if p.is_file() and not p.name.endswith(".lock")]
     assert len(caches) == 1, caches
     cache = caches[0]
     original = cache.read_bytes()
     fake_bin = test_root / "daemon-startup-bin"
     fake_bin.mkdir()
-    marker = test_root / "identity-convert-paused"
-    release = test_root / "identity-convert-release"
-    qemu_img = shutil.which("qemu-img")
-    assert qemu_img
-    wrapper = fake_bin / "qemu-img"
+    # The supervisor asks systemd for a scope of its own right before it
+    # starts its children. Pause it there and break the file-sharing daemon.
+    marker = test_root / "supervisor-paused"
+    release = test_root / "supervisor-release"
+    wrapper = fake_bin / "busctl"
     wrapper.write_text(
         "#!/usr/bin/python3\n"
-        "import os, sys, time\n"
+        "import sys, time\n"
         "from pathlib import Path\n"
-        "if any('zaigr-identity-' in arg for arg in sys.argv):\n"
-        f"    Path({str(marker)!r}).touch()\n"
-        f"    while not Path({str(release)!r}).exists():\n"
-        "        time.sleep(0.05)\n"
-        f"os.execv({qemu_img!r}, [{qemu_img!r}, *sys.argv[1:]])\n",
+        f"Path({str(marker)!r}).touch()\n"
+        f"while not Path({str(release)!r}).exists():\n"
+        "    time.sleep(0.05)\n"
+        "sys.exit(1)\n",
         encoding="utf-8",
     )
     wrapper.chmod(0o755)
-    state = project.store_dir / "agent-state"
-    saved_state = test_root / "saved-agent-state"
     env = project.env
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
     launch = spawn_interactive(f"{zaigr} project vm start", cwd=project.cwd, env=env, timeout=90)
@@ -336,15 +329,13 @@ def test_daemon_startup_failure_cleans_started_children(project, test_root):
         while time.monotonic() < deadline and not marker.exists():
             time.sleep(0.05)
         assert marker.exists(), launch.transcript.tail(3000)
-        state.rename(saved_state)
-        state.write_text("test-only invalid shared directory\n")
+        cache.write_bytes(b"#!/bin/sh\nexit 1\n")
         release.touch()
         launch.expect(pexpect.EOF, timeout=70)
         launch.close()
         assert launch.exitstatus != 0, launch.transcript.tail(4000)
         diagnostic = launch.transcript.tail(5000).lower()
-        assert "pin agent-state export" in diagnostic, diagnostic
-        assert "not a directory" in diagnostic, diagnostic
+        assert "virtiofsd" in diagnostic, diagnostic
         record_path = project.store_dir / "vm-supervisor.json"
         assert not record_path.exists(), record_path.read_text() if record_path.exists() else record_path
         for name in ("virtiofsd-workspace.sock", "virtiofsd-agent-state.sock", "vm.sock"):
@@ -355,9 +346,6 @@ def test_daemon_startup_failure_cleans_started_children(project, test_root):
         if launch.isalive():
             launch.terminate(force=True)
         cache.write_bytes(original)
-        if saved_state.exists():
-            state.unlink(missing_ok=True)
-            saved_state.rename(state)
     run([zaigr, "project", "vm", "start"], timeout=180)
     assert run([zaigr, "project", "vm", "exec", "--", "findmnt", "-n", "-o", "FSTYPE", "/home/user/workspace"], timeout=20).strip() == "virtiofs"
 
